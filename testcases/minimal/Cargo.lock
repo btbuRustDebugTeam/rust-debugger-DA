@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "minimal_futures"
+name = "minimal"
 version = "0.1.0"

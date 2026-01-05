@@ -15,13 +15,30 @@ check-rust:
 		echo "Rust is installed: $$(rustc --version)"; \
 	fi
 
-check-ddbug:
-	@if ! command -v ddbug >/dev/null 2>&1; then \
-		if ! command -v cargo >/dev/null 2>&1; then \
-			echo "cargo not found; ensure Rust is installed and cargo is in PATH"; exit 1; \
-		fi; \
-		echo "ddbug not found — installing from git..."; \
-		cargo install --git https://github.com/gimli-rs/ddbug || true; \
-	else \
-		echo "ddbug is installed: $$(ddbug --version 2>/dev/null || echo '(version unknown)')"; \
+# Usage: make compile TESTCASE=<testcase-name>
+compile:
+	@if [ -z "$(TESTCASE)" ]; then \
+		echo "Usage: make compile TESTCASE=<testcase-name>"; \
+		exit 1; \
 	fi
+	cd testcases/$(TESTCASE) && cargo build
+
+clean:
+	@if [ -z "$(TESTCASE)" ]; then \
+		echo "Usage: make clean TESTCASE=<testcase-name>"; \
+		exit 1; \
+	fi
+	cd testcases/$(TESTCASE) && cargo clean
+
+clean-all:
+	cd testcases/minimal && cargo clean
+	cd testcases/no_external_runtime && cargo clean
+
+# Usage: make debug TESTCASE=<testcase-name>
+debug:
+	@if [ -z "$(TESTCASE)" ]; then \
+		echo "Usage: make debug TESTCASE=<testcase-name>"; \
+		exit 1; \
+	fi
+	cd testcases/$(TESTCASE) && cargo build && \
+	gdb target/debug/$(TESTCASE)
