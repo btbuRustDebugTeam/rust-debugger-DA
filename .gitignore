@@ -1,0 +1,5 @@
+# Ignore Rust compiled artifacts
+/target/
+
+# Ignore Python venv
+/venv/
