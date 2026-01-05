@@ -1,0 +1,10 @@
+[package]
+name = "dwarf-viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gimli = "0.31"
+object = "0.36"
+memmap2 = "0.9"
+clap = { version = "4", features = ["derive"] }
