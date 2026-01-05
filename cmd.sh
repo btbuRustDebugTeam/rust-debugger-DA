@@ -1,4 +1,4 @@
-# frequently used commands
+# frequently used commands to help developers of this project
 
 if [ "$1" = "compile-tests" ]; then
     case "$2" in
@@ -7,13 +7,13 @@ if [ "$1" = "compile-tests" ]; then
             cd testcases/minimal
             cargo build
             ;;
-        no_external_future)
-            echo "Compiling testcases (no_external_future)..."
-            cd testcases/no_external_future
+        no_external_runtime)
+            echo "Compiling testcases (no_external_runtime)..."
+            cd testcases/no_external_runtime
             cargo build
             ;;
         *)
-            echo "Usage: $0 compile-all-testcases {minimal|no_external_future}" >&2
+            echo "Usage: $0 compile-tests {minimal|no_external_runtime}" >&2
             exit 2
             ;;
     esac
