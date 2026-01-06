@@ -13,17 +13,16 @@ fn sync_b(x: i32) -> i32 { println!("sync_b({})", x); x * 2 }
 
 // leaf of async fn chain
 // but calls a manually constructed future
-// by .await (generates __awaitee)
-// and without .await (not generating __awaitee)
+// without .await (not generating __awaitee)
 // so not leaf of async awaiting chain
+//TODO: call async fn without .await
 async fn async_fn_leaf(x: i32) -> i32 { 
     sync_a(x) 
-    + Manual(x, false).await
     + block_on(std::pin::pin!(Manual(x, false)))
 }
 
 // Async function (non-leaf)
-async fn nonleaf(x: i32) -> i32 { sync_b(async_fn_leaf(x).await) }
+async fn nonleaf(x: i32) -> i32 { sync_b(async_fn_leaf(x).await) + Manual(x, false).await }
 
 // Manual future, the actual async leaf
 struct Manual(i32, bool);
