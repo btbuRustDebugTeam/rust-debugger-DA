@@ -2,22 +2,30 @@ use std::{future::Future, pin::Pin, task::{Context, Poll, RawWaker, RawWakerVTab
 
 // Minimal executor
 fn block_on<F: Future>(mut f: Pin<&mut F>) -> F::Output {
-    let w = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+    let w = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &MY_VTABLE)) };
     loop { if let Poll::Ready(v) = f.as_mut().poll(&mut Context::from_waker(&w)) { return v; } }
 }
-static VTABLE: RawWakerVTable = RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
+static MY_VTABLE: RawWakerVTable = RawWakerVTable::new(|p| RawWaker::new(p, &MY_VTABLE), |_| {}, |_| {}, |_| {});
 
 // Sync functions
 fn sync_a(x: i32) -> i32 { println!("sync_a({})", x); x + 1 }
 fn sync_b(x: i32) -> i32 { println!("sync_b({})", x); x * 2 }
 
-// Async function (leaf)
-async fn leaf(x: i32) -> i32 { sync_a(x) }
+// leaf of async fn chain
+// but calls a manually constructed future
+// by .await (generates __awaitee)
+// and without .await (not generating __awaitee)
+// so not leaf of async awaiting chain
+async fn async_fn_leaf(x: i32) -> i32 { 
+    sync_a(x) 
+    + Manual(x, false).await
+    + block_on(std::pin::pin!(Manual(x, false)))
+}
 
 // Async function (non-leaf)
-async fn nonleaf(x: i32) -> i32 { sync_b(leaf(x).await) }
+async fn nonleaf(x: i32) -> i32 { sync_b(async_fn_leaf(x).await) }
 
-// Manual future
+// Manual future, the actual async leaf
 struct Manual(i32, bool);
 impl Future for Manual {
     type Output = i32;
@@ -27,8 +35,8 @@ impl Future for Manual {
 }
 
 fn main() {
-    println!("leaf: {}", block_on(std::pin::pin!(leaf(1))));
+    println!("leaf: {}", block_on(std::pin::pin!(async_fn_leaf(1))));
     println!("nonleaf: {}", block_on(std::pin::pin!(nonleaf(2))));
-    println!("block: {}", block_on(std::pin::pin!(async { sync_b(leaf(3).await) })));
+    println!("block: {}", block_on(std::pin::pin!(async { sync_b(async_fn_leaf(3).await) })));
     println!("manual: {}", block_on(std::pin::pin!(Manual(4, false))));
 }
