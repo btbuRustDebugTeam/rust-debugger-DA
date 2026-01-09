@@ -13,3 +13,8 @@ make env
 ./cmd.sh compile-tests no-external-runtime
 ```
 
+```
+log start
+log end
+```
+

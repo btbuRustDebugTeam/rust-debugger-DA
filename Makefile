@@ -1,5 +1,8 @@
 SHELL := /bin/bash
 
+PYTHONPATH := $(PWD)
+ASYNC_RUST_DEBUGGER_TEMP_DIR := $(PWD)/temp
+
 .PHONY: all env check-rust install-rust check-ddbug install-ddbug
 
 all: env
@@ -36,9 +39,11 @@ clean-all:
 
 # Usage: make debug TESTCASE=<testcase-name>
 debug:
-	@if [ -z "$(TESTCASE)" ]; then \
-		echo "Usage: make debug TESTCASE=<testcase-name>"; \
-		exit 1; \
-	fi
-	cd testcases/$(TESTCASE) && cargo build && \
-	gdb target/debug/$(TESTCASE)
+	$(MAKE) compile TESTCASE=$(TESTCASE)
+	$(MAKE) just-debug TESTCASE=$(TESTCASE)
+
+just-debug:
+	cd testcases/$(TESTCASE) && \
+	PYTHONPATH=$(PYTHONPATH) \
+	ASYNC_RUST_DEBUGGER_TEMP_DIR=$(ASYNC_RUST_DEBUGGER_TEMP_DIR) \
+	gdb -ex "python import async_rust_debugger" target/debug/$(TESTCASE)

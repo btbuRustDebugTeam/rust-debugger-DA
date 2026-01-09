@@ -1,6 +1,9 @@
 # ignore all target dirs anywhere
 target/
 
+# ignore all python cache folders
+__pycache__/
+
 # ignore venv
 /venv/
 

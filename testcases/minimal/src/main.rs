@@ -22,7 +22,10 @@ async fn async_fn_leaf(x: i32) -> i32 {
 }
 
 // Async function (non-leaf)
-async fn nonleaf(x: i32) -> i32 { sync_b(async_fn_leaf(x).await) + Manual(x, false).await }
+async fn nonleaf(x: i32) -> i32 {
+    sync_b(async_fn_leaf(x).await) + 
+    Manual(x, false).await 
+}
 
 // Manual future, the actual async leaf
 struct Manual(i32, bool);
