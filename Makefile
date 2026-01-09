@@ -19,6 +19,9 @@ check-rust:
 	fi
 
 # Usage: make compile TESTCASE=<testcase-name>
+# `cargo build -vv` for verbose output
+# `RUSTFLAGS="-C dwarf-version=5 -C llvm-args=-emit-call-site-info -C llvm-args=-debug-entry-values"`
+#     doesn't work currently
 compile:
 	@if [ -z "$(TESTCASE)" ]; then \
 		echo "Usage: make compile TESTCASE=<testcase-name>"; \

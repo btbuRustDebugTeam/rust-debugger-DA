@@ -17,8 +17,13 @@ fn sync_b(x: i32) -> i32 { println!("sync_b({})", x); x * 2 }
 // so not leaf of async awaiting chain
 //TODO: call async fn without .await
 async fn async_fn_leaf(x: i32) -> i32 { 
-    sync_a(x) 
+    sync_a(x)
+    + another_branch(x).await
     + block_on(std::pin::pin!(Manual(x, false)))
+}
+
+async fn another_branch(x: i32) -> i32 {
+    sync_a(x) * 3
 }
 
 // Async function (non-leaf)

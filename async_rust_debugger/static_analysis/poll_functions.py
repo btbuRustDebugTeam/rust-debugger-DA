@@ -4,6 +4,14 @@ def parse_info_functions(output):
     """
     Parse the output of 'info functions' into a list of dictionaries.
     Each dict contains: 'file', 'line', 'signature', 'return_type'
+    # Example usage:
+    ```
+    output = gdb.execute("info functions", to_string=True)
+    funcs = parse_info_functions(output)
+    for f in funcs:
+        if f["return_type"] and "core::task::poll::Poll<" in f["return_type"]:
+            print("Found poll function: ", f["signature"])
+    ```
     """
     functions = []
     current_file = None
@@ -40,10 +48,4 @@ def parse_info_functions(output):
                 except ValueError:
                     continue  # Skip if line_num not int
     return functions
-
-# Example usage:
-# output = gdb.execute("info functions", to_string=True)
-# funcs = parse_info_functions(output)
-# for f in funcs:
-#     print(f)
 
