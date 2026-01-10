@@ -3,11 +3,11 @@
 import gdb
 from async_rust_debugger.static_analysis.poll_functions import parse_info_functions
 
-output = gdb.execute("info functions", to_string=True)
-funcs = parse_info_functions(output)
-for f in funcs:
-    if f["return_type"] and "core::task::poll::Poll<" in f["return_type"]:
-        print("Found poll function: ", f["signature"])
+# output = gdb.execute("info functions", to_string=True)
+# funcs = parse_info_functions(output)
+# for f in funcs:
+#     if f["return_type"] and "core::task::poll::Poll<" in f["return_type"]:
+#         print("Found poll function: ", f["signature"])
 
 # translate function signatures to future names
 # look up future names in debug info via `info types``
