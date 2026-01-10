@@ -14,12 +14,16 @@ PRINT_INTERNAL_POLL_HITS = False    # keep output readable
 # Internal state
 # -------------------------
 
-_CREATED_BPS = []                  # breakpoints created by this script
-_CALLSITE_INSTALLED_FOR_FN = set() # function names we've scanned
-_ACTIVE_ROOTS = set()              # root poll symbols installed
-_SEEN_CALL_EDGES = set()           # (caller_fn, callee_sym) printed edges, for dedup
+_CREATED_BPS = []                  # all breakpoints created by this script
+_RUN_SCOPED_BPS = []               # address-based breakpoints (invalid across runs)
+_CALLSITE_INSTALLED_FOR_FN = set() # function names we've scanned (per run)
+_ACTIVE_ROOTS = set()              # root/child poll symbols installed (symbol BPs)
+_SEEN_CALL_EDGES = set()           # (caller_fn, callee_sym) printed edges (per run)
+
 _WHITELIST = None                  # set[str] or None
 _WHITELIST_PATH = None             # str or None
+
+_EVENTS_INSTALLED = False
 
 # -------------------------
 # Utilities
@@ -52,13 +56,30 @@ def _info_symbol_raw(addr: int) -> str:
 def _info_symbol_name(addr: int) -> str:
     """
     Parse `info symbol` to get a bare symbol name.
-    Examples:
-      "foo + 0 in section .text of ..." -> "foo"
     """
     s = _info_symbol_raw(addr)
     s = s.split(" in section")[0].strip()
     s = s.split(" + ")[0].strip()
     return s
+
+def _find_pc_function_name(addr: int) -> str | None:
+    """
+    Prefer GDB's pc->function mapping; often matches 'info functions' naming better.
+    """
+    try:
+        sym = gdb.find_pc_function(addr)
+        if sym is None:
+            return None
+        # Some GDB builds provide print_name; others only name.
+        n = getattr(sym, "print_name", None)
+        if n:
+            return str(n)
+        n2 = getattr(sym, "name", None)
+        if n2:
+            return str(n2)
+        return str(sym)
+    except Exception:
+        return None
 
 def _function_range() -> tuple[int, int] | None:
     """
@@ -144,10 +165,6 @@ def _resolve_call_target_from_asm(asm: str) -> int | None:
 # -------------------------
 
 def _pollsym_to_envtype(poll_sym: str) -> str | None:
-    """
-    minimal::foo::{async_fn#0} -> minimal::foo::{async_fn_env#0}
-    minimal::bar::{async_block#0} -> minimal::bar::{async_block_env#0}
-    """
     s = poll_sym
     s = s.replace("{async_fn#", "{async_fn_env#")
     s = s.replace("{async_block#", "{async_block_env#")
@@ -194,10 +211,6 @@ def _try_read_awaitee_from_current_poll(poll_sym: str):
         return None
 
 def _child_poll_symbol_from_awaitee_type(awa_ty: str) -> str | None:
-    """
-    If awaitee type is an async env, derive its poll symbol name.
-      minimal::foo::{async_fn_env#0} -> minimal::foo::{async_fn#0}
-    """
     if "{async_fn_env#" in awa_ty:
         return awa_ty.replace("{async_fn_env#", "{async_fn#")
     if "{async_block_env#" in awa_ty:
@@ -218,8 +231,7 @@ def _load_whitelist_file(path: str) -> set[str]:
     """
     Accepts:
       - one symbol per line
-      - or lines like: "00012  minimal::foo::{async_fn#0}"
-    Ignores empty lines and comments starting with '#'.
+      - or lines like: "0 minimal::foo::{async_fn#0}"
     """
     syms: set[str] = set()
     with open(path, "r", encoding="utf-8") as fp:
@@ -227,7 +239,6 @@ def _load_whitelist_file(path: str) -> set[str]:
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
-            # If it starts with an index, take the 2nd token; otherwise take the whole line.
             parts = line.split()
             if len(parts) >= 2 and parts[0].isdigit():
                 sym = parts[1]
@@ -239,19 +250,74 @@ def _load_whitelist_file(path: str) -> set[str]:
 def _whitelist_allows(sym: str) -> bool:
     global _WHITELIST
     if _WHITELIST is None:
-        return True  # whitelist not loaded => permissive
+        return True
     return sym in _WHITELIST
 
 # -------------------------
 # Filtering
 # -------------------------
 
-def _is_interesting_symbol(sym_name: str) -> bool:
-    # Base heuristic
-    if not (("::poll" in sym_name) or ("{async_fn#" in sym_name) or ("{async_block#" in sym_name)):
-        return False
-    # If whitelist loaded, require membership
-    return _whitelist_allows(sym_name)
+def _is_pollish_name(sym_name: str) -> bool:
+    return ("::poll" in sym_name) or ("{async_fn#" in sym_name) or ("{async_block#" in sym_name)
+
+def _callee_candidates(addr: int) -> list[str]:
+    """
+    Produce multiple naming spellings for the same address, because:
+      - whitelist uses "info functions" style (e.g. minimal::{impl#0}::poll)
+      - info symbol may return "<T as Trait>::poll"
+    We try both and let whitelist match any.
+    """
+    cands = []
+    n1 = _find_pc_function_name(addr)
+    if n1:
+        cands.append(n1.strip())
+    n2 = _info_symbol_name(addr)
+    if n2:
+        cands.append(n2.strip())
+
+    # de-dup keep order
+    seen = set()
+    out = []
+    for s in cands:
+        if s and s not in seen:
+            out.append(s)
+            seen.add(s)
+    return out
+
+def _pick_interesting_callee(addr: int) -> str | None:
+    for name in _callee_candidates(addr):
+        if _is_pollish_name(name) and _whitelist_allows(name):
+            return name
+    # if whitelist not loaded, allow heuristic match
+    if _WHITELIST is None:
+        for name in _callee_candidates(addr):
+            if _is_pollish_name(name):
+                return name
+    return None
+
+# -------------------------
+# Run-scoped cleanup (ASLR/PIE safe)
+# -------------------------
+
+def _cleanup_run_scoped(reason: str):
+    # delete address-based bps (call-sites + *addr entry bps)
+    for bp in list(_RUN_SCOPED_BPS):
+        try:
+            bp.delete()
+        except Exception:
+            pass
+    _RUN_SCOPED_BPS.clear()
+
+    # per-run caches
+    _CALLSITE_INSTALLED_FOR_FN.clear()
+    _SEEN_CALL_EDGES.clear()
+
+def _on_exited(event):
+    _cleanup_run_scoped("exited")
+
+def _on_new_objfile(event):
+    # When a new objfile is loaded (common across re-run), old absolute addresses are stale.
+    _cleanup_run_scoped("new_objfile")
 
 # -------------------------
 # Breakpoints
@@ -270,6 +336,13 @@ class PollEntryBP(gdb.Breakpoint):
         self.internal = internal
         _CREATED_BPS.append(self)
 
+        # Address-based breakpoint => run-scoped
+        try:
+            if isinstance(location, str) and location.strip().startswith("*"):
+                _RUN_SCOPED_BPS.append(self)
+        except Exception:
+            pass
+
     def stop(self) -> bool:
         fn = _current_function_name()
 
@@ -283,7 +356,6 @@ class PollEntryBP(gdb.Breakpoint):
             if awa is not None:
                 awa_ty, _awa_val = awa
 
-                # Make it clear whether this is coming from a child/internal poll
                 if self.internal and not PRINT_INTERNAL_POLL_HITS:
                     gdb.write(f"[ARD]   awaitee@{fn}: {awa_ty}\n")
                 else:
@@ -291,10 +363,12 @@ class PollEntryBP(gdb.Breakpoint):
 
                 child_poll = _child_poll_symbol_from_awaitee_type(awa_ty)
                 if child_poll and (child_poll not in _ACTIVE_ROOTS):
-                    _ACTIVE_ROOTS.add(child_poll)
-                    PollEntryBP(child_poll, poll_sym=child_poll, internal=True, temporary=False)
+                    # If whitelist is loaded, only follow into children we actually care about.
+                    if _WHITELIST is None or _whitelist_allows(child_poll):
+                        _ACTIVE_ROOTS.add(child_poll)
+                        PollEntryBP(child_poll, poll_sym=child_poll, internal=True, temporary=False)
 
-        # Install call-site breakpoints once per function
+        # Install call-site breakpoints once per function (per run)
         if fn not in _CALLSITE_INSTALLED_FOR_FN:
             try:
                 call_sites = _collect_call_sites()
@@ -310,12 +384,12 @@ class PollEntryBP(gdb.Breakpoint):
             if (not self.internal) or PRINT_INTERNAL_POLL_HITS:
                 gdb.write(f"[ARD]   call-sites: {len(call_sites)}\n")
 
-        return False  # keep running
+        return False
 
 
 class CallSiteBP(gdb.Breakpoint):
     """
-    Breakpoint at a call instruction address (internal, quiet).
+    Breakpoint at a call instruction address (internal, quiet, run-scoped).
     On hit:
       - resolve call target
       - if interesting (and whitelist allows), set a one-shot poll-entry breakpoint at callee entry
@@ -326,6 +400,7 @@ class CallSiteBP(gdb.Breakpoint):
         self.silent = True
         self.addr = addr
         _CREATED_BPS.append(self)
+        _RUN_SCOPED_BPS.append(self)
 
     def stop(self) -> bool:
         asm = _current_asm()
@@ -333,14 +408,13 @@ class CallSiteBP(gdb.Breakpoint):
         if not target:
             return False
 
-        callee = _info_symbol_name(target)
-        if not _is_interesting_symbol(callee):
+        callee = _pick_interesting_callee(target)
+        if not callee:
             return False
 
-        # Set a one-shot entry breakpoint at the callee
+        # Set a one-shot entry breakpoint at the callee (address-based => run-scoped)
         PollEntryBP(f"*{target:#x}", poll_sym=callee, internal=True, temporary=True)
 
-        # Print edge once (dedup)
         caller = _current_function_name()
         edge = (caller, callee)
         if edge not in _SEEN_CALL_EDGES:
@@ -354,12 +428,6 @@ class CallSiteBP(gdb.Breakpoint):
 # -------------------------
 
 class ARDTraceCommand(gdb.Command):
-    """
-    ardb-trace <poll-symbol>
-      Example:
-        (gdb) ardb-trace minimal::nonleaf::{async_fn#0}
-        (gdb) run
-    """
     def __init__(self):
         super().__init__("ardb-trace", gdb.COMMAND_USER)
 
@@ -372,8 +440,10 @@ class ARDTraceCommand(gdb.Command):
         gdb.execute("set pagination off", to_string=True)
         gdb.execute("set debuginfod enabled off", to_string=True)
 
-        # Install a user-visible root BP
         if sym not in _ACTIVE_ROOTS:
+            # If whitelist is loaded, help user catch typos early.
+            if _WHITELIST is not None and sym not in _WHITELIST:
+                gdb.write(f"[ARD] warning: root not in whitelist: {sym}\n")
             _ACTIVE_ROOTS.add(sym)
             PollEntryBP(sym, poll_sym=sym, internal=False, temporary=False)
             gdb.write(f"[ARD] trace root: {sym}\n")
@@ -384,22 +454,21 @@ class ARDTraceCommand(gdb.Command):
 class ARDResetCommand(gdb.Command):
     """
     ardb-reset
-      Delete all breakpoints created by this script and clear state.
+      Delete ALL breakpoints created by this script and clear state.
       (Whitelist remains loaded.)
     """
     def __init__(self):
         super().__init__("ardb-reset", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
-        # Delete breakpoints
         for bp in list(_CREATED_BPS):
             try:
                 bp.delete()
             except Exception:
                 pass
         _CREATED_BPS.clear()
+        _RUN_SCOPED_BPS.clear()
 
-        # Clear state
         _CALLSITE_INSTALLED_FOR_FN.clear()
         _ACTIVE_ROOTS.clear()
         _SEEN_CALL_EDGES.clear()
@@ -410,12 +479,7 @@ class ARDResetCommand(gdb.Command):
 class ARDLoadWhitelistCommand(gdb.Command):
     """
     ardb-load-whitelist [path]
-
-    Load a whitelist of poll-like symbols. When loaded:
-      - call-site edges are only reported if the target symbol is in the whitelist
-      - temporary entry BPs are only installed for whitelisted targets
-
-    Default path (if omitted):
+    Default path:
       $ASYNC_RUST_DEBUGGER_TEMP_DIR/poll_functions.txt
     """
     def __init__(self):
@@ -440,14 +504,50 @@ class ARDLoadWhitelistCommand(gdb.Command):
         _WHITELIST_PATH = path
         gdb.write(f"[ARD] whitelist loaded: {len(wl)} symbols from {path}\n")
 
+
+class ARDGenWhitelistCommand(gdb.Command):
+    """
+    ardb-gen-whitelist
+      Convenience wrapper around async_rust_debugger.static_analysis.gen_whitelist.gen_default_whitelist().
+    """
+    def __init__(self):
+        super().__init__("ardb-gen-whitelist", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        try:
+            from async_rust_debugger.static_analysis.gen_whitelist import gen_default_whitelist
+        except Exception as e:
+            gdb.write(f"[ARD] cannot import gen_whitelist: {e}\n")
+            return
+        try:
+            gen_default_whitelist()
+        except Exception as e:
+            gdb.write(f"[ARD] gen_default_whitelist failed: {e}\n")
+
 # -------------------------
 # Entry
 # -------------------------
 
 def install():
+    global _EVENTS_INSTALLED
     gdb.execute("set pagination off", to_string=True)
     gdb.execute("set debuginfod enabled off", to_string=True)
+
     ARDTraceCommand()
     ARDResetCommand()
     ARDLoadWhitelistCommand()
-    gdb.write("[ARD] installed. Commands: ardb-trace, ardb-reset, ardb-load-whitelist\n")
+    ARDGenWhitelistCommand()
+
+    # Install event handlers once: fix PIE/ASLR address churn across runs
+    if not _EVENTS_INSTALLED:
+        try:
+            gdb.events.exited.connect(_on_exited)
+        except Exception:
+            pass
+        try:
+            gdb.events.new_objfile.connect(_on_new_objfile)
+        except Exception:
+            pass
+        _EVENTS_INSTALLED = True
+
+    gdb.write("[ARD] installed. Commands: ardb-trace, ardb-reset, ardb-load-whitelist, ardb-gen-whitelist\n")
