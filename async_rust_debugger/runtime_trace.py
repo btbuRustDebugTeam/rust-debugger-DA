@@ -16,6 +16,9 @@ PRINT_WHITELIST_ADDR_STATS = True
 TREE_DEDUP_CALL_AWA_SAME_DST = True   # if call+awa to same dst, keep awa
 TREE_REUSE_NODES = True              # if a node already expanded, show "(shared)" instead of repeating subtree
 TREE_MAX_DEPTH = 50
+TREE_SHOW_SHARED = True          # False => not displaying `(shared)` edges (dangerous)
+TREE_MARK_SHARED_LEAVES = False  # False => not marking `(shared)` for leaf nodes
+
 
 # -------------------------
 # State
@@ -372,17 +375,19 @@ def _build_adj_from_edges():
 def _render_tree(root: str, *, max_depth: int = TREE_MAX_DEPTH) -> str:
     adj = _build_adj_from_edges()
     lines: list[str] = []
-    expanded = set()
+
+    # only consider nodes with children as reusable subtrees
+    expanded_nonleaf: set[str] = set()
 
     def dfs(node: str, prefix: str, path: list[str], depth: int):
         if depth >= max_depth:
             lines.append(f"{prefix}└── ... (depth>={max_depth})")
             return
 
-        if TREE_REUSE_NODES:
-            expanded.add(node)
-
         children = adj.get(node, [])
+        if TREE_REUSE_NODES and children:
+            expanded_nonleaf.add(node)
+
         for i, (kind, dst) in enumerate(children):
             last = (i == len(children) - 1)
             branch = "└──" if last else "├──"
@@ -392,16 +397,34 @@ def _render_tree(root: str, *, max_depth: int = TREE_MAX_DEPTH) -> str:
                 lines.append(f"{prefix}{branch} {kind} -> {dst} (cycle)")
                 continue
 
-            if TREE_REUSE_NODES and dst in expanded:
-                lines.append(f"{prefix}{branch} {kind} -> {dst} (shared)")
+            dst_children = adj.get(dst, [])
+
+            # considered shared only when dst is non-leaf and already expanded
+            is_shared_subtree = TREE_REUSE_NODES and (dst in expanded_nonleaf) and bool(dst_children)
+
+            if is_shared_subtree:
+                if TREE_SHOW_SHARED:
+                    lines.append(f"{prefix}{branch} {kind} -> {dst} (shared)")
+                # not expand
+                continue
+
+            # whether to mark shared for leaf nodes (default no)
+            if TREE_REUSE_NODES and (dst in expanded_nonleaf) and (not dst_children):
+                # a fall back check here. expanded_nonleaf should not contain leaf nodes
+                if TREE_MARK_SHARED_LEAVES and TREE_SHOW_SHARED:
+                    lines.append(f"{prefix}{branch} {kind} -> {dst} (shared)")
+                else:
+                    lines.append(f"{prefix}{branch} {kind} -> {dst}")
                 continue
 
             lines.append(f"{prefix}{branch} {kind} -> {dst}")
-            dfs(dst, next_prefix, path + [dst], depth + 1)
+            if dst_children:
+                dfs(dst, next_prefix, path + [dst], depth + 1)
 
     lines.append(root)
     dfs(root, "", [root], 0)
     return "\n".join(lines) + "\n"
+
 
 # -------------------------
 # Run-scoped cleanup (PIE/ASLR safe)
