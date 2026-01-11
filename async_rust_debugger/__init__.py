@@ -3,6 +3,9 @@
 import gdb
 from async_rust_debugger.static_analysis.poll_functions import parse_info_functions
 
+import async_rust_debugger.runtime_trace as rt
+rt.install()
+
 # output = gdb.execute("info functions", to_string=True)
 # funcs = parse_info_functions(output)
 # for f in funcs:
