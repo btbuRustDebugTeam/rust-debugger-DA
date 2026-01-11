@@ -1,5 +1,6 @@
 import os
 import re
+import shlex
 import struct
 import gdb
 
@@ -7,34 +8,44 @@ import gdb
 # User-facing knobs
 # -------------------------
 
-MAX_CALLSITES_PER_FN = 200          # safety cap per function
-PRINT_INTERNAL_POLL_HITS = False    # keep output readable
-PRINT_WHITELIST_ADDR_STATS = True   # print 1 line when addr-map built in a run
+MAX_CALLSITES_PER_FN = 200
+PRINT_INTERNAL_POLL_HITS = False
+PRINT_WHITELIST_ADDR_STATS = True
+
+# Tree rendering
+TREE_DEDUP_CALL_AWA_SAME_DST = True   # if call+awa to same dst, keep awa
+TREE_REUSE_NODES = True              # if a node already expanded, show "(shared)" instead of repeating subtree
+TREE_MAX_DEPTH = 50
 
 # -------------------------
-# Internal state
+# State
 # -------------------------
 
-_CREATED_BPS = []                  # all breakpoints created by this script
-_RUN_SCOPED_BPS = []               # address-based breakpoints (invalid across runs)
-_CALLSITE_INSTALLED_FOR_FN = set() # function names we've scanned (per run)
-_ACTIVE_ROOTS = set()              # root/child poll symbols installed (symbol BPs)
-_SEEN_CALL_EDGES = set()           # (caller_fn, callee_sym) printed edges (per run)
+_CREATED_BPS = []
+_RUN_SCOPED_BPS = []
 
-_WHITELIST = None                  # set[str] or None
-_WHITELIST_PATH = None             # str or None
+_CALLSITE_INSTALLED_FOR_FN = set()   # per-run
+_SEEN_CALL_EDGES = set()             # per-run (caller, callee)
+_SEEN_AWA_EDGES = set()              # per-run (src_fn, awa_ty)
 
-# Per-run: addr -> canonical whitelist symbol
-_WHITELIST_ADDR_MAP = {}
+_ACTIVE_ROOTS = set()                # symbol roots/children installed (symbol BPs)
+
+_WHITELIST = None                    # set[str] | None
+_WHITELIST_PATH = None
+
+_WHITELIST_ADDR_MAP = {}             # per-run: addr -> canonical whitelist symbol
 _WHITELIST_ADDR_READY = False
 
 _EVENTS_INSTALLED = False
-_SEEN_AWA_EDGES = set()  # (src_fn, awa_ty) printed edges
-_EDGES = []  # (kind, src, dst)
+
+_EDGES = []  # list[(kind, src, dst)] ; kind in {"call","awa"} ; awa dst is type name (raw), normalized only for tree
 
 # -------------------------
-# Utilities
+# Low-level helpers
 # -------------------------
+
+CALL_MNEMONIC_RE = re.compile(r"^\s*call\w*\b", re.IGNORECASE)
+HEX_ADDR_RE = re.compile(r"(0x[0-9a-fA-F]+)")
 
 def _ptr_size() -> int:
     return gdb.lookup_type("void").pointer().sizeof
@@ -67,9 +78,6 @@ def _info_symbol_name(addr: int) -> str:
     return s
 
 def _find_pc_function_name(addr: int) -> str | None:
-    """
-    Prefer GDB's pc->function mapping; often matches 'info functions' style better.
-    """
     try:
         sym = gdb.find_pc_function(addr)
         if sym is None:
@@ -92,8 +100,6 @@ def _function_range() -> tuple[int, int] | None:
         return None
     return (int(blk.start), int(blk.end))
 
-CALL_MNEMONIC_RE = re.compile(r"^\s*call\w*\b", re.IGNORECASE)
-
 def _collect_call_sites() -> list[int]:
     r = _function_range()
     if r is None:
@@ -101,18 +107,17 @@ def _collect_call_sites() -> list[int]:
     start, end = r
     arch = gdb.selected_frame().architecture()
     insns = arch.disassemble(start, end)
-    addrs = []
-    for ins in insns:
-        asm = ins.get("asm", "")
-        if CALL_MNEMONIC_RE.match(asm.strip()):
-            addrs.append(int(ins["addr"]))
-    # de-dup preserve order
-    seen = set()
+
     out = []
-    for a in addrs:
-        if a not in seen:
-            out.append(a)
-            seen.add(a)
+    seen = set()
+    for ins in insns:
+        asm = ins.get("asm", "").strip()
+        if CALL_MNEMONIC_RE.match(asm):
+            a = int(ins["addr"])
+            if a not in seen:
+                out.append(a)
+                seen.add(a)
+
     return out[:MAX_CALLSITES_PER_FN]
 
 def _current_asm() -> str:
@@ -124,15 +129,7 @@ def _current_asm() -> str:
             return ins.get("asm", "")
     return gdb.execute("x/i $pc", to_string=True).strip()
 
-HEX_ADDR_RE = re.compile(r"(0x[0-9a-fA-F]+)")
-
 def _resolve_call_target_from_asm(asm: str) -> int | None:
-    """
-    Supports typical AT&T syntax:
-      - direct:   callq  0x401234 <sym>
-      - indirect: callq  *%rax
-      - indirect: callq  *0x18(%rax)
-    """
     s = asm.strip()
 
     # direct call
@@ -144,20 +141,17 @@ def _resolve_call_target_from_asm(asm: str) -> int | None:
     # call *%reg
     m = re.search(r"call\w*\s+\*\%([a-z0-9]+)\b", s)
     if m:
-        reg = m.group(1)
-        return _reg_u64(reg)
+        return _reg_u64(m.group(1))
 
     # call *disp(%reg)
     m = re.search(r"call\w*\s+\*([\-0-9a-fx]+)\(\%([a-z0-9]+)\)", s)
     if m:
-        disp_s = m.group(1)
-        base = m.group(2)
-        disp = int(disp_s, 16) if disp_s.startswith("0x") or disp_s.startswith("-0x") else int(disp_s, 10)
-        basev = _reg_u64(base)
-        slot = basev + disp
+        disp_s, base = m.group(1), m.group(2)
+        disp = int(disp_s, 16) if disp_s.startswith(("0x", "-0x")) else int(disp_s, 10)
+        slot = _reg_u64(base) + disp
         return _read_ptr(slot)
 
-    # NOTE: 没有处理 *disp(%rip) 这种形式；需要时再加（你的 minimal 目前不需要）
+    # NOTE: 没处理 *disp(%rip)；需要再加
     return None
 
 # -------------------------
@@ -214,7 +208,7 @@ def _child_poll_symbol_from_awaitee_type(awa_ty: str) -> str | None:
     return None
 
 # -------------------------
-# Whitelist load + per-run addr map (PIE/ASLR-safe)
+# Whitelist (PIE/ASLR-safe via per-run addr map)
 # -------------------------
 
 def _default_whitelist_path() -> str | None:
@@ -232,10 +226,9 @@ def _load_whitelist_file(path: str) -> set[str]:
                 continue
             parts = line.split()
             if len(parts) >= 2 and parts[0].isdigit():
-                sym = parts[1]
+                syms.add(parts[1])
             else:
-                sym = line
-            syms.add(sym)
+                syms.add(line)
     return syms
 
 def _invalidate_whitelist_addrs():
@@ -244,25 +237,17 @@ def _invalidate_whitelist_addrs():
     _WHITELIST_ADDR_READY = False
 
 def _try_addr_by_lookup_global_symbol(name: str) -> int | None:
-    """
-    Try resolving function entry address from symbol name.
-    Works best after program has started (PIE base known).
-    """
     try:
         sym = gdb.lookup_global_symbol(name)
         if sym is None:
             return None
         v = sym.value()
-        # cast to void* then int
         voidp = gdb.lookup_type("void").pointer()
         return int(v.cast(voidp))
     except Exception:
         return None
 
 def _try_addr_by_info_address(name: str) -> int | None:
-    """
-    Fallback: parse `info address` output, trying quoted name too.
-    """
     for expr in (name, f"'{name}'"):
         try:
             out = gdb.execute(f"info address {expr}", to_string=True)
@@ -275,16 +260,13 @@ def _try_addr_by_info_address(name: str) -> int | None:
 
 def _build_whitelist_addr_map_if_needed(caller_is_user_visible: bool):
     global _WHITELIST_ADDR_READY, _WHITELIST_ADDR_MAP
-    if _WHITELIST is None:
-        return
-    if _WHITELIST_ADDR_READY:
+    if _WHITELIST is None or _WHITELIST_ADDR_READY:
         return
 
     resolved = 0
     total = len(_WHITELIST)
     addr_map = {}
 
-    # try to resolve every whitelist symbol to an address (this run's relocated address)
     for name in _WHITELIST:
         addr = _try_addr_by_lookup_global_symbol(name)
         if addr is None:
@@ -301,92 +283,13 @@ def _build_whitelist_addr_map_if_needed(caller_is_user_visible: bool):
         gdb.write(f"[ARD] whitelist addrs: {resolved}/{total} resolved (PIE/ASLR-safe)\n")
 
 def _whitelist_allows_by_addr(target_addr: int) -> str | None:
-    """
-    If whitelist is loaded and addr-map built for this run:
-      return canonical whitelist name if allowed, else None.
-    """
-    if _WHITELIST is None:
-        return None
-    if not _WHITELIST_ADDR_READY:
+    if _WHITELIST is None or not _WHITELIST_ADDR_READY:
         return None
     return _WHITELIST_ADDR_MAP.get(int(target_addr))
 
 # -------------------------
-# Filtering / callee naming
+# Callee selection
 # -------------------------
-
-import shlex
-
-def _normalize_awa_dst(dst: str) -> str:
-    """
-    awa edge 的 dst 目前是“类型名”（比如 xxx::{async_fn_env#0} 或 Manual）。
-    我们把 async_fn_env/async_block_env 归一化为对应 poll symbol（async_fn/async_block）。
-    """
-    child = _child_poll_symbol_from_awaitee_type(dst)
-    return child or dst
-
-
-def _build_adj_from_edges():
-    """
-    Build adjacency list:
-      src -> list[(kind, dst)]
-    - call: dst 是 callee poll symbol
-    - awa : dst 是 awaitee type，但会 normalize 到 poll symbol（如果是 *_env）
-    """
-    adj: dict[str, list[tuple[str, str]]] = {}
-
-    for kind, src, dst in _EDGES:
-        if kind == "awa":
-            dst = _normalize_awa_dst(dst)
-
-        adj.setdefault(src, []).append((kind, dst))
-
-    # de-dup while preserving order per src
-    for src, lst in adj.items():
-        seen = set()
-        out = []
-        for kind, dst in lst:
-            key = (kind, dst)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append((kind, dst))
-        adj[src] = out
-
-    return adj
-
-
-def _render_tree(root: str, *, max_depth: int = 50) -> str:
-    """
-    Render a simple ASCII tree from collected edges.
-    - Avoid infinite loops by tracking current path.
-    - Show edge kind labels: call / awa
-    """
-    adj = _build_adj_from_edges()
-    lines: list[str] = []
-
-    def dfs(node: str, prefix: str, path: list[str], depth: int):
-        if depth > max_depth:
-            lines.append(f"{prefix}... (depth>{max_depth})")
-            return
-
-        children = adj.get(node, [])
-        for i, (kind, dst) in enumerate(children):
-            last = (i == len(children) - 1)
-            branch = "└─" if last else "├─"
-            next_prefix = prefix + ("  " if last else "│ ")
-
-            # cycle detection on the current recursion path
-            if dst in path:
-                lines.append(f"{prefix}{branch} {kind} -> {dst}  (cycle)")
-                continue
-
-            lines.append(f"{prefix}{branch} {kind} -> {dst}")
-            dfs(dst, next_prefix, path + [dst], depth + 1)
-
-    lines.append(root)
-    dfs(root, "", [root], 0)
-    return "\n".join(lines) + "\n"
 
 def _is_pollish_name(sym_name: str) -> bool:
     return ("::poll" in sym_name) or ("{async_fn#" in sym_name) or ("{async_block#" in sym_name)
@@ -399,7 +302,6 @@ def _callee_candidates(addr: int) -> list[str]:
     n2 = _info_symbol_name(addr)
     if n2:
         cands.append(n2.strip())
-    # de-dup
     seen = set()
     out = []
     for s in cands:
@@ -409,38 +311,103 @@ def _callee_candidates(addr: int) -> list[str]:
     return out
 
 def _pick_interesting_callee(target_addr: int) -> str | None:
-    """
-    Priority:
-      1) If whitelist loaded and addr-map ready: accept by address (fixes name mismatch)
-      2) Else: accept by name membership
-      3) If no whitelist: heuristic pollish
-    """
+    # If whitelist loaded and addr-map ready: strict by address
     if _WHITELIST is not None and _WHITELIST_ADDR_READY:
-        canon = _whitelist_allows_by_addr(target_addr)
-        if canon:
-            return canon
-        return None  # strict when whitelist loaded + addr-map ready
+        return _whitelist_allows_by_addr(target_addr)
 
-    # addr-map not ready yet (e.g. early stop), fall back to name checks
+    # addr-map not ready yet: try name membership
     cands = _callee_candidates(target_addr)
-
     if _WHITELIST is not None:
         for n in cands:
             if n in _WHITELIST:
                 return n
         return None
 
+    # no whitelist: heuristic
     for n in cands:
         if _is_pollish_name(n):
             return n
     return None
 
 # -------------------------
-# Run-scoped cleanup (ASLR/PIE safe)
+# Tree rendering (clean)
 # -------------------------
 
-def _cleanup_run_scoped(reason: str, *, keep_edges: bool):
-    # 1) delete addr-based breakpoints (invalid across runs)
+_KIND_PRI = {"call": 1, "awa": 2}  # prefer awa over call when same dst
+
+def _normalize_awa_dst(dst: str) -> str:
+    child = _child_poll_symbol_from_awaitee_type(dst)
+    return child or dst
+
+def _build_adj_from_edges():
+    """
+    adj[src] = list[(kind, dst)] in stable order.
+    If TREE_DEDUP_CALL_AWA_SAME_DST: for the same dst, keep the "best" kind (awa > call).
+    """
+    # temp: src -> { "order": [dst...], "best_kind": {dst: kind} }
+    tmp = {}
+
+    for kind, src, dst in _EDGES:
+        if kind == "awa":
+            dst = _normalize_awa_dst(dst)
+
+        ent = tmp.setdefault(src, {"order": [], "best_kind": {}})
+        best_kind = ent["best_kind"]
+
+        if dst not in best_kind:
+            best_kind[dst] = kind
+            ent["order"].append(dst)
+            continue
+
+        if TREE_DEDUP_CALL_AWA_SAME_DST:
+            if _KIND_PRI.get(kind, 0) > _KIND_PRI.get(best_kind[dst], 0):
+                best_kind[dst] = kind
+
+    adj: dict[str, list[tuple[str, str]]] = {}
+    for src, ent in tmp.items():
+        best_kind = ent["best_kind"]
+        adj[src] = [(best_kind[dst], dst) for dst in ent["order"]]
+    return adj
+
+def _render_tree(root: str, *, max_depth: int = TREE_MAX_DEPTH) -> str:
+    adj = _build_adj_from_edges()
+    lines: list[str] = []
+    expanded = set()
+
+    def dfs(node: str, prefix: str, path: list[str], depth: int):
+        if depth >= max_depth:
+            lines.append(f"{prefix}└── ... (depth>={max_depth})")
+            return
+
+        if TREE_REUSE_NODES:
+            expanded.add(node)
+
+        children = adj.get(node, [])
+        for i, (kind, dst) in enumerate(children):
+            last = (i == len(children) - 1)
+            branch = "└──" if last else "├──"
+            next_prefix = prefix + ("   " if last else "│  ")
+
+            if dst in path:
+                lines.append(f"{prefix}{branch} {kind} -> {dst} (cycle)")
+                continue
+
+            if TREE_REUSE_NODES and dst in expanded:
+                lines.append(f"{prefix}{branch} {kind} -> {dst} (shared)")
+                continue
+
+            lines.append(f"{prefix}{branch} {kind} -> {dst}")
+            dfs(dst, next_prefix, path + [dst], depth + 1)
+
+    lines.append(root)
+    dfs(root, "", [root], 0)
+    return "\n".join(lines) + "\n"
+
+# -------------------------
+# Run-scoped cleanup (PIE/ASLR safe)
+# -------------------------
+
+def _cleanup_run_scoped(*, keep_edges: bool):
     for bp in list(_RUN_SCOPED_BPS):
         try:
             bp.delete()
@@ -448,28 +415,20 @@ def _cleanup_run_scoped(reason: str, *, keep_edges: bool):
             pass
     _RUN_SCOPED_BPS.clear()
 
-    # 2) clear per-run caches
     _CALLSITE_INSTALLED_FOR_FN.clear()
     _SEEN_CALL_EDGES.clear()
     _SEEN_AWA_EDGES.clear()
 
-    # Keep edges after program exit so user can `ardb-dump`
     if not keep_edges:
         _EDGES.clear()
 
-    # addresses change across runs => invalidate whitelist addr-map
     _invalidate_whitelist_addrs()
 
-
 def _on_exited(event):
-    # Program finished: keep edges for `ardb-dump`
-    _cleanup_run_scoped("exited", keep_edges=True)
-
+    _cleanup_run_scoped(keep_edges=True)
 
 def _on_new_objfile(event):
-    # New load / new run context: drop old edges
-    _cleanup_run_scoped("new_objfile", keep_edges=False)
-
+    _cleanup_run_scoped(keep_edges=False)
 
 # -------------------------
 # Breakpoints
@@ -483,45 +442,37 @@ class PollEntryBP(gdb.Breakpoint):
         self.internal = internal
         _CREATED_BPS.append(self)
 
-        # address-based => run-scoped
         if isinstance(location, str) and location.strip().startswith("*"):
             _RUN_SCOPED_BPS.append(self)
 
     def stop(self) -> bool:
         fn = _current_function_name()
 
-        # If whitelist loaded, ensure we have THIS RUN's relocated addr-map
         _build_whitelist_addr_map_if_needed(caller_is_user_visible=(not self.internal))
 
         if (not self.internal) or PRINT_INTERNAL_POLL_HITS:
             gdb.write(f"[ARD] poll: {fn}\n")
 
-        # __awaitee chain
         if self.poll_sym:
             awa = _try_read_awaitee_from_current_poll(self.poll_sym)
             if awa is not None:
                 awa_ty, _awa_val = awa
-
-                # Dedup awaitee edges (tree edges, not poll events)
                 key = (fn, awa_ty)
                 if key not in _SEEN_AWA_EDGES:
                     _SEEN_AWA_EDGES.add(key)
                     _EDGES.append(("awa", fn, awa_ty))
+
                     if self.internal and not PRINT_INTERNAL_POLL_HITS:
                         gdb.write(f"[ARD]   awaitee@{fn}: {awa_ty}\n")
                     else:
                         gdb.write(f"[ARD]   awaitee: {awa_ty}\n")
 
-
-
                 child_poll = _child_poll_symbol_from_awaitee_type(awa_ty)
                 if child_poll and (child_poll not in _ACTIVE_ROOTS):
-                    # If whitelist loaded: only follow children in whitelist
                     if _WHITELIST is None or child_poll in _WHITELIST:
                         _ACTIVE_ROOTS.add(child_poll)
                         PollEntryBP(child_poll, poll_sym=child_poll, internal=True, temporary=False)
 
-        # Install call-site breakpoints once per function (per run)
         if fn not in _CALLSITE_INSTALLED_FOR_FN:
             try:
                 call_sites = _collect_call_sites()
@@ -539,7 +490,6 @@ class PollEntryBP(gdb.Breakpoint):
 
         return False
 
-
 class CallSiteBP(gdb.Breakpoint):
     def __init__(self, addr: int):
         super().__init__(f"*{addr:#x}", type=gdb.BP_BREAKPOINT, internal=True)
@@ -549,8 +499,7 @@ class CallSiteBP(gdb.Breakpoint):
         _RUN_SCOPED_BPS.append(self)
 
     def stop(self) -> bool:
-        asm = _current_asm()
-        target = _resolve_call_target_from_asm(asm)
+        target = _resolve_call_target_from_asm(_current_asm())
         if not target:
             return False
 
@@ -558,7 +507,6 @@ class CallSiteBP(gdb.Breakpoint):
         if not callee:
             return False
 
-        # one-shot callee entry BP (addr-based => run-scoped)
         PollEntryBP(f"*{target:#x}", poll_sym=callee, internal=True, temporary=True)
 
         caller = _current_function_name()
@@ -567,7 +515,6 @@ class CallSiteBP(gdb.Breakpoint):
             _SEEN_CALL_EDGES.add(edge)
             _EDGES.append(("call", caller, callee))
             gdb.write(f"[ARD]   call@{caller} -> {callee}\n")
-
 
         return False
 
@@ -588,22 +535,18 @@ class ARDTraceCommand(gdb.Command):
         gdb.execute("set pagination off", to_string=True)
         gdb.execute("set debuginfod enabled off", to_string=True)
 
-        if sym not in _ACTIVE_ROOTS:
-            if _WHITELIST is not None and sym not in _WHITELIST:
-                gdb.write(f"[ARD] warning: root not in whitelist: {sym}\n")
-            _ACTIVE_ROOTS.add(sym)
-            PollEntryBP(sym, poll_sym=sym, internal=False, temporary=False)
-            gdb.write(f"[ARD] trace root: {sym}\n")
-        else:
+        if sym in _ACTIVE_ROOTS:
             gdb.write(f"[ARD] root already traced: {sym}\n")
+            return
 
+        if _WHITELIST is not None and sym not in _WHITELIST:
+            gdb.write(f"[ARD] warning: root not in whitelist: {sym}\n")
+
+        _ACTIVE_ROOTS.add(sym)
+        PollEntryBP(sym, poll_sym=sym, internal=False, temporary=False)
+        gdb.write(f"[ARD] trace root: {sym}\n")
 
 class ARDResetCommand(gdb.Command):
-    """
-    ardb-reset
-      Delete ALL breakpoints created by this script and clear state.
-      (Whitelist remains loaded.)
-    """
     def __init__(self):
         super().__init__("ardb-reset", gdb.COMMAND_USER)
 
@@ -625,19 +568,16 @@ class ARDResetCommand(gdb.Command):
         _invalidate_whitelist_addrs()
         gdb.write("[ARD] reset done.\n")
 
-
 class ARDLoadWhitelistCommand(gdb.Command):
     def __init__(self):
         super().__init__("ardb-load-whitelist", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
         global _WHITELIST, _WHITELIST_PATH
-        path = arg.strip()
+        path = arg.strip() or _default_whitelist_path()
         if not path:
-            path = _default_whitelist_path()
-            if not path:
-                gdb.write("[ARD] whitelist path not provided and ASYNC_RUST_DEBUGGER_TEMP_DIR is not set.\n")
-                return
+            gdb.write("[ARD] whitelist path not provided and ASYNC_RUST_DEBUGGER_TEMP_DIR is not set.\n")
+            return
 
         try:
             wl = _load_whitelist_file(path)
@@ -647,16 +587,10 @@ class ARDLoadWhitelistCommand(gdb.Command):
 
         _WHITELIST = wl
         _WHITELIST_PATH = path
-        _invalidate_whitelist_addrs()  # must rebuild each run
-
+        _invalidate_whitelist_addrs()
         gdb.write(f"[ARD] whitelist loaded: {len(wl)} symbols from {path}\n")
 
-
 class ARDGenWhitelistCommand(gdb.Command):
-    """
-    ardb-gen-whitelist
-      Calls async_rust_debugger.static_analysis.gen_whitelist.gen_default_whitelist()
-    """
     def __init__(self):
         super().__init__("ardb-gen-whitelist", gdb.COMMAND_USER)
 
@@ -672,22 +606,15 @@ class ARDGenWhitelistCommand(gdb.Command):
             gdb.write(f"[ARD] gen_default_whitelist failed: {e}\n")
 
 class ARDDumpCommand(gdb.Command):
-    """
-    ardb-dump [path]
-      Dump collected edges (call + awaitee).
-      If path omitted: print to GDB console.
-    """
     def __init__(self):
         super().__init__("ardb-dump", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
         path = arg.strip()
 
-        lines = []
-        lines.append("# kind src -> dst")
+        lines = ["# kind src -> dst"]
         for kind, src, dst in _EDGES:
             lines.append(f"{kind} {src} -> {dst}")
-
         out = "\n".join(lines) + "\n"
 
         if not path:
@@ -707,12 +634,6 @@ class ARDDumpCommand(gdb.Command):
             gdb.write(f"[ARD] dump failed: {e}\n")
 
 class ARDTreeCommand(gdb.Command):
-    """
-    ardb-tree <root> [path]
-      Print a normalized tree from collected edges.
-      - root: e.g. minimal::nonleaf::{async_fn#0}
-      - path: optional file path to write
-    """
     def __init__(self):
         super().__init__("ardb-tree", gdb.COMMAND_USER)
 
@@ -749,6 +670,7 @@ class ARDTreeCommand(gdb.Command):
 
 def install():
     global _EVENTS_INSTALLED
+
     gdb.execute("set pagination off", to_string=True)
     gdb.execute("set debuginfod enabled off", to_string=True)
 
@@ -770,4 +692,7 @@ def install():
             pass
         _EVENTS_INSTALLED = True
 
-    gdb.write("[ARD] installed. Commands: ardb-trace, ardb-reset, ardb-load-whitelist, ardb-gen-whitelist, ardb-dump, ardb-tree\n")
+    gdb.write(
+        "[ARD] installed. Commands: ardb-trace, ardb-reset, ardb-load-whitelist, "
+        "ardb-gen-whitelist, ardb-dump, ardb-tree\n"
+    )
