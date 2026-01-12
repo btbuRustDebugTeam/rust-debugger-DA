@@ -1,6 +1,5 @@
 import os
 import re
-import shlex
 import struct
 import gdb
 
@@ -9,15 +8,8 @@ import gdb
 # -------------------------
 
 MAX_CALLSITES_PER_FN = 200
-PRINT_INTERNAL_POLL_HITS = False
+PRINT_INTERNAL_POLL_HITS = True
 PRINT_WHITELIST_ADDR_STATS = True
-
-# Tree rendering
-TREE_DEDUP_CALL_AWA_SAME_DST = True   # if call+awa to same dst, keep awa
-TREE_REUSE_NODES = True              # if a node already expanded, show "(shared)" instead of repeating subtree
-TREE_MAX_DEPTH = 50
-TREE_SHOW_SHARED = True          # False => not displaying `(shared)` edges (dangerous)
-TREE_MARK_SHARED_LEAVES = False  # False => not marking `(shared)` for leaf nodes
 
 # -------------------------
 # Coroutine instance tracking (runtime)
@@ -62,7 +54,6 @@ class _PopOnReturnBP(gdb.FinishBreakpoint):
         self.silent = True
         self.tid = tid
         self.cid = cid
-        # finish bp is address-context sensitive -> run-scoped
         _RUN_SCOPED_BPS.append(self)
 
     def stop(self):
@@ -88,10 +79,7 @@ class _PopOnReturnBP(gdb.FinishBreakpoint):
 _CREATED_BPS = []
 _RUN_SCOPED_BPS = []
 
-_CALLSITE_INSTALLED_FOR_FN = set()   # per-run
-_SEEN_CALL_EDGES = set()             # per-run (caller, callee)
-_SEEN_AWA_EDGES = set()  # (cid, src_fn, awa_ty)
-
+_CALLSITE_INSTALLED_FOR_FN = set()   # per-run: avoid re-installing callsite BPs
 _ACTIVE_ROOTS = set()                # symbol roots/children installed (symbol BPs)
 
 _WHITELIST = None                    # set[str] | None
@@ -101,8 +89,6 @@ _WHITELIST_ADDR_MAP = {}             # per-run: addr -> canonical whitelist symb
 _WHITELIST_ADDR_READY = False
 
 _EVENTS_INSTALLED = False
-
-_EDGES = []  # list[(kind, src, dst)] ; kind in {"call","awa"} ; awa dst is type name (raw), normalized only for tree
 
 # -------------------------
 # Low-level helpers
@@ -215,7 +201,7 @@ def _resolve_call_target_from_asm(asm: str) -> int | None:
         slot = _reg_u64(base) + disp
         return _read_ptr(slot)
 
-    # NOTE: 没处理 *disp(%rip)；需要再加
+    # NOTE: 没处理 *disp(%rip)
     return None
 
 # -------------------------
@@ -394,104 +380,10 @@ def _pick_interesting_callee(target_addr: int) -> str | None:
     return None
 
 # -------------------------
-# Tree rendering (clean)
-# -------------------------
-
-_KIND_PRI = {"call": 1, "awa": 2}  # prefer awa over call when same dst
-
-def _normalize_awa_dst(dst: str) -> str:
-    child = _child_poll_symbol_from_awaitee_type(dst)
-    return child or dst
-
-def _build_adj_from_edges():
-    """
-    adj[src] = list[(kind, dst)] in stable order.
-    If TREE_DEDUP_CALL_AWA_SAME_DST: for the same dst, keep the "best" kind (awa > call).
-    """
-    # temp: src -> { "order": [dst...], "best_kind": {dst: kind} }
-    tmp = {}
-
-    for kind, src, dst in _EDGES:
-        if kind == "awa":
-            dst = _normalize_awa_dst(dst)
-
-        ent = tmp.setdefault(src, {"order": [], "best_kind": {}})
-        best_kind = ent["best_kind"]
-
-        if dst not in best_kind:
-            best_kind[dst] = kind
-            ent["order"].append(dst)
-            continue
-
-        if TREE_DEDUP_CALL_AWA_SAME_DST:
-            if _KIND_PRI.get(kind, 0) > _KIND_PRI.get(best_kind[dst], 0):
-                best_kind[dst] = kind
-
-    adj: dict[str, list[tuple[str, str]]] = {}
-    for src, ent in tmp.items():
-        best_kind = ent["best_kind"]
-        adj[src] = [(best_kind[dst], dst) for dst in ent["order"]]
-    return adj
-
-def _render_tree(root: str, *, max_depth: int = TREE_MAX_DEPTH) -> str:
-    adj = _build_adj_from_edges()
-    lines: list[str] = []
-
-    # only consider nodes with children as reusable subtrees
-    expanded_nonleaf: set[str] = set()
-
-    def dfs(node: str, prefix: str, path: list[str], depth: int):
-        if depth >= max_depth:
-            lines.append(f"{prefix}└── ... (depth>={max_depth})")
-            return
-
-        children = adj.get(node, [])
-        if TREE_REUSE_NODES and children:
-            expanded_nonleaf.add(node)
-
-        for i, (kind, dst) in enumerate(children):
-            last = (i == len(children) - 1)
-            branch = "└──" if last else "├──"
-            next_prefix = prefix + ("   " if last else "│  ")
-
-            if dst in path:
-                lines.append(f"{prefix}{branch} {kind} -> {dst} (cycle)")
-                continue
-
-            dst_children = adj.get(dst, [])
-
-            # considered shared only when dst is non-leaf and already expanded
-            is_shared_subtree = TREE_REUSE_NODES and (dst in expanded_nonleaf) and bool(dst_children)
-
-            if is_shared_subtree:
-                if TREE_SHOW_SHARED:
-                    lines.append(f"{prefix}{branch} {kind} -> {dst} (shared)")
-                # not expand
-                continue
-
-            # whether to mark shared for leaf nodes (default no)
-            if TREE_REUSE_NODES and (dst in expanded_nonleaf) and (not dst_children):
-                # a fall back check here. expanded_nonleaf should not contain leaf nodes
-                if TREE_MARK_SHARED_LEAVES and TREE_SHOW_SHARED:
-                    lines.append(f"{prefix}{branch} {kind} -> {dst} (shared)")
-                else:
-                    lines.append(f"{prefix}{branch} {kind} -> {dst}")
-                continue
-
-            lines.append(f"{prefix}{branch} {kind} -> {dst}")
-            if dst_children:
-                dfs(dst, next_prefix, path + [dst], depth + 1)
-
-    lines.append(root)
-    dfs(root, "", [root], 0)
-    return "\n".join(lines) + "\n"
-
-
-# -------------------------
 # Run-scoped cleanup (PIE/ASLR safe)
 # -------------------------
 
-def _cleanup_run_scoped(*, keep_edges: bool):
+def _cleanup_run_scoped():
     for bp in list(_RUN_SCOPED_BPS):
         try:
             bp.delete()
@@ -500,12 +392,6 @@ def _cleanup_run_scoped(*, keep_edges: bool):
     _RUN_SCOPED_BPS.clear()
 
     _CALLSITE_INSTALLED_FOR_FN.clear()
-    _SEEN_CALL_EDGES.clear()
-    _SEEN_AWA_EDGES.clear()
-
-    if not keep_edges:
-        _EDGES.clear()
-
     _invalidate_whitelist_addrs()
 
     _TLS_STACK.clear()
@@ -514,24 +400,11 @@ def _cleanup_run_scoped(*, keep_edges: bool):
     global _CO_NEXT_ID
     _CO_NEXT_ID = 1
 
-
 def _on_exited(event):
-    _cleanup_run_scoped(keep_edges=True)
-    _TLS_STACK.clear()
-    _CO_BY_KEY.clear()
-    _CO_META.clear()
-    global _CO_NEXT_ID
-    _CO_NEXT_ID = 1
-
+    _cleanup_run_scoped()
 
 def _on_new_objfile(event):
-    _cleanup_run_scoped(keep_edges=False)
-    _TLS_STACK.clear()
-    _CO_BY_KEY.clear()
-    _CO_META.clear()
-    global _CO_NEXT_ID
-    _CO_NEXT_ID = 1
-
+    _cleanup_run_scoped()
 
 # -------------------------
 # Breakpoints
@@ -553,7 +426,6 @@ class PollEntryBP(gdb.Breakpoint):
 
         # ---- coro context enter (best-effort) ----
         tid = _thread_id()
-        this_ptr = 0
         try:
             this_ptr = _reg_u64("rdi")   # x86_64 SysV: first arg
         except Exception:
@@ -569,23 +441,18 @@ class PollEntryBP(gdb.Breakpoint):
 
         indent = "  " * max(depth, 0)
 
-
         _build_whitelist_addr_map_if_needed(caller_is_user_visible=(not self.internal))
 
+        # poll line
         if (not self.internal) or PRINT_INTERNAL_POLL_HITS:
             gdb.write(f"[ARD]{indent} poll[coro#{cid}] {fn}\n")
 
+        # awaitee line (no dedup)
         if self.poll_sym:
             awa = _try_read_awaitee_from_current_poll(self.poll_sym)
             if awa is not None:
                 awa_ty, _awa_val = awa
-                key = (cid, fn, awa_ty)   # 关键：按协程实例去重
-                if key not in _SEEN_AWA_EDGES:
-                    _SEEN_AWA_EDGES.add(key)
-
-                    # 实时输出也带 coro#，和 call 对齐
-                    gdb.write(f"[ARD]{indent} awa[coro#{cid}] {fn} -> {awa_ty}\n")
-
+                gdb.write(f"[ARD]{indent} awa[coro#{cid}] {fn} -> {awa_ty}\n")
 
                 child_poll = _child_poll_symbol_from_awaitee_type(awa_ty)
                 if child_poll and (child_poll not in _ACTIVE_ROOTS):
@@ -593,6 +460,7 @@ class PollEntryBP(gdb.Breakpoint):
                         _ACTIVE_ROOTS.add(child_poll)
                         PollEntryBP(child_poll, poll_sym=child_poll, internal=True, temporary=False)
 
+        # Install call-site breakpoints once per function (per run)
         if fn not in _CALLSITE_INSTALLED_FOR_FN:
             try:
                 call_sites = _collect_call_sites()
@@ -627,21 +495,22 @@ class CallSiteBP(gdb.Breakpoint):
         if not callee:
             return False
 
-        PollEntryBP(f"*{target:#x}", poll_sym=callee, internal=True, temporary=True)
-
         caller = _current_function_name()
         cid, depth = _current_coro()
         indent = "  " * max(depth, 0)
 
-        edge = (cid, caller, callee)   # critical: deduplicate according to coroutine instance
-        if edge not in _SEEN_CALL_EDGES:
-            _SEEN_CALL_EDGES.add(edge)
-            gdb.write(f"[ARD]{indent} call[coro#{cid}] {caller} -> {callee}\n")
+        # call line (no dedup)
+        gdb.write(f"[ARD]{indent} call[coro#{cid}] {caller} -> {callee}\n")
 
-
-
+        # IMPORTANT: 不要再装 *addr 的临时 PollEntryBP，避免和已有 symbol BP 双重命中
+        # 改成：若还没追踪过该 poll symbol，就按“符号名”装一个（只装一次）
+        if callee not in _ACTIVE_ROOTS:
+            # whitelist 模式下仍然只会进到这里（callee 已经通过 _pick_interesting_callee 过滤）
+            _ACTIVE_ROOTS.add(callee)
+            PollEntryBP(callee, poll_sym=callee, internal=True, temporary=False)
 
         return False
+
 
 # -------------------------
 # Commands
@@ -686,12 +555,9 @@ class ARDResetCommand(gdb.Command):
 
         _CALLSITE_INSTALLED_FOR_FN.clear()
         _ACTIVE_ROOTS.clear()
-        _SEEN_CALL_EDGES.clear()
-        _SEEN_AWA_EDGES.clear()
-        _EDGES.clear()
 
         _invalidate_whitelist_addrs()
-        
+
         _TLS_STACK.clear()
         _CO_BY_KEY.clear()
         _CO_META.clear()
@@ -763,7 +629,4 @@ def install():
             pass
         _EVENTS_INSTALLED = True
 
-    gdb.write(
-        "[ARD] installed. Commands: ardb-trace, ardb-reset, ardb-load-whitelist, "
-        "ardb-gen-whitelist \n"
-    )
+    gdb.write("[ARD] installed. Commands: ardb-trace, ardb-reset, ardb-load-whitelist, ardb-gen-whitelist\n")
