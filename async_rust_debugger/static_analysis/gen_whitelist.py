@@ -86,5 +86,7 @@ def gen_default_whitelist():
     temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
     if not temp_dir:
         raise RuntimeError("ASYNC_RUST_DEBUGGER_TEMP_DIR is not set")
-    out_path = os.path.join(temp_dir, "poll_functions.txt")
+    cwd = os.getcwd()
+    out_dir = os.path.join(cwd, temp_dir)
+    out_path = os.path.join(out_dir, "poll_functions.txt")
     gen_poll_whitelist(out_path)

@@ -297,10 +297,11 @@ def _child_poll_symbol_from_awaitee_type(awa_ty: str) -> str | None:
 # -------------------------
 
 def _default_whitelist_path() -> str | None:
+    cwd = os.getcwd()
     temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
     if not temp_dir:
         return None
-    return os.path.join(temp_dir, "poll_functions.txt")
+    return os.path.join(cwd, temp_dir, "poll_functions.txt")
 
 def _load_whitelist_file(path: str):
     """
