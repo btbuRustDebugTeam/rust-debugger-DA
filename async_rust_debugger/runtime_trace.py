@@ -2,6 +2,7 @@ import os
 import re
 import struct
 import gdb
+import json
 
 # -------------------------
 # User-facing knobs
@@ -403,13 +404,45 @@ def _build_whitelist_addr_map_if_needed(caller_is_user_visible: bool):
 
     if caller_is_user_visible and PRINT_WHITELIST_ADDR_STATS:
         prefix_n = len(_WHITELIST_PREFIX) if _WHITELIST_PREFIX else 0
-        gdb.write(f"[ARD] whitelist addrs: {resolved}/{total} resolved (exact), prefix={prefix_n}\n")
+        _log_ard(f"[ARD] whitelist addrs: {resolved}/{total} resolved (exact), prefix={prefix_n}")
 
 def _whitelist_allows_by_addr(target_addr: int) -> str | None:
     if _WHITELIST_EXACT is None or not _WHITELIST_ADDR_READY:
         return None
     return _WHITELIST_ADDR_MAP.get(int(target_addr))
 
+# -------------------------
+# Logging helpers (runtime)
+# -------------------------
+
+def _default_log_path() -> str | None:
+    cwd = os.getcwd()
+    temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
+    if not temp_dir:
+        return None
+    return os.path.join(cwd, temp_dir, "ardb.log")
+
+def _log_ard(message: str, to_console: bool = False):
+    """
+    双轨日志记录：
+    - 始终尝试写入磁盘文件 (ardb.log) 以供开发者检查。
+    - 根据 to_console 参数决定是否实时打印到 GDB 终端。
+    """
+    path = _default_log_path()
+    if path:
+        try:
+            # 确保 temp 目录存在（如果之前没生成白名单的话）
+            log_dir = os.path.dirname(path)
+            if not os.path.exists(log_dir):
+                os.makedirs(log_dir, exist_ok=True)
+                
+            with open(path, "a", encoding="utf-8") as fp:
+                fp.write(message + "\n")
+        except Exception:
+            pass
+
+    if to_console:
+        gdb.write(message + "\n")
 
 # -------------------------
 # Callee selection
@@ -492,7 +525,6 @@ def _on_exited(event):
 def _on_new_objfile(event):
     _cleanup_run_scoped()
 
-
 # -------------------------
 # Breakpoints
 # -------------------------
@@ -541,18 +573,18 @@ class PollEntryBP(gdb.Breakpoint):
 
         # new coro line
         if cid and is_new:
-            gdb.write(f"[ARD]{indent} coro#{cid} new: {poll_sym} @ {this_ptr:#x}\n")
+            _log_ard(f"[ARD]{indent} coro#{cid} new: {poll_sym} @ {this_ptr:#x}") # 使用默认的 False
 
         # poll line
         if (not self.internal) or PRINT_INTERNAL_POLL_HITS:
-            gdb.write(f"[ARD]{indent} poll[coro#{cid} poll#{seq}] {fn}\n")
+            _log_ard(f"[ARD]{indent} poll[coro#{cid} poll#{seq}] {fn}") # 使用默认的 False
 
         # awaitee line (no output dedup)
         if self.poll_sym:
             awa = _try_read_awaitee_from_current_poll(self.poll_sym)
             if awa is not None:
                 awa_ty, _awa_val = awa
-                gdb.write(f"[ARD]{indent} awa[coro#{cid} poll#{seq}] {fn} -> {awa_ty}\n")
+                _log_ard(f"[ARD]{indent} awa[coro#{cid} poll#{seq}] {fn} -> {awa_ty}") # 使用默认的 False
 
                 # auto-trace child async fn/block by symbol (install once)
                 child_poll = _child_poll_symbol_from_awaitee_type(awa_ty)
@@ -568,7 +600,7 @@ class PollEntryBP(gdb.Breakpoint):
                 call_sites = _collect_call_sites()
             except gdb.error as e:
                 if (not self.internal) or PRINT_INTERNAL_POLL_HITS:
-                    gdb.write(f"[ARD]{indent} call-site scan failed: {e}\n")
+                    _log_ard(f"[ARD]{indent} call-site scan failed: {e}")
                 return False
 
             for a in call_sites:
@@ -576,7 +608,7 @@ class PollEntryBP(gdb.Breakpoint):
 
             _CALLSITE_INSTALLED_FOR_FN.add(fn)
             if (not self.internal) or PRINT_INTERNAL_POLL_HITS:
-                gdb.write(f"[ARD]{indent} call-sites: {len(call_sites)}\n")
+                _log_ard(f"[ARD]{indent} call-sites: {len(call_sites)}")
 
         return False
 
@@ -604,17 +636,14 @@ class CallSiteBP(gdb.Breakpoint):
         seq = _CO_POLL_SEQ.get(cid, 0) if cid else 0
 
         # call line (no output dedup)
-        gdb.write(f"[ARD]{indent} call[coro#{cid} poll#{seq}] {caller} -> {callee}\n")
+        _log_ard(f"[ARD]{indent} call[coro#{cid} poll#{seq}] {caller} -> {callee}") # 使用默认的 False
 
-        # IMPORTANT: 不要装 *addr 的临时 PollEntryBP（会导致重复命中）
-        # 只按“符号名”装一个（一次装好，所有实例都会进）
         if _is_pollish_name(callee) and callee not in _ACTIVE_ROOTS:
             _ACTIVE_ROOTS.add(callee)
             PollEntryBP(callee, poll_sym=callee, internal=True, temporary=False)
 
         return False
-
-
+    
 # -------------------------
 # Commands
 # -------------------------
@@ -669,8 +698,16 @@ class ARDResetCommand(gdb.Command):
         global _CO_NEXT_ID
         _CO_NEXT_ID = 1
 
-        gdb.write("[ARD] reset done.\n")
+        # Clear log file if exists
+        path = _default_log_path()
+        if path and os.path.exists(path):
+            try:
+                with open(path, "w") as f:
+                    pass
+            except Exception:
+                pass
 
+        gdb.write("[ARD] reset done.\n")
 
 class ARDLoadWhitelistCommand(gdb.Command):
     def __init__(self):
@@ -712,6 +749,82 @@ class ARDGenWhitelistCommand(gdb.Command):
         except Exception as e:
             gdb.write(f"[ARD] gen_default_whitelist failed: {e}\n")
 
+class ARDGetSnapshotCommand(gdb.Command):
+    """
+    Get a mixed-mode snapshot of the current call stack, including 
+    asynchronous coroutines and synchronous function calls.
+    Usage: ardb-get-snapshot
+    """
+    def __init__(self):
+        super().__init__("ardb-get-snapshot", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        tid = _thread_id()
+        stack = _TLS_STACK.get(tid, [])
+        
+        snapshot = {
+            "thread_id": tid,
+            "path": []
+        }
+        
+        # 1. Extract the asynchronous shadow stack (Coroutines)
+        top_async_func = ""
+        for cid in stack:
+            poll_sym, this_ptr = _CO_META.get(cid, ("<unknown>", 0))
+            seq = _CO_POLL_SEQ.get(cid, 0)
+            top_async_func = poll_sym
+            
+            state_val = "N/A"
+            env_type_name = _pollsym_to_envtype(poll_sym)
+            if env_type_name and this_ptr:
+                try:
+                    env_t = gdb.lookup_type(env_type_name)
+                    env_val = gdb.Value(this_ptr).cast(env_t.pointer()).dereference()
+                    state_val = int(env_val["__state"])
+                except Exception:
+                    pass
+
+            snapshot["path"].append({
+                "type": "async",
+                "cid": cid,
+                "func": poll_sym,
+                "addr": hex(this_ptr),
+                "poll": seq,
+                "state": state_val
+            })
+            
+        # 2. Extract the synchronous tail (Physical frames above the top coroutine)
+        sync_tail = []
+        try:
+            # Start from the currently selected frame (deepest)
+            frame = gdb.selected_frame()
+            while frame:
+                fname = frame.name()
+                
+                # Stop if we reach the poll entry of the top async function 
+                # to avoid duplication with the shadow stack
+                if fname == top_async_func:
+                    break
+                
+                if fname:
+                    sync_tail.append({
+                        "type": "sync",
+                        "cid": None,
+                        "func": fname,
+                        "addr": hex(frame.pc()),
+                        "poll": 0,
+                        "state": "NON-ASYNC"
+                    })
+                frame = frame.older()
+        except Exception:
+            pass
+            
+        # Physical frames are captured in reverse order (deepest first), 
+        # so we reverse them before appending to the path.
+        snapshot["path"].extend(reversed(sync_tail))
+            
+        # Output pure JSON for the Debug Adapter
+        gdb.write(json.dumps(snapshot) + "\n")
 
 # -------------------------
 # Entry
@@ -727,6 +840,7 @@ def install():
     ARDResetCommand()
     ARDLoadWhitelistCommand()
     ARDGenWhitelistCommand()
+    ARDGetSnapshotCommand()
 
     if not _EVENTS_INSTALLED:
         try:
@@ -739,4 +853,4 @@ def install():
             pass
         _EVENTS_INSTALLED = True
 
-    gdb.write("[ARD] installed. Commands: ardb-trace, ardb-reset, ardb-load-whitelist, ardb-gen-whitelist\n")
+    gdb.write("[ARD] installed. Commands: ardb-gen-whitelist, ardb-load-whitelist, ardb-trace, ardb-get-snapshot, ardb-reset\n")
