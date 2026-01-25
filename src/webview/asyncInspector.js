@@ -1,5 +1,7 @@
 (function() {
     const vscode = acquireVsCodeApi();
+    console.log("Webview JS Loaded!"); // 调试日志
+    let treeData = window.treeData || [];
     let selectedNode = null;
     let candidates = [];
 
@@ -12,14 +14,17 @@
 
     function setupEventListeners() {
         document.getElementById('resetBtn').addEventListener('click', () => {
+            console.log("Reset button clicked!");
             vscode.postMessage({ command: 'reset' });
         });
 
         document.getElementById('genWhitelistBtn').addEventListener('click', () => {
+            console.log("GenWhitelist button clicked!");
             vscode.postMessage({ command: 'genWhitelist' });
         });
 
         document.getElementById('snapshotBtn').addEventListener('click', () => {
+            console.log("Snapshot button clicked!");
             vscode.postMessage({ command: 'snapshot' });
         });
     }

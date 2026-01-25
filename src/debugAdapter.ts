@@ -1,3 +1,4 @@
+// src/debugAdapter.ts
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { GDBDebugSession } from './gdbDebugSession';
@@ -17,9 +18,14 @@ export class ARDDebugAdapterFactory implements vscode.DebugAdapterDescriptorFact
     ): vscode.ProviderResult<vscode.DebugAdapterDescriptor> {
         const config = session.configuration;
         const workspaceFolder = session.workspaceFolder?.uri.fsPath || process.cwd();
+
+        const extensionPath = this.context.extensionPath;
         
-        // 注意：这里指向的是编译后的脚本路径
-        const adapterScript = path.join(this.context.extensionPath, 'out', 'gdbAdapter.js');
+        const pythonPath = extensionPath; 
+    
+        const tempDir = path.join(workspaceFolder, 'temp');
+
+        const adapterScript = path.join(extensionPath, 'out', 'gdbAdapter.js');
         
         return new vscode.DebugAdapterExecutable(
             'node',
@@ -30,7 +36,9 @@ export class ARDDebugAdapterFactory implements vscode.DebugAdapterDescriptorFact
                     ...process.env,
                     ARDB_PROGRAM: config.program,
                     ARDB_ARGS: JSON.stringify(config.args || []),
-                    PYTHONPATH: path.join(workspaceFolder, 'async_rust_debugger')
+                    ARDB_CWD: workspaceFolder,
+                    PYTHONPATH: pythonPath, 
+                    ASYNC_RUST_DEBUGGER_TEMP_DIR: tempDir 
                 }
             }
         );

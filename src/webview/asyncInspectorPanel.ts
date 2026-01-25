@@ -30,6 +30,7 @@ export class AsyncInspectorPanel {
         // Handle messages from the webview
         this._panel.webview.onDidReceiveMessage(
             async (message) => {
+                vscode.window.showInformationMessage(`Webview 呼叫插件: ${message.command}`);
                 switch (message.command) {
                     case 'reset':
                         await this.handleReset();
@@ -150,14 +151,17 @@ export class AsyncInspectorPanel {
 
     private async handleSnapshot(): Promise<void> {
         const session = this._debugAdapterFactory?.getActiveSession();
-        if (!session) {
-            return;
-        }
+        if (!session) return;
 
         const snapshot = await session.getSnapshot();
         if (snapshot) {
             this.updateTreeFromSnapshot(snapshot);
-            this._update();
+
+            const treeData = Array.from(this._treeRoots.values());
+            this._panel.webview.postMessage({
+                command: 'updateTree',
+                treeData: treeData
+            });
         }
     }
 
@@ -352,7 +356,7 @@ export class AsyncInspectorPanel {
         // Get paths to webview resources
         const scriptPath = vscode.Uri.joinPath(this._extensionUri, 'src', 'webview', 'asyncInspector.js');
         const stylePath = vscode.Uri.joinPath(this._extensionUri, 'src', 'webview', 'asyncInspector.css');
-        
+
         const scriptUri = webview.asWebviewUri(scriptPath);
         const styleUri = webview.asWebviewUri(stylePath);
 
@@ -391,8 +395,7 @@ export class AsyncInspectorPanel {
                     </div>
                 </div>
                 <script>
-                    const vscode = acquireVsCodeApi();
-                    const treeData = ${JSON.stringify(treeData)};
+                    window.treeData = ${JSON.stringify(Array.from(this._treeRoots.values()))};
                 </script>
                 <script src="${scriptUri}"></script>
             </body>
