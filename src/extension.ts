@@ -62,9 +62,12 @@ export function activate(context: vscode.ExtensionContext) {
 
     // Open inspector automatically when debug session starts
     const onDidStartDebugSession = vscode.debug.onDidStartDebugSession((session) => {
-        if (session.type === 'ardb') {
+        if (session.type === 'ardb' && debugAdapterFactory) { // 增加检查
             if (!inspectorPanel) {
-                inspectorPanel = AsyncInspectorPanel.createOrShow(context.extensionUri, debugAdapterFactory!);
+                inspectorPanel = AsyncInspectorPanel.createOrShow(
+                    context.extensionUri,
+                    debugAdapterFactory // 移除感叹号，改用上面的 if 判断
+                );
             }
         }
     });

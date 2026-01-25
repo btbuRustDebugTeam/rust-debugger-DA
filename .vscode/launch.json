@@ -1,0 +1,75 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Extension Development Host",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/out/**/*.js"
+      ],
+      "preLaunchTask": "npm: compile",
+      "sourceMaps": true,
+      "internalConsoleOptions": "openOnSessionStart"
+    },
+    {
+      "name": "Extension Development Host (with testcase)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "${workspaceFolder}/testcases/minimal"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/out/**/*.js"
+      ],
+      "preLaunchTask": "npm: compile",
+      "sourceMaps": true,
+      "internalConsoleOptions": "openOnSessionStart"
+    },
+    {
+      "name": "Debug Adapter (standalone)",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/out/gdbAdapter.js",
+      "args": [],
+      "cwd": "${workspaceFolder}/testcases/minimal",
+      "env": {
+        "ARDB_PROGRAM": "${workspaceFolder}/testcases/minimal/target/debug/minimal",
+        "ARDB_ARGS": "[]",
+        "ARDB_CWD": "${workspaceFolder}/testcases/minimal",
+        "PYTHONPATH": "${workspaceFolder}/async_rust_debugger",
+        "ASYNC_RUST_DEBUGGER_TEMP_DIR": "${workspaceFolder}/testcases/minimal/.ardb"
+      },
+      "console": "internalConsole",
+      "internalConsoleOptions": "openOnSessionStart",
+      "sourceMaps": true,
+      "skipFiles": [
+        "<node_internals>/**"
+      ],
+      "preLaunchTask": "npm: compile"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Debug Extension + Debug Target",
+      "configurations": [
+        "Extension Development Host (with testcase)"
+      ],
+      "stopAll": true,
+      "preLaunchTask": "npm: compile"
+    },
+    {
+      "name": "Debug Extension + Debug Adapter",
+      "configurations": [
+        "Extension Development Host",
+        "Debug Adapter (standalone)"
+      ],
+      "stopAll": true,
+      "preLaunchTask": "npm: compile"
+    }
+  ]
+}

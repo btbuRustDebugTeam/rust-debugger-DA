@@ -116,18 +116,13 @@ export class GDBDebugSession {
         }
 
         try {
-            // Try to send as custom request
             const response = await this.debugSession.customRequest('evaluate', {
                 expression: command,
                 context: 'repl'
             });
             return response?.result || '';
         } catch (error) {
-            // Fallback: if custom request doesn't work, we'll need to use
-            // a different approach (e.g., through debug console)
-            console.warn('Custom request failed, trying alternative method:', error);
-            // For now, return empty string - in a full implementation,
-            // we would use GDB MI protocol or debug console
+            console.error('GDB Command Failed:', command, error);
             return '';
         }
     }
