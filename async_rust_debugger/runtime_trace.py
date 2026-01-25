@@ -824,7 +824,18 @@ class ARDGetSnapshotCommand(gdb.Command):
         snapshot["path"].extend(reversed(sync_tail))
             
         # Output pure JSON for the Debug Adapter
-        gdb.write(json.dumps(snapshot) + "\n")
+        json_output = json.dumps(snapshot) + "\n"
+        gdb.write(json_output)
+        
+        # Also write to file if ASYNC_RUST_DEBUGGER_TEMP_DIR is set (for DA integration)
+        temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
+        if temp_dir:
+            snapshot_path = os.path.join(os.getcwd(), temp_dir, "ardb_snapshot.json")
+            try:
+                with open(snapshot_path, "w", encoding="utf-8") as f:
+                    f.write(json_output)
+            except Exception:
+                pass  # Best-effort file write, don't fail if it doesn't work
 
 # -------------------------
 # Entry

@@ -1,0 +1,209 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+    color: var(--vscode-foreground);
+    background-color: var(--vscode-editor-background);
+    padding: 10px;
+}
+
+.container {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+}
+
+.toolbar {
+    display: flex;
+    gap: 10px;
+    padding: 10px;
+    border-bottom: 1px solid var(--vscode-panel-border);
+    margin-bottom: 10px;
+}
+
+.btn {
+    padding: 6px 12px;
+    background-color: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    border: none;
+    border-radius: 2px;
+    cursor: pointer;
+    font-size: 12px;
+}
+
+.btn:hover {
+    background-color: var(--vscode-button-hoverBackground);
+}
+
+.main-content {
+    display: flex;
+    flex: 1;
+    gap: 20px;
+    overflow: hidden;
+}
+
+.tree-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: auto;
+}
+
+.side-panel {
+    width: 300px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    border-left: 1px solid var(--vscode-panel-border);
+    padding-left: 10px;
+}
+
+h3 {
+    font-size: 14px;
+    margin-bottom: 10px;
+    color: var(--vscode-foreground);
+}
+
+#treeContainer {
+    flex: 1;
+    overflow: auto;
+}
+
+.tree-node {
+    margin: 5px 0;
+    padding: 5px;
+    border-radius: 3px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.tree-node:hover {
+    background-color: var(--vscode-list-hoverBackground);
+}
+
+.tree-node.selected {
+    background-color: var(--vscode-list-activeSelectionBackground);
+    color: var(--vscode-list-activeSelectionForeground);
+}
+
+.tree-node.async {
+    border-left: 3px solid #ff6b6b;
+}
+
+.tree-node.sync {
+    border-left: 3px solid #51cf66;
+}
+
+.node-content {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.node-type {
+    font-weight: bold;
+    font-size: 11px;
+}
+
+.node-info {
+    flex: 1;
+    font-size: 12px;
+}
+
+.node-func {
+    font-weight: 500;
+}
+
+.node-meta {
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    margin-top: 2px;
+}
+
+.node-children {
+    margin-left: 20px;
+    margin-top: 5px;
+}
+
+.candidates-section {
+    flex: 1;
+    overflow: auto;
+}
+
+#candidatesList {
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.candidate-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 5px;
+    margin: 3px 0;
+    border-radius: 3px;
+}
+
+.candidate-item:hover {
+    background-color: var(--vscode-list-hoverBackground);
+}
+
+.candidate-symbol {
+    flex: 1;
+    font-size: 12px;
+    font-family: var(--vscode-editor-font-family);
+}
+
+.candidate-actions {
+    display: flex;
+    gap: 5px;
+}
+
+.candidate-btn {
+    padding: 3px 8px;
+    font-size: 11px;
+    background-color: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+    border: none;
+    border-radius: 2px;
+    cursor: pointer;
+}
+
+.candidate-btn:hover {
+    background-color: var(--vscode-button-secondaryHoverBackground);
+}
+
+.log-section {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 200px;
+}
+
+#logContainer {
+    flex: 1;
+    overflow-y: auto;
+    font-family: var(--vscode-editor-font-family);
+    font-size: 11px;
+    background-color: var(--vscode-textBlockQuote-background);
+    padding: 10px;
+    border-radius: 3px;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+.log-entry {
+    margin: 2px 0;
+    padding: 2px 0;
+}
+
+.log-entry.highlight {
+    background-color: var(--vscode-textBlockQuote-border);
+    padding: 2px 5px;
+    border-radius: 2px;
+}

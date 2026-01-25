@@ -1,0 +1,93 @@
+{
+  "name": "async-rust-debugger",
+  "displayName": "Async Rust Debugger",
+  "description": "Debug adapter for async Rust code with async inspector panel",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "activationEvents": [
+    "onDebug"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "debuggers": [
+      {
+        "type": "ardb",
+        "label": "ARD (Async Rust Debugger)",
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Path to the Rust executable to debug",
+                "default": "${workspaceFolder}/target/debug/${workspaceFolderBasename}"
+              },
+              "args": {
+                "type": "array",
+                "description": "Command line arguments",
+                "default": []
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory",
+                "default": "${workspaceFolder}"
+              },
+              "env": {
+                "type": "object",
+                "description": "Environment variables"
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "ardb",
+            "request": "launch",
+            "name": "Launch Rust Program",
+            "program": "${workspaceFolder}/target/debug/${workspaceFolderBasename}"
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "ardb.openInspector",
+        "title": "Open Async Inspector",
+        "icon": "$(debug-console)"
+      },
+      {
+        "command": "ardb.traceFunction",
+        "title": "Trace Function",
+        "icon": "$(debug-start)"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "ardb.traceFunction",
+          "when": "editorLangId == rust"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "vscode-debugadapter": "^1.50.0"
+  }
+}
