@@ -88,6 +88,6 @@
     "typescript": "^5.0.0"
   },
   "dependencies": {
-    "vscode-debugadapter": "^1.50.0"
+    "@vscode/debugadapter": "^1.50.0"
   }
 }
