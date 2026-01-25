@@ -8,9 +8,10 @@ let inspectorPanel: AsyncInspectorPanel | undefined;
 export function activate(context: vscode.ExtensionContext) {
     console.log('ARD Debug Adapter extension is now active');
 
-    // Create debug adapter factory (simplified - doesn't need DAP registration for now)
+    // Create and register debug adapter factory
     debugAdapterFactory = new ARDDebugAdapterFactory(context);
-    context.subscriptions.push(debugAdapterFactory);
+    const disposable = vscode.debug.registerDebugAdapterDescriptorFactory('ardb', debugAdapterFactory);
+    context.subscriptions.push(disposable, debugAdapterFactory);
 
     // Register command to open async inspector
     const openInspectorCommand = vscode.commands.registerCommand('ardb.openInspector', () => {
