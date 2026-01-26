@@ -1,165 +1,52 @@
-# ARD Debug Adapter (DA) Implementation
+## Async Rust Debugger - Debug Adapter (DA) 使用方法
+本项目是一款针对 Async Rust 协程执行流设计的调试适配器（Debug Adapter）。它通过对接 VS Code Debug Adapter Protocol (DAP) 与后端 GDB 脚本，实现了异步调用栈的深度解析与可视化渲染。
 
-This document describes the VS Code Debug Adapter implementation for the Async Rust Debugger.
-
-## Overview
-
-The Debug Adapter (DA) serves as a coordinator between the VS Code interface and the GDB backend (Python scripts). Its core task is to restore "broken physical execution frames" into "continuous logical async lifelines".
-
-## Architecture
-
-### Components
-
-1. **Extension Entry Point** (`src/extension.ts`)
-   - Activates the extension
-   - Registers commands and debug session listeners
-   - Manages the async inspector panel lifecycle
-
-2. **Debug Adapter Factory** (`src/debugAdapter.ts`)
-   - Manages GDB debug session instances
-   - Provides access to active sessions for UI components
-
-3. **GDB Debug Session** (`src/gdbDebugSession.ts`)
-   - Communicates with GDB via VS Code debug session API
-   - Executes ARD-specific commands (ardb-reset, ardb-gen-whitelist, etc.)
-   - Reads snapshot data from files
-   - Manages file watchers for whitelist auto-reload
-
-4. **Async Inspector Panel** (`src/webview/asyncInspectorPanel.ts`)
-   - Webview panel for displaying async execution trees
-   - Handles user interactions (buttons, node selection)
-   - Updates tree visualization from snapshot data
-
-5. **Webview UI** (`src/webview/asyncInspector.js`, `asyncInspector.css`)
-   - Frontend JavaScript for tree rendering
-   - CSS styling for the inspector panel
-   - Event handlers for user interactions
-
-## Features
-
-### 1. Async Inspector Panel
-
-The panel displays:
-- **Multi-root async trees**: Multiple independent execution trees if multiple entry points are traced
-- **Node types**: Color-coded (red for async coroutines, green for sync functions)
-- **Metadata**: Each node shows CID, Poll Count, and State
-- **Thread context**: Shows which OS thread executed the current path
-- **Log preview**: Displays last few log entries for selected CID
-
-### 2. Button Commands
-
-| Button | Backend Command | Behavior |
-|--------|---------------|----------|
-| Reset | `ardb-reset` | Deletes all breakpoints, resets CID counter, clears `ardb.log` |
-| Gen Whitelist | `ardb-gen-whitelist` | Triggers static analysis, generates whitelist, opens file |
-| Snapshot | `ardb-get-snapshot` | Gets current async+sync call stack JSON |
-| Trace | `ardb-trace <sym>` | Adds target function to trace roots |
-
-### 3. Whitelist Management
-
-- **Auto-generation**: Click "Gen Whitelist" to scan and generate `poll_functions.txt`
-- **Auto-reload**: File watcher automatically reloads whitelist when file is saved
-- **Candidates panel**: Shows all whitelist functions with Trace and Locate buttons
-
-### 4. Frame Switching
-
-When clicking a coroutine node in the tree:
-- DA tells VS Code to switch the selected frame to the corresponding physical frame
-- VS Code's native variable panel automatically refreshes
-- Shows all variables within that coroutine
-
-## Communication Protocol
-
-### Snapshot Data Format
-
-The DA parses JSON output from `ardb-get-snapshot`:
-
-```json
+#### 1.环境配置 (launch.json)
+在需要调试的 Rust 项目根目录下，创建 .vscode/launch.json 并使用以下标准配置。该配置会自动调用插件注册的 ardb 调试引擎。
+```JSON
 {
-  "thread_id": 1,
-  "path": [
+  "version": "0.2.0",
+  "configurations": [
     {
-      "type": "async",
-      "cid": 1,
-      "func": "minimal::nonleaf::{async_fn#0}",
-      "addr": "0x7fffffffd0c4",
-      "poll": 2,
-      "state": 3
-    },
-    {
-      "type": "sync",
-      "cid": null,
-      "func": "minimal::sync_a",
-      "addr": "0x55555556a014",
-      "state": "NON-ASYNC"
+      "name": "Debug Rust (ARD)",
+      "type": "ardb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/${workspaceFolderBasename}",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "stopOnEntry": false,
+      "console": "internalConsole",
+      "preLaunchTask": "cargo build"
     }
   ]
 }
 ```
+#### 2. 标准调试流程
+为了保证调试上下文与 GDB 状态的同步，请严格遵循以下操作顺序：
 
-### File-based Communication
+###### 第一步：启动插件环境
+- 在插件工程源代码中，进入“运行和调试”面板。
 
-Since direct GDB command output capture through DAP is limited, the implementation uses file-based communication:
+- 选择 Extension Development Host 配置并按下 F5。
 
-- **Snapshots**: Written to `temp/ardb_snapshot.json` by the Python script
-- **Logs**: Written to `temp/ardb.log` by the Python script
-- **Whitelist**: Read from `temp/poll_functions.txt`
+- 系统将启动一个集成该插件的新 VS Code 窗口。
 
-## Development Notes
+###### 第二步：激活调试会话
+- 在弹出的新窗口中打开待调试的 Rust 项目。
 
-### GDB Command Execution
+- 按下 F5 启动 Debug Rust (ARD) 配置。
 
-The current implementation attempts to execute GDB commands via the debug session's `customRequest` API. However, this may not work with all debug adapters. The implementation includes fallbacks:
+- 系统将自动弹出 Async Inspector 调试面板。
 
-1. Try to execute via `customRequest('evaluate', ...)`
-2. If that fails, read from files (if commands were executed manually in GDB console)
-3. Use last known snapshot if file read fails
+###### 第三步：初始化与白名单配置
+- 环境重置 (Reset)：首先点击面板顶部的 Reset 按钮。此操作将初始化后端 GDB 运行环境并同步寄存器状态。
 
-### Future Improvements
+- 生成白名单 (Gen Whitelist)：点击 Gen Whitelist 按钮。插件将自动扫描二进制文件的符号表，识别异步 poll 函数，并自动弹出生成的 poll_functions.txt 文件。
 
-1. **Full DAP Implementation**: Implement a complete DAP server that communicates directly with GDB via MI protocol
-2. **Better Command Execution**: Use GDB MI protocol directly for more reliable command execution
-3. **Real-time Updates**: Implement event-driven updates instead of polling
-4. **Tree History**: Maintain execution history to build accurate tree structures
+- 设置追踪点 (Trace)：
 
-## Building and Testing
+1. 检查弹出的白名单文件，根据需求手动修改并保存。
 
-1. Install dependencies:
-   ```bash
-   npm install
-   ```
+2. 在面板右侧的候选列表中选择目标函数，点击 Trace 设置异步入口(可设置多个)。
 
-2. Compile TypeScript:
-   ```bash
-   npm run compile
-   ```
-
-3. Open in VS Code and press F5 to launch extension development host
-
-4. Create a launch configuration:
-   ```json
-   {
-     "type": "ardb",
-     "request": "launch",
-     "name": "Debug Rust",
-     "program": "${workspaceFolder}/testcases/minimal/target/debug/minimal"
-   }
-   ```
-
-5. Start debugging - the Async Inspector panel should open automatically
-
-## Integration with GDB Backend
-
-The DA works with the existing GDB Python scripts:
-
-1. **Initialization**: GDB must be started with `python import async_rust_debugger`
-2. **Commands**: All `ardb-*` commands are available in GDB
-3. **File Output**: Python scripts write snapshots and logs to the temp directory
-4. **Environment**: Set `ASYNC_RUST_DEBUGGER_TEMP_DIR` environment variable
-
-## Limitations
-
-- Command execution relies on debug adapter support for custom requests
-- Snapshot updates are file-based and may have slight delays
-- Tree building is simplified and may not capture all execution history
-- Frame switching requires proper DAP frame support
+3. 执行追踪：完成上述配置后，通过 VS Code 调试工具栏进行单步跳过或继续运行，即可在左侧实时观察生成的 Async Execution Tree。
