@@ -73,28 +73,27 @@ class AsyncInspectorPanel {
                 case 'refreshCandidates':
                     await this.handleRefreshCandidates();
                     break;
-                case 'selectFrame':
-                    await this.handleSelectFrame(message.file, message.line);
-                    break;
             }
         }, null, this._disposables);
-        // Listen for debug session events
+        // Listen for debug session changes
         vscode.debug.onDidChangeActiveDebugSession((session) => {
             this._debugSession = session?.type === 'ardb' ? session : undefined;
-            if (this._debugSession) {
-                this.startAutoRefresh();
-                this.handleCallStack();
-            }
-            else {
-                this.stopAutoRefresh();
-            }
         }, null, this._disposables);
-        vscode.debug.onDidReceiveDebugSessionCustomEvent((event) => {
-            if (event.session.type === 'ardb' && event.event === 'stopped') {
-                this.handleSnapshot();
-                this.handleCallStack();
+        // Register a DebugAdapterTracker to intercept stopped events from the adapter.
+        // This replaces the 500ms polling timer with event-driven updates.
+        const trackerDisposable = vscode.debug.registerDebugAdapterTrackerFactory('ardb', {
+            createDebugAdapterTracker: (_session) => {
+                return {
+                    onDidSendMessage: (message) => {
+                        if (message.type === 'event' && message.event === 'stopped') {
+                            this._debugSession = _session;
+                            this.onDebugStopped(message.body);
+                        }
+                    }
+                };
             }
-        }, null, this._disposables);
+        });
+        this._disposables.push(trackerDisposable);
     }
     static createOrShow(extensionUri, debugAdapterFactory) {
         const column = vscode.window.activeTextEditor
@@ -117,18 +116,30 @@ class AsyncInspectorPanel {
     reveal() {
         this._panel.reveal();
     }
-    startAutoRefresh() {
-        this.stopAutoRefresh();
-        // Refresh every 500ms when debug session is active
-        this._refreshInterval = setInterval(() => {
-            this.handleSnapshot();
-        }, 500);
-    }
-    stopAutoRefresh() {
-        if (this._refreshInterval) {
-            clearInterval(this._refreshInterval);
-            this._refreshInterval = undefined;
-        }
+    /**
+     * Called when the debug adapter sends a "stopped" event.
+     * Triggers snapshot refresh automatically when the inferior has been
+     * started (not the synthetic "entry" stop).
+     *
+     * Uses a small delay to let VS Code's own stopped-event handling
+     * (threads, stackTrace) settle first, avoiding request conflicts.
+     */
+    onDebugStopped(stoppedBody) {
+        const isEntry = stoppedBody?.reason === 'entry';
+        console.log(`[AsyncInspector] onDebugStopped reason=${stoppedBody?.reason} isEntry=${isEntry} hasSession=${!!this._debugSession}`);
+        // Serialize requests to avoid race conditions in the GDB MI2 command
+        // pipeline — concurrent evaluate requests can cause console output to
+        // be misrouted via the shared lastSentToken in gdbAdapter.
+        setTimeout(async () => {
+            try {
+                if (!isEntry) {
+                    await this.handleSnapshot();
+                }
+            }
+            catch (e) {
+                console.error('[AsyncInspector] onDebugStopped handlers failed:', e);
+            }
+        }, 300);
     }
     async handleReset() {
         const session = this._debugAdapterFactory?.getActiveSession();
@@ -156,15 +167,18 @@ class AsyncInspectorPanel {
     }
     async handleSnapshot() {
         const session = this._debugAdapterFactory?.getActiveSession();
-        if (!session)
+        if (!session) {
+            console.warn('[AsyncInspector] handleSnapshot: no GDB session from factory');
             return;
+        }
         const snapshot = await session.getSnapshot();
+        console.log('[AsyncInspector] handleSnapshot: result =', snapshot ? `thread_id=${snapshot.thread_id}, path.length=${snapshot.path.length}` : 'null');
         if (snapshot) {
+            this._lastSnapshot = snapshot;
             this.updateTreeFromSnapshot(snapshot);
-            const treeData = Array.from(this._treeRoots.values());
             this._panel.webview.postMessage({
                 command: 'updateTree',
-                treeData: treeData
+                treeData: Array.from(this._treeRoots.values()),
             });
         }
     }
@@ -172,77 +186,75 @@ class AsyncInspectorPanel {
         if (cid === null || !this._debugSession) {
             return;
         }
-        // Find the frame corresponding to this CID
-        const snapshot = await this._debugAdapterFactory?.getActiveSession()?.getSnapshot();
+        const snapshot = this._lastSnapshot;
         if (!snapshot) {
             return;
         }
-        // Find the frame index for this CID in the snapshot path
-        // Note: The snapshot path is ordered from root to leaf
-        // We need to find the physical frame that corresponds to this async frame
+        // Find the frame index for this CID in the snapshot path.
+        // The snapshot path is ordered root → leaf (async chain).
+        // We map this to the physical GDB stack frame index.
         let targetFrameIndex = -1;
         for (let i = 0; i < snapshot.path.length; i++) {
             const node = snapshot.path[i];
             if (node.type === 'async' && node.cid === cid) {
-                // For async nodes, we need to find the corresponding physical frame
-                // The sync tail after this async node represents the physical frames
-                // Count backwards from the end to find the right frame
                 targetFrameIndex = snapshot.path.length - 1 - i;
                 break;
             }
         }
-        if (targetFrameIndex >= 0 && this._debugSession) {
-            // Request stack trace to get frame IDs
+        if (targetFrameIndex >= 0) {
             try {
+                // Get real frame IDs from the stack trace
                 const stackTrace = await this._debugSession.customRequest('stackTrace', {
-                    threadId: snapshot.thread_id
+                    threadId: snapshot.thread_id,
+                    startFrame: 0,
+                    levels: 200,
                 });
-                if (stackTrace && stackTrace.stackFrames && stackTrace.stackFrames.length > targetFrameIndex) {
-                    const frameId = stackTrace.stackFrames[targetFrameIndex].id;
-                    // Select the frame
-                    await this._debugSession.customRequest('scopes', {
-                        frameId: frameId
+                const frames = stackTrace?.stackFrames || [];
+                if (frames.length > targetFrameIndex) {
+                    const frame = frames[targetFrameIndex];
+                    // Use evaluate to switch GDB to this frame, which updates
+                    // the variables view via the debug session
+                    await this._debugSession.customRequest('evaluate', {
+                        expression: `frame ${targetFrameIndex}`,
+                        context: 'repl',
                     });
-                    // VS Code will automatically update the variables view
+                    // Also open the source file at the frame location
+                    if (frame.source?.path) {
+                        await this.handleSelectFrame(frame.source.path, frame.line || 0);
+                    }
                 }
             }
             catch (error) {
                 console.error('Failed to switch frame:', error);
-                // Fallback: try to use evaluate to change frame
-                try {
-                    await this._debugSession.customRequest('evaluate', {
-                        expression: `frame ${targetFrameIndex}`,
-                        context: 'repl'
-                    });
-                }
-                catch (e) {
-                    console.error('Fallback frame switch also failed:', e);
-                }
             }
-        }
-        // Get log entries for this CID
-        const session = this._debugAdapterFactory?.getActiveSession();
-        if (session && cid !== null) {
-            const logEntries = await session.getLogEntriesForCID(cid);
-            this._panel.webview.postMessage({
-                command: 'updateLogs',
-                cid: cid,
-                logs: logEntries
-            });
         }
     }
     async handleLocate(symbol) {
-        // Use VS Code's symbol search to locate the function
-        const symbols = await vscode.commands.executeCommand('vscode.executeWorkspaceSymbolProvider', symbol);
-        if (symbols && symbols.length > 0) {
-            const symbolInfo = symbols[0];
-            const doc = await vscode.workspace.openTextDocument(symbolInfo.location.uri);
-            await vscode.window.showTextDocument(doc, {
-                selection: symbolInfo.location.range
-            });
+        // Use GDB's "info line" command to find the source location of the symbol.
+        // The candidate symbols are fully-qualified GDB names (e.g.
+        // "my_crate::my_module::my_async_fn") that workspace symbol providers
+        // cannot resolve, but GDB can map them to source files directly.
+        const session = this._debugAdapterFactory?.getActiveSession();
+        if (!session) {
+            vscode.window.showWarningMessage('No active debug session');
+            return;
         }
-        else {
-            vscode.window.showWarningMessage(`Symbol not found: ${symbol}`);
+        try {
+            const output = await session.executeGDBCommand(`info line ${symbol}`);
+            // GDB output format: "Line 42 of \"src/main.rs\" starts at address ..."
+            const match = output.match(/Line\s+(\d+)\s+of\s+"([^"]+)"/);
+            if (match) {
+                const line = parseInt(match[1], 10);
+                const filePath = match[2];
+                await this.handleSelectFrame(filePath, line);
+            }
+            else {
+                vscode.window.showWarningMessage(`Cannot locate source for: ${symbol}`);
+            }
+        }
+        catch (error) {
+            console.error('Failed to locate symbol:', error);
+            vscode.window.showWarningMessage(`Failed to locate: ${symbol}`);
         }
     }
     async handleRefreshCandidates() {
@@ -253,55 +265,6 @@ class AsyncInspectorPanel {
                 command: 'updateCandidates',
                 candidates: candidates
             });
-        }
-    }
-    /**
-     * Fetch thread list and call stack from GDB via the debug session,
-     * then send the data to the webview for rendering.
-     */
-    async handleCallStack() {
-        if (!this._debugSession) {
-            return;
-        }
-        try {
-            // 1. Get threads
-            const threadsResponse = await this._debugSession.customRequest('threads');
-            const threads = threadsResponse?.threads || [];
-            // 2. For each thread, get stack trace
-            const threadStacks = [];
-            for (const thread of threads) {
-                try {
-                    const stackResponse = await this._debugSession.customRequest('stackTrace', {
-                        threadId: thread.id,
-                        startFrame: 0,
-                        levels: 100,
-                    });
-                    const frames = (stackResponse?.stackFrames || []).map((f) => ({
-                        id: f.id,
-                        name: f.name || '<unknown>',
-                        file: f.source?.name || '',
-                        path: f.source?.path || '',
-                        line: f.line || 0,
-                        addr: f.instructionPointerReference || '',
-                    }));
-                    threadStacks.push({
-                        threadId: thread.id,
-                        threadName: thread.name,
-                        frames,
-                    });
-                }
-                catch (e) {
-                    // Thread might have exited between listing and stack query
-                    console.warn(`Failed to get stack for thread ${thread.id}:`, e);
-                }
-            }
-            this._panel.webview.postMessage({
-                command: 'updateCallStack',
-                threadStacks,
-            });
-        }
-        catch (error) {
-            console.error('Failed to fetch call stack:', error);
         }
     }
     /**
@@ -346,10 +309,10 @@ class AsyncInspectorPanel {
         if (rootNode.cid === null) {
             return;
         }
-        // Check if we already have this root
-        if (!this._treeRoots.has(rootNode.cid)) {
-            // Create new root
-            const treeNode = {
+        // Get or create root tree node
+        let root = this._treeRoots.get(rootNode.cid);
+        if (!root) {
+            root = {
                 type: 'async',
                 cid: rootNode.cid,
                 func: rootNode.func,
@@ -358,22 +321,29 @@ class AsyncInspectorPanel {
                 state: rootNode.state,
                 children: []
             };
-            this._treeRoots.set(rootNode.cid, treeNode);
+            this._treeRoots.set(rootNode.cid, root);
         }
-        // Build tree from snapshot path
-        // This is a simplified version - in reality, we'd need to track
-        // the tree structure more carefully based on the execution history
-        const root = this._treeRoots.get(rootNode.cid);
-        this.buildTreeFromPath(root, snapshot.path, rootIndex);
+        else {
+            root.poll = rootNode.poll;
+            root.state = rootNode.state;
+        }
+        // Build the child chain from the snapshot path
+        this.mergePathIntoTree(root, snapshot.path, rootIndex + 1);
     }
-    buildTreeFromPath(parent, path, startIndex) {
-        // Simplified tree building - in practice, this would need to track
-        // the actual call hierarchy from the log
-        for (let i = startIndex + 1; i < path.length; i++) {
+    /**
+     * Merge the snapshot path (from startIndex onward) into the tree under `parent`.
+     * - Async nodes are matched by CID and updated or created.
+     * - Sync nodes are deduplicated by func+addr to avoid duplicates on re-snapshot.
+     * - The path represents a single chain (not a fan-out), so each level
+     *   has at most one "current" child being walked.
+     */
+    mergePathIntoTree(parent, path, startIndex) {
+        let current = parent;
+        for (let i = startIndex; i < path.length; i++) {
             const node = path[i];
             if (node.type === 'async' && node.cid !== null) {
-                // Check if child already exists
-                let child = parent.children.find(c => c.cid === node.cid);
+                // Find existing async child by CID
+                let child = current.children.find(c => c.type === 'async' && c.cid === node.cid);
                 if (!child) {
                     child = {
                         type: 'async',
@@ -382,30 +352,34 @@ class AsyncInspectorPanel {
                         addr: node.addr,
                         poll: node.poll,
                         state: node.state,
-                        children: []
+                        children: [],
                     };
-                    parent.children.push(child);
+                    current.children.push(child);
                 }
                 else {
-                    // Update existing child
+                    // Update mutable fields
                     child.poll = node.poll;
                     child.state = node.state;
                 }
-                // Recursively build children
-                this.buildTreeFromPath(child, path, i);
+                // Continue deeper into this child
+                current = child;
             }
             else if (node.type === 'sync') {
-                // Add sync node as child
-                const syncChild = {
-                    type: 'sync',
-                    cid: null,
-                    func: node.func,
-                    addr: node.addr,
-                    poll: 0,
-                    state: 'NON-ASYNC',
-                    children: []
-                };
-                parent.children.push(syncChild);
+                // Dedup sync nodes by func + addr
+                const existing = current.children.find(c => c.type === 'sync' && c.func === node.func && c.addr === node.addr);
+                if (!existing) {
+                    const syncChild = {
+                        type: 'sync',
+                        cid: null,
+                        func: node.func,
+                        addr: node.addr,
+                        poll: 0,
+                        state: 'NON-ASYNC',
+                        children: [],
+                    };
+                    current.children.push(syncChild);
+                    // Sync nodes are leaf-like, don't descend into them
+                }
             }
         }
     }
@@ -419,7 +393,6 @@ class AsyncInspectorPanel {
         const stylePath = vscode.Uri.joinPath(this._extensionUri, 'src', 'webview', 'asyncInspector.css');
         const scriptUri = webview.asWebviewUri(scriptPath);
         const styleUri = webview.asWebviewUri(stylePath);
-        const treeData = Array.from(this._treeRoots.values());
         return `<!DOCTYPE html>
             <html lang="en">
             <head>
@@ -439,19 +412,11 @@ class AsyncInspectorPanel {
                         <div class="tree-panel">
                             <h3>Async Execution Tree</h3>
                             <div id="treeContainer"></div>
-                            <div class="callstack-section">
-                                <h3>Call Stack</h3>
-                                <div id="callStackContainer"></div>
-                            </div>
                         </div>
                         <div class="side-panel">
                             <div class="candidates-section">
                                 <h3>Candidates</h3>
                                 <div id="candidatesList"></div>
-                            </div>
-                            <div class="log-section">
-                                <h3>Log Preview</h3>
-                                <div id="logContainer"></div>
                             </div>
                         </div>
                     </div>
@@ -465,7 +430,6 @@ class AsyncInspectorPanel {
     }
     dispose() {
         AsyncInspectorPanel.currentPanel = undefined;
-        this.stopAutoRefresh();
         this._panel.dispose();
         while (this._disposables.length) {
             const x = this._disposables.pop();

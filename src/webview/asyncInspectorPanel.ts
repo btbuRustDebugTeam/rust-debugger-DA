@@ -52,9 +52,6 @@ export class AsyncInspectorPanel {
                     case 'refreshCandidates':
                         await this.handleRefreshCandidates();
                         break;
-                    case 'selectFrame':
-                        await this.handleSelectFrame(message.file, message.line);
-                        break;
                 }
             },
             null,
@@ -116,8 +113,8 @@ export class AsyncInspectorPanel {
 
     /**
      * Called when the debug adapter sends a "stopped" event.
-     * Triggers call stack refresh automatically, and snapshot only
-     * if the inferior has been started (not the synthetic "entry" stop).
+     * Triggers snapshot refresh automatically when the inferior has been
+     * started (not the synthetic "entry" stop).
      *
      * Uses a small delay to let VS Code's own stopped-event handling
      * (threads, stackTrace) settle first, avoiding request conflicts.
@@ -126,13 +123,14 @@ export class AsyncInspectorPanel {
         const isEntry = stoppedBody?.reason === 'entry';
         console.log(`[AsyncInspector] onDebugStopped reason=${stoppedBody?.reason} isEntry=${isEntry} hasSession=${!!this._debugSession}`);
 
+        // Serialize requests to avoid race conditions in the GDB MI2 command
+        // pipeline — concurrent evaluate requests can cause console output to
+        // be misrouted via the shared lastSentToken in gdbAdapter.
         setTimeout(async () => {
             try {
-                const tasks: Promise<void>[] = [this.handleCallStack()];
                 if (!isEntry) {
-                    tasks.push(this.handleSnapshot());
+                    await this.handleSnapshot();
                 }
-                await Promise.all(tasks);
             } catch (e) {
                 console.error('[AsyncInspector] onDebugStopped handlers failed:', e);
             }
@@ -237,33 +235,33 @@ export class AsyncInspectorPanel {
                 console.error('Failed to switch frame:', error);
             }
         }
-
-        // Get log entries for this CID
-        const session = this._debugAdapterFactory?.getActiveSession();
-        if (session) {
-            const logEntries = await session.getLogEntriesForCID(cid);
-            this._panel.webview.postMessage({
-                command: 'updateLogs',
-                cid,
-                logs: logEntries,
-            });
-        }
     }
 
     private async handleLocate(symbol: string): Promise<void> {
-        // Use VS Code's symbol search to locate the function
-        const symbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
-            'vscode.executeWorkspaceSymbolProvider',
-            symbol
-        );
-        if (symbols && symbols.length > 0) {
-            const symbolInfo = symbols[0];
-            const doc = await vscode.workspace.openTextDocument(symbolInfo.location.uri);
-            await vscode.window.showTextDocument(doc, {
-                selection: symbolInfo.location.range
-            });
-        } else {
-            vscode.window.showWarningMessage(`Symbol not found: ${symbol}`);
+        // Use GDB's "info line" command to find the source location of the symbol.
+        // The candidate symbols are fully-qualified GDB names (e.g.
+        // "my_crate::my_module::my_async_fn") that workspace symbol providers
+        // cannot resolve, but GDB can map them to source files directly.
+        const session = this._debugAdapterFactory?.getActiveSession();
+        if (!session) {
+            vscode.window.showWarningMessage('No active debug session');
+            return;
+        }
+
+        try {
+            const output = await session.executeGDBCommand(`info line ${symbol}`);
+            // GDB output format: "Line 42 of \"src/main.rs\" starts at address ..."
+            const match = output.match(/Line\s+(\d+)\s+of\s+"([^"]+)"/);
+            if (match) {
+                const line = parseInt(match[1], 10);
+                const filePath = match[2];
+                await this.handleSelectFrame(filePath, line);
+            } else {
+                vscode.window.showWarningMessage(`Cannot locate source for: ${symbol}`);
+            }
+        } catch (error) {
+            console.error('Failed to locate symbol:', error);
+            vscode.window.showWarningMessage(`Failed to locate: ${symbol}`);
         }
     }
 
@@ -275,74 +273,6 @@ export class AsyncInspectorPanel {
                 command: 'updateCandidates',
                 candidates: candidates
             });
-        }
-    }
-
-    /**
-     * Fetch thread list and call stack from GDB via the debug session,
-     * then send the data to the webview for rendering.
-     */
-    private async handleCallStack(): Promise<void> {
-        if (!this._debugSession) {
-            console.warn('[AsyncInspector] handleCallStack: no debug session');
-            return;
-        }
-
-        try {
-            // 1. Get threads
-            const threadsResponse = await this._debugSession.customRequest('threads');
-            const threads: Array<{ id: number; name: string }> = threadsResponse?.threads || [];
-            console.log(`[AsyncInspector] handleCallStack: ${threads.length} threads`);
-
-            // 2. For each thread, get stack trace
-            const threadStacks: Array<{
-                threadId: number;
-                threadName: string;
-                frames: Array<{
-                    id: number;
-                    name: string;
-                    file: string;
-                    path: string;
-                    line: number;
-                    addr: string;
-                }>;
-            }> = [];
-
-            for (const thread of threads) {
-                try {
-                    const stackResponse = await this._debugSession.customRequest('stackTrace', {
-                        threadId: thread.id,
-                        startFrame: 0,
-                        levels: 100,
-                    });
-
-                    const frames = (stackResponse?.stackFrames || []).map((f: any) => ({
-                        id: f.id,
-                        name: f.name || '<unknown>',
-                        file: f.source?.name || '',
-                        path: f.source?.path || '',
-                        line: f.line || 0,
-                        addr: f.instructionPointerReference || '',
-                    }));
-
-                    console.log(`[AsyncInspector] Thread ${thread.id}: ${frames.length} frames`);
-
-                    threadStacks.push({
-                        threadId: thread.id,
-                        threadName: thread.name,
-                        frames,
-                    });
-                } catch (e) {
-                    console.warn(`[AsyncInspector] Failed to get stack for thread ${thread.id}:`, e);
-                }
-            }
-
-            this._panel.webview.postMessage({
-                command: 'updateCallStack',
-                threadStacks,
-            });
-        } catch (error) {
-            console.error('Failed to fetch call stack:', error);
         }
     }
 
@@ -507,19 +437,11 @@ export class AsyncInspectorPanel {
                         <div class="tree-panel">
                             <h3>Async Execution Tree</h3>
                             <div id="treeContainer"></div>
-                            <div class="callstack-section">
-                                <h3>Call Stack</h3>
-                                <div id="callStackContainer"></div>
-                            </div>
                         </div>
                         <div class="side-panel">
                             <div class="candidates-section">
                                 <h3>Candidates</h3>
                                 <div id="candidatesList"></div>
-                            </div>
-                            <div class="log-section">
-                                <h3>Log Preview</h3>
-                                <div id="logContainer"></div>
                             </div>
                         </div>
                     </div>

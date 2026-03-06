@@ -31,6 +31,26 @@ let gdbOutputBuffer = '';
  */
 let inferiorStarted = false;
 // ---------------------------------------------------------------------------
+// Breakpoint state
+// ---------------------------------------------------------------------------
+/**
+ * Map from source file path → array of GDB breakpoint numbers set in that file.
+ * Used to clear old breakpoints when VS Code sends a new setBreakpoints request.
+ */
+const fileBreakpoints = new Map();
+/**
+ * Map from GDB breakpoint number → DAP breakpoint info.
+ * Used to translate GDB breakpoint events back to DAP breakpoint IDs.
+ */
+const gdbBkptToDap = new Map();
+/** Next DAP breakpoint ID to assign. */
+let nextDapBreakpointId = 1;
+/**
+ * GDB breakpoint numbers for function breakpoints.
+ * Cleared and re-created on each setFunctionBreakpoints request.
+ */
+let functionBreakpointNumbers = [];
+// ---------------------------------------------------------------------------
 // DAP message parsing (stdin)
 // ---------------------------------------------------------------------------
 process.stdin.on('data', (data) => {
@@ -68,6 +88,7 @@ function handleRequest(request) {
             sendResponse(request, {
                 supportsConfigurationDoneRequest: true,
                 supportsEvaluateForHovers: false,
+                supportsFunctionBreakpoints: true,
             });
             sendEvent('initialized');
             break;
@@ -76,6 +97,12 @@ function handleRequest(request) {
             break;
         case 'configurationDone':
             handleConfigurationDone(request);
+            break;
+        case 'setBreakpoints':
+            handleSetBreakpoints(request);
+            break;
+        case 'setFunctionBreakpoints':
+            handleSetFunctionBreakpoints(request);
             break;
         case 'continue':
             handleContinue(request);
@@ -99,22 +126,7 @@ function handleRequest(request) {
             handleStackTrace(request);
             break;
         case 'evaluate':
-            if (gdbProcess && request.arguments?.expression) {
-                const expr = request.arguments.expression;
-                sendMICommand(`-interpreter-exec console "${expr}"`)
-                    .then((record) => {
-                    const result = record.cls === 'done'
-                        ? (record.data?.msg || 'OK')
-                        : (record.data?.msg || record.cls || 'error');
-                    sendResponse(request, { result, variablesReference: 0 });
-                })
-                    .catch(() => {
-                    sendResponse(request, { result: 'Command failed', variablesReference: 0 });
-                });
-            }
-            else {
-                sendResponse(request, { result: '', variablesReference: 0 });
-            }
+            handleEvaluate(request);
             break;
         case 'disconnect':
             if (gdbProcess)
@@ -353,6 +365,171 @@ function handlePause(request) {
     });
 }
 // ---------------------------------------------------------------------------
+// Breakpoint handlers
+// ---------------------------------------------------------------------------
+/**
+ * Handle "setBreakpoints" request.
+ * VS Code sends this for each source file that has breakpoints.
+ * The request contains the FULL set of desired breakpoints for a file —
+ * we must delete any previous breakpoints for that file and re-create them.
+ */
+async function handleSetBreakpoints(request) {
+    const source = request.arguments?.source;
+    const filePath = source?.path || '';
+    const requestedLines = (request.arguments?.breakpoints || []);
+    if (!filePath) {
+        sendResponse(request, { breakpoints: [] });
+        return;
+    }
+    try {
+        // 1. Delete old breakpoints for this file
+        const oldNumbers = fileBreakpoints.get(filePath) || [];
+        for (const num of oldNumbers) {
+            await sendMICommand(`-break-delete ${num}`).catch(() => { });
+            gdbBkptToDap.delete(num);
+        }
+        fileBreakpoints.delete(filePath);
+        // 2. Insert new breakpoints
+        const newNumbers = [];
+        const dapBreakpoints = [];
+        for (const bp of requestedLines) {
+            const location = `${filePath}:${bp.line}`;
+            try {
+                const record = await sendMICommand(`-break-insert -f ${location}`);
+                const bkpt = record.data?.bkpt;
+                const gdbNumber = parseInt(bkpt?.number || '0', 10);
+                const actualLine = parseInt(bkpt?.line || `${bp.line}`, 10);
+                const verified = bkpt?.pending === undefined; // pending means not yet resolved
+                // Set condition if provided
+                if (bp.condition && gdbNumber > 0) {
+                    await sendMICommand(`-break-condition ${gdbNumber} ${bp.condition}`).catch(() => { });
+                }
+                const dapId = nextDapBreakpointId++;
+                newNumbers.push(gdbNumber);
+                gdbBkptToDap.set(gdbNumber, { id: dapId, line: actualLine, verified });
+                dapBreakpoints.push({
+                    id: dapId,
+                    verified,
+                    line: actualLine,
+                    source: { name: source?.name || '', path: filePath },
+                });
+            }
+            catch (err) {
+                // Breakpoint insertion failed — report as unverified
+                const dapId = nextDapBreakpointId++;
+                dapBreakpoints.push({
+                    id: dapId,
+                    verified: false,
+                    line: bp.line,
+                    message: err.message || 'Failed to set breakpoint',
+                    source: { name: source?.name || '', path: filePath },
+                });
+            }
+        }
+        fileBreakpoints.set(filePath, newNumbers);
+        sendResponse(request, { breakpoints: dapBreakpoints });
+    }
+    catch (err) {
+        process.stderr.write(`[Adapter] setBreakpoints failed: ${err.message}\n`);
+        sendErrorResponse(request, err.message);
+    }
+}
+/**
+ * Handle "setFunctionBreakpoints" request.
+ * Clears all previous function breakpoints, then sets new ones by function name.
+ */
+async function handleSetFunctionBreakpoints(request) {
+    const requestedFunctions = (request.arguments?.breakpoints || []);
+    try {
+        // 1. Delete old function breakpoints
+        for (const num of functionBreakpointNumbers) {
+            await sendMICommand(`-break-delete ${num}`).catch(() => { });
+            gdbBkptToDap.delete(num);
+        }
+        functionBreakpointNumbers = [];
+        // 2. Insert new function breakpoints
+        const dapBreakpoints = [];
+        for (const fbp of requestedFunctions) {
+            try {
+                const record = await sendMICommand(`-break-insert -f ${fbp.name}`);
+                const bkpt = record.data?.bkpt;
+                const gdbNumber = parseInt(bkpt?.number || '0', 10);
+                const actualLine = parseInt(bkpt?.line || '0', 10);
+                const verified = bkpt?.pending === undefined;
+                if (fbp.condition && gdbNumber > 0) {
+                    await sendMICommand(`-break-condition ${gdbNumber} ${fbp.condition}`).catch(() => { });
+                }
+                const dapId = nextDapBreakpointId++;
+                functionBreakpointNumbers.push(gdbNumber);
+                gdbBkptToDap.set(gdbNumber, { id: dapId, line: actualLine, verified });
+                dapBreakpoints.push({
+                    id: dapId,
+                    verified,
+                    line: actualLine,
+                    source: bkpt?.fullname ? { path: bkpt.fullname, name: bkpt.file || '' } : undefined,
+                });
+            }
+            catch (err) {
+                const dapId = nextDapBreakpointId++;
+                dapBreakpoints.push({
+                    id: dapId,
+                    verified: false,
+                    message: err.message || 'Failed to set function breakpoint',
+                });
+            }
+        }
+        sendResponse(request, { breakpoints: dapBreakpoints });
+    }
+    catch (err) {
+        process.stderr.write(`[Adapter] setFunctionBreakpoints failed: ${err.message}\n`);
+        sendErrorResponse(request, err.message);
+    }
+}
+// ---------------------------------------------------------------------------
+// Evaluate handler
+// ---------------------------------------------------------------------------
+/**
+ * Handle "evaluate" request.
+ * Sends the expression to GDB via `-interpreter-exec console` and returns
+ * the captured console-stream output as the result.
+ *
+ * For "repl" context (Debug Console input), the output is also emitted as
+ * an "output" event so it appears in the Debug Console.
+ */
+async function handleEvaluate(request) {
+    if (!gdbProcess || !request.arguments?.expression) {
+        sendResponse(request, { result: '', variablesReference: 0 });
+        return;
+    }
+    const expr = request.arguments.expression;
+    const context = request.arguments?.context || 'repl';
+    // Escape the expression for MI C-string: backslash and double-quote
+    const escaped = expr.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    try {
+        const record = await sendMICommand(`-interpreter-exec console "${escaped}"`);
+        const result = record.data?.msg || '';
+        // For repl context, also emit output event so the result shows
+        // in the Debug Console output area (not just the inline response)
+        if (context === 'repl' && result) {
+            sendEvent('output', {
+                category: 'console',
+                output: result.endsWith('\n') ? result : result + '\n',
+            });
+        }
+        sendResponse(request, { result: result || 'OK', variablesReference: 0 });
+    }
+    catch (err) {
+        const msg = err.message || 'Command failed';
+        if (context === 'repl') {
+            sendEvent('output', {
+                category: 'stderr',
+                output: msg.endsWith('\n') ? msg : msg + '\n',
+            });
+        }
+        sendResponse(request, { result: msg, variablesReference: 0 });
+    }
+}
+// ---------------------------------------------------------------------------
 // Send MI command to GDB with token-based response tracking
 // ---------------------------------------------------------------------------
 /**
@@ -366,7 +543,8 @@ function sendMICommand(command) {
             return;
         }
         const token = nextToken++;
-        pendingCommands.set(token, { resolve, reject });
+        pendingCommands.set(token, { resolve, reject, consoleOutput: [] });
+        lastSentToken = token;
         const fullCommand = `${token}${command}\n`;
         process.stderr.write(`[Adapter -> GDB] ${fullCommand.trim()}\n`);
         gdbProcess.stdin.write(fullCommand);
@@ -442,10 +620,11 @@ function handleGDBOutput(data) {
     }
 }
 /**
- * Accumulated console-stream output lines between commands,
- * used to capture output from `-interpreter-exec console "..."`.
+ * The token of the most recently sent MI command.
+ * Console-stream output (~"...") is routed to this token's pending entry,
+ * since GDB emits stream output before the result record of the same command.
  */
-let consoleStreamBuffer = [];
+let lastSentToken = 0;
 /**
  * Route a parsed MI record to the appropriate handler.
  */
@@ -461,9 +640,12 @@ function dispatchMIRecord(record) {
             handleNotifyAsync(record);
             break;
         case 'console-stream':
-            // Accumulate console output for pending evaluate commands
+            // Route console output to the most recent pending command
             if (record.data?.msg) {
-                consoleStreamBuffer.push(record.data.msg);
+                const pending = pendingCommands.get(lastSentToken);
+                if (pending) {
+                    pending.consoleOutput.push(record.data.msg);
+                }
             }
             break;
         case 'target-stream':
@@ -488,9 +670,8 @@ function handleResultRecord(record) {
         if (pending) {
             pendingCommands.delete(record.token);
             // Attach accumulated console stream output to the result
-            if (consoleStreamBuffer.length > 0) {
-                record.data.msg = consoleStreamBuffer.join('');
-                consoleStreamBuffer = [];
+            if (pending.consoleOutput.length > 0) {
+                record.data.msg = pending.consoleOutput.join('');
             }
             if (record.cls === 'error') {
                 pending.reject(new Error(record.data?.msg || 'GDB error'));
@@ -501,8 +682,6 @@ function handleResultRecord(record) {
             return;
         }
     }
-    // No matching token — clear stream buffer
-    consoleStreamBuffer = [];
 }
 /**
  * Handle exec-async records (*stopped, *running).
@@ -564,7 +743,29 @@ function handleExecAsync(record) {
  */
 function handleNotifyAsync(record) {
     process.stderr.write(`[GDB notify] ${record.cls}: ${JSON.stringify(record.data)}\n`);
-    // Placeholder: will be expanded in future tasks
+    if (record.cls === 'breakpoint-modified') {
+        const bkpt = record.data?.bkpt;
+        if (!bkpt)
+            return;
+        const gdbNumber = parseInt(bkpt.number || '0', 10);
+        const entry = gdbBkptToDap.get(gdbNumber);
+        if (!entry)
+            return;
+        // Update verified status — a pending breakpoint may become resolved
+        const nowVerified = bkpt.pending === undefined;
+        const actualLine = parseInt(bkpt.line || `${entry.line}`, 10);
+        entry.verified = nowVerified;
+        entry.line = actualLine;
+        sendEvent('breakpoint', {
+            reason: 'changed',
+            breakpoint: {
+                id: entry.id,
+                verified: nowVerified,
+                line: actualLine,
+                source: bkpt.fullname ? { path: bkpt.fullname, name: bkpt.file || '' } : undefined,
+            },
+        });
+    }
 }
 // ---------------------------------------------------------------------------
 // Launch GDB

@@ -3,13 +3,10 @@
     let treeData = window.treeData || [];
     let selectedNode = null;
     let candidates = [];
-    let callStackData = [];
-    let selectedFrameId = null;
 
     // Initialize UI
     function init() {
         renderTree(treeData);
-        renderCallStack(callStackData);
         setupEventListeners();
         requestCandidates();
     }
@@ -107,77 +104,6 @@
     }
 
     // -----------------------------------------------------------------------
-    // Call Stack rendering
-    // -----------------------------------------------------------------------
-
-    function renderCallStack(threadStacks) {
-        const container = document.getElementById('callStackContainer');
-        container.innerHTML = '';
-
-        if (!threadStacks || threadStacks.length === 0) {
-            container.innerHTML = '<div class="placeholder-text">No call stack available.</div>';
-            return;
-        }
-
-        threadStacks.forEach(threadInfo => {
-            // Thread header
-            const threadHeader = document.createElement('div');
-            threadHeader.className = 'callstack-thread-header';
-            threadHeader.textContent = `Thread ${threadInfo.threadId}: ${threadInfo.threadName}`;
-            container.appendChild(threadHeader);
-
-            // Frames
-            if (threadInfo.frames.length === 0) {
-                const empty = document.createElement('div');
-                empty.className = 'placeholder-text';
-                empty.textContent = 'No frames.';
-                container.appendChild(empty);
-                return;
-            }
-
-            threadInfo.frames.forEach((frame, index) => {
-                const frameEl = document.createElement('div');
-                frameEl.className = 'callstack-frame' + (selectedFrameId === frame.id ? ' selected' : '');
-
-                const indexSpan = document.createElement('span');
-                indexSpan.className = 'callstack-frame-index';
-                indexSpan.textContent = `#${index}`;
-
-                const nameSpan = document.createElement('span');
-                nameSpan.className = 'callstack-frame-name';
-                nameSpan.textContent = frame.name;
-
-                const locSpan = document.createElement('span');
-                locSpan.className = 'callstack-frame-location';
-                if (frame.file && frame.line > 0) {
-                    locSpan.textContent = `${frame.file}:${frame.line}`;
-                } else if (frame.addr) {
-                    locSpan.textContent = frame.addr;
-                }
-
-                frameEl.appendChild(indexSpan);
-                frameEl.appendChild(nameSpan);
-                frameEl.appendChild(locSpan);
-
-                // Click to jump to source
-                frameEl.addEventListener('click', () => {
-                    selectedFrameId = frame.id;
-                    renderCallStack(callStackData);
-                    if (frame.path && frame.line > 0) {
-                        vscode.postMessage({
-                            command: 'selectFrame',
-                            file: frame.path,
-                            line: frame.line,
-                        });
-                    }
-                });
-
-                container.appendChild(frameEl);
-            });
-        });
-    }
-
-    // -----------------------------------------------------------------------
     // Candidates rendering
     // -----------------------------------------------------------------------
 
@@ -224,29 +150,6 @@
     }
 
     // -----------------------------------------------------------------------
-    // Log rendering
-    // -----------------------------------------------------------------------
-
-    function renderLogs(logs, cid) {
-        const container = document.getElementById('logContainer');
-        if (!logs || logs.length === 0) {
-            container.textContent = 'No log entries for selected CID.';
-            return;
-        }
-
-        container.innerHTML = '';
-        logs.forEach(log => {
-            const entry = document.createElement('div');
-            entry.className = 'log-entry';
-            if (cid && log.includes(`coro#${cid}`)) {
-                entry.classList.add('highlight');
-            }
-            entry.textContent = log;
-            container.appendChild(entry);
-        });
-    }
-
-    // -----------------------------------------------------------------------
     // Message listener
     // -----------------------------------------------------------------------
 
@@ -260,13 +163,6 @@
             case 'updateCandidates':
                 candidates = message.candidates;
                 renderCandidates(candidates);
-                break;
-            case 'updateLogs':
-                renderLogs(message.logs, message.cid);
-                break;
-            case 'updateCallStack':
-                callStackData = message.threadStacks;
-                renderCallStack(callStackData);
                 break;
         }
     });
