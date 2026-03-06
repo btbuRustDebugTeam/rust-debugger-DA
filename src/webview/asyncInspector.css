@@ -207,3 +207,67 @@ h3 {
     padding: 2px 5px;
     border-radius: 2px;
 }
+
+/* ---- Call Stack ---- */
+
+.callstack-section {
+    margin-top: 15px;
+    border-top: 1px solid var(--vscode-panel-border);
+    padding-top: 10px;
+}
+
+.callstack-thread-header {
+    font-size: 12px;
+    font-weight: 600;
+    padding: 4px 6px;
+    margin: 4px 0 2px 0;
+    color: var(--vscode-foreground);
+    background-color: var(--vscode-sideBarSectionHeader-background);
+    border-radius: 3px;
+}
+
+.callstack-frame {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 6px 3px 12px;
+    margin: 1px 0;
+    cursor: pointer;
+    border-radius: 3px;
+    font-size: 12px;
+}
+
+.callstack-frame:hover {
+    background-color: var(--vscode-list-hoverBackground);
+}
+
+.callstack-frame.selected {
+    background-color: var(--vscode-list-activeSelectionBackground);
+    color: var(--vscode-list-activeSelectionForeground);
+}
+
+.callstack-frame-index {
+    color: var(--vscode-descriptionForeground);
+    font-size: 11px;
+    min-width: 24px;
+}
+
+.callstack-frame-name {
+    flex: 1;
+    font-family: var(--vscode-editor-font-family);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.callstack-frame-location {
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    white-space: nowrap;
+}
+
+.placeholder-text {
+    padding: 10px;
+    color: var(--vscode-descriptionForeground);
+    font-size: 11px;
+}

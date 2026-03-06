@@ -51,7 +51,6 @@ class AsyncInspectorPanel {
         this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
         // Handle messages from the webview
         this._panel.webview.onDidReceiveMessage(async (message) => {
-            vscode.window.showInformationMessage(`Webview 呼叫插件: ${message.command}`);
             switch (message.command) {
                 case 'reset':
                     await this.handleReset();
@@ -74,6 +73,9 @@ class AsyncInspectorPanel {
                 case 'refreshCandidates':
                     await this.handleRefreshCandidates();
                     break;
+                case 'selectFrame':
+                    await this.handleSelectFrame(message.file, message.line);
+                    break;
             }
         }, null, this._disposables);
         // Listen for debug session events
@@ -81,6 +83,7 @@ class AsyncInspectorPanel {
             this._debugSession = session?.type === 'ardb' ? session : undefined;
             if (this._debugSession) {
                 this.startAutoRefresh();
+                this.handleCallStack();
             }
             else {
                 this.stopAutoRefresh();
@@ -89,6 +92,7 @@ class AsyncInspectorPanel {
         vscode.debug.onDidReceiveDebugSessionCustomEvent((event) => {
             if (event.session.type === 'ardb' && event.event === 'stopped') {
                 this.handleSnapshot();
+                this.handleCallStack();
             }
         }, null, this._disposables);
     }
@@ -251,6 +255,78 @@ class AsyncInspectorPanel {
             });
         }
     }
+    /**
+     * Fetch thread list and call stack from GDB via the debug session,
+     * then send the data to the webview for rendering.
+     */
+    async handleCallStack() {
+        if (!this._debugSession) {
+            return;
+        }
+        try {
+            // 1. Get threads
+            const threadsResponse = await this._debugSession.customRequest('threads');
+            const threads = threadsResponse?.threads || [];
+            // 2. For each thread, get stack trace
+            const threadStacks = [];
+            for (const thread of threads) {
+                try {
+                    const stackResponse = await this._debugSession.customRequest('stackTrace', {
+                        threadId: thread.id,
+                        startFrame: 0,
+                        levels: 100,
+                    });
+                    const frames = (stackResponse?.stackFrames || []).map((f) => ({
+                        id: f.id,
+                        name: f.name || '<unknown>',
+                        file: f.source?.name || '',
+                        path: f.source?.path || '',
+                        line: f.line || 0,
+                        addr: f.instructionPointerReference || '',
+                    }));
+                    threadStacks.push({
+                        threadId: thread.id,
+                        threadName: thread.name,
+                        frames,
+                    });
+                }
+                catch (e) {
+                    // Thread might have exited between listing and stack query
+                    console.warn(`Failed to get stack for thread ${thread.id}:`, e);
+                }
+            }
+            this._panel.webview.postMessage({
+                command: 'updateCallStack',
+                threadStacks,
+            });
+        }
+        catch (error) {
+            console.error('Failed to fetch call stack:', error);
+        }
+    }
+    /**
+     * Handle frame selection from the webview.
+     * Opens the source file at the given line in VS Code editor.
+     */
+    async handleSelectFrame(file, line) {
+        if (!file) {
+            return;
+        }
+        try {
+            const uri = vscode.Uri.file(file);
+            const doc = await vscode.workspace.openTextDocument(uri);
+            const targetLine = Math.max(0, line - 1); // VS Code lines are 0-based
+            await vscode.window.showTextDocument(doc, {
+                selection: new vscode.Range(targetLine, 0, targetLine, 0),
+                preserveFocus: false,
+                viewColumn: vscode.ViewColumn.One,
+            });
+        }
+        catch (error) {
+            console.error('Failed to open source file:', error);
+            vscode.window.showWarningMessage(`Cannot open file: ${file}`);
+        }
+    }
     updateTreeFromSnapshot(snapshot) {
         if (snapshot.path.length === 0) {
             return;
@@ -363,6 +439,10 @@ class AsyncInspectorPanel {
                         <div class="tree-panel">
                             <h3>Async Execution Tree</h3>
                             <div id="treeContainer"></div>
+                            <div class="callstack-section">
+                                <h3>Call Stack</h3>
+                                <div id="callStackContainer"></div>
+                            </div>
                         </div>
                         <div class="side-panel">
                             <div class="candidates-section">

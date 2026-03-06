@@ -29,7 +29,6 @@ export class GDBDebugSession {
     private whitelistPath: string;
     private fileWatcher: vscode.FileSystemWatcher | undefined;
     private lastSnapshot: SnapshotData | undefined;
-    private snapshotOutputPath: string;
 
     constructor(context: vscode.ExtensionContext) {
         this.context = context;
@@ -40,7 +39,6 @@ export class GDBDebugSession {
         this.tempDir = envTempDir || (workspaceFolder ? path.join(workspaceFolder, 'temp') : './temp');
         this.logPath = path.join(this.tempDir, 'ardb.log');
         this.whitelistPath = path.join(this.tempDir, 'poll_functions.txt');
-        this.snapshotOutputPath = path.join(this.tempDir, 'ardb_snapshot.json');
 
         // Ensure temp directory exists
         if (!fs.existsSync(this.tempDir)) {
@@ -129,7 +127,7 @@ export class GDBDebugSession {
 
     /**
      * Get snapshot from GDB using ardb-get-snapshot command.
-     * The Python script now writes the snapshot to a file automatically.
+     * Parses the JSON directly from the evaluate response.
      */
     async getSnapshot(): Promise<SnapshotData | undefined> {
         if (!this.debugSession) {
@@ -137,39 +135,26 @@ export class GDBDebugSession {
         }
 
         try {
-            // Execute the command - the Python script will write to file automatically
-            // We try to execute it via the debug session, but if that fails,
-            // we can still read the file if it was written by a previous command execution
-            try {
-                // Try to execute the command through the debug session
-                // Note: This may not work depending on the debug adapter implementation
-                await this.executeGDBCommand('ardb-get-snapshot');
-            } catch (e) {
-                // Command execution may fail, but the file might still be updated
-                // if the command was executed elsewhere (e.g., manually in GDB console)
-                console.warn('Command execution may have failed, but checking file anyway:', e);
+            const output = await this.executeGDBCommand('ardb-get-snapshot');
+            if (!output) {
+                return this.lastSnapshot;
             }
 
-            // Wait a bit for file to be written (Python script writes it asynchronously)
-            await new Promise(resolve => setTimeout(resolve, 100));
-
-            // Read the snapshot file (Python script writes it automatically)
-            if (fs.existsSync(this.snapshotOutputPath)) {
-                const content = fs.readFileSync(this.snapshotOutputPath, 'utf-8').trim();
-                if (content) {
-                    try {
-                        const snapshot = JSON.parse(content);
-                        if (snapshot.thread_id !== undefined && snapshot.path) {
-                            this.lastSnapshot = snapshot;
-                            return snapshot;
-                        }
-                    } catch (e) {
-                        console.error('Failed to parse snapshot JSON:', e, content.substring(0, 100));
-                    }
-                }
+            // The output may contain non-JSON lines before/after the JSON object.
+            // Find the first '{' and last '}' to extract the JSON payload.
+            const jsonStart = output.indexOf('{');
+            const jsonEnd = output.lastIndexOf('}');
+            if (jsonStart === -1 || jsonEnd === -1 || jsonEnd <= jsonStart) {
+                return this.lastSnapshot;
             }
 
-            // Return last known snapshot if available
+            const jsonStr = output.substring(jsonStart, jsonEnd + 1);
+            const snapshot = JSON.parse(jsonStr) as SnapshotData;
+            if (snapshot.thread_id !== undefined && snapshot.path) {
+                this.lastSnapshot = snapshot;
+                return snapshot;
+            }
+
             return this.lastSnapshot;
         } catch (error) {
             console.error('Failed to get snapshot:', error);

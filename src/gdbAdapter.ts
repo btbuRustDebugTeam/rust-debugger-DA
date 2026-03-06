@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 
 import * as child_process from 'child_process';
-import * as path from 'path';
 import { spawn } from 'child_process';
+import { parseMILine, MIRecord } from './miParser';
+
+// ---------------------------------------------------------------------------
+// Environment
+// ---------------------------------------------------------------------------
 
 const program = process.env.ARDB_PROGRAM;
 const argsStr = process.env.ARDB_ARGS || '[]';
@@ -14,8 +18,60 @@ if (!program) {
     process.exit(1);
 }
 
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
 let gdbProcess: child_process.ChildProcess | undefined;
 let rawData = Buffer.alloc(0);
+
+/** Auto-incrementing token for MI commands. */
+let nextToken = 1;
+
+/** Pending MI command callbacks keyed by token. */
+const pendingCommands: Map<number, {
+    resolve: (record: MIRecord) => void;
+    reject: (err: Error) => void;
+    consoleOutput: string[];
+}> = new Map();
+
+/** Buffer for accumulating partial GDB output lines. */
+let gdbOutputBuffer = '';
+
+/**
+ * Whether the inferior (target program) has been started with -exec-run.
+ * Before this is true, the first "continue" must use -exec-run instead.
+ */
+let inferiorStarted = false;
+
+// ---------------------------------------------------------------------------
+// Breakpoint state
+// ---------------------------------------------------------------------------
+
+/**
+ * Map from source file path → array of GDB breakpoint numbers set in that file.
+ * Used to clear old breakpoints when VS Code sends a new setBreakpoints request.
+ */
+const fileBreakpoints: Map<string, number[]> = new Map();
+
+/**
+ * Map from GDB breakpoint number → DAP breakpoint info.
+ * Used to translate GDB breakpoint events back to DAP breakpoint IDs.
+ */
+const gdbBkptToDap: Map<number, { id: number; line: number; verified: boolean }> = new Map();
+
+/** Next DAP breakpoint ID to assign. */
+let nextDapBreakpointId = 1;
+
+/**
+ * GDB breakpoint numbers for function breakpoints.
+ * Cleared and re-created on each setFunctionBreakpoints request.
+ */
+let functionBreakpointNumbers: number[] = [];
+
+// ---------------------------------------------------------------------------
+// DAP message parsing (stdin)
+// ---------------------------------------------------------------------------
 
 process.stdin.on('data', (data: Buffer) => {
     rawData = Buffer.concat([rawData, data]);
@@ -44,27 +100,68 @@ process.stdin.on('data', (data: Buffer) => {
     }
 });
 
+// ---------------------------------------------------------------------------
+// DAP request handler
+// ---------------------------------------------------------------------------
+
 function handleRequest(request: any) {
     process.stderr.write(`[Adapter] Received: ${request.command}\n`);
     switch (request.command) {
         case 'initialize':
             sendResponse(request, {
                 supportsConfigurationDoneRequest: true,
-                supportsEvaluateForHovers: false
+                supportsEvaluateForHovers: false,
+                supportsFunctionBreakpoints: true,
             });
             sendEvent('initialized');
             break;
 
         case 'launch':
-            launchGDB();
-            sendResponse(request);
+            handleLaunch(request);
+            break;
+
+        case 'configurationDone':
+            handleConfigurationDone(request);
+            break;
+
+        case 'setBreakpoints':
+            handleSetBreakpoints(request);
+            break;
+
+        case 'setFunctionBreakpoints':
+            handleSetFunctionBreakpoints(request);
+            break;
+
+        case 'continue':
+            handleContinue(request);
+            break;
+
+        case 'next':
+            handleNext(request);
+            break;
+
+        case 'stepIn':
+            handleStepIn(request);
+            break;
+
+        case 'stepOut':
+            handleStepOut(request);
+            break;
+
+        case 'pause':
+            handlePause(request);
+            break;
+
+        case 'threads':
+            handleThreads(request);
+            break;
+
+        case 'stackTrace':
+            handleStackTrace(request);
             break;
 
         case 'evaluate':
-            if (gdbProcess && request.arguments.expression) {
-                gdbProcess.stdin?.write(`-interpreter-exec console "${request.arguments.expression}"\n`);
-            }
-            sendResponse(request, { result: "Command sent to GDB", variablesReference: 0 });
+            handleEvaluate(request);
             break;
 
         case 'disconnect':
@@ -74,9 +171,484 @@ function handleRequest(request: any) {
             break;
 
         default:
+            // Acknowledge unknown requests so VS Code doesn't hang
             sendResponse(request);
     }
 }
+
+// ---------------------------------------------------------------------------
+// DAP request handlers
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle "launch" request.
+ * Starts GDB and loads the program symbols, but does NOT run the inferior.
+ * The user is expected to configure ARD (whitelist, trace points) before
+ * pressing Continue to actually start execution.
+ */
+function handleLaunch(request: any): void {
+    launchGDB();
+    inferiorStarted = false;
+    sendResponse(request);
+}
+
+/**
+ * Handle "configurationDone" request.
+ * VS Code sends this after all initial breakpoints / config are set.
+ * We emit a synthetic "stopped" event so VS Code enters paused state,
+ * giving the user time to configure ARD before running the program.
+ */
+function handleConfigurationDone(request: any): void {
+    sendResponse(request);
+
+    // Emit a synthetic stopped event with reason "entry".
+    // This puts VS Code into paused UI so the user can use the
+    // Async Inspector panel to set up whitelist and trace points.
+    // threadId 1 is a placeholder — GDB has not started threads yet.
+    sendEvent('stopped', {
+        reason: 'entry',
+        description: 'Program loaded. Configure ARD, then press Continue to run.',
+        threadId: 1,
+        allThreadsStopped: true,
+    });
+}
+
+/**
+ * Handle "threads" request.
+ * Queries GDB for thread list and returns DAP Thread objects.
+ * Before the inferior starts, returns a synthetic placeholder thread.
+ */
+function handleThreads(request: any): void {
+    if (!inferiorStarted) {
+        // Before -exec-run, there are no real threads yet.
+        // Return a placeholder so VS Code doesn't error out.
+        sendResponse(request, {
+            threads: [{ id: 1, name: 'main (not started)' }],
+        });
+        return;
+    }
+
+    sendMICommand('-thread-info')
+        .then((record) => {
+            const threads: Array<{ id: number; name: string }> = [];
+            const miThreads = record.data?.threads;
+
+            if (Array.isArray(miThreads)) {
+                for (const t of miThreads) {
+                    const id = parseInt(t.id || '1', 10);
+                    const targetId = t['target-id'] || '';
+                    const name = t.name || targetId || `Thread ${id}`;
+                    threads.push({ id, name });
+                }
+            }
+
+            if (threads.length === 0) {
+                threads.push({ id: 1, name: 'main' });
+            }
+
+            sendResponse(request, { threads });
+        })
+        .catch(() => {
+            sendResponse(request, {
+                threads: [{ id: 1, name: 'main' }],
+            });
+        });
+}
+
+/**
+ * Handle "stackTrace" request.
+ * Queries GDB for the call stack of the given thread and returns
+ * DAP StackFrame objects with source location info.
+ */
+function handleStackTrace(request: any): void {
+    const threadId = request.arguments?.threadId || 1;
+
+    if (!inferiorStarted) {
+        // Before -exec-run, no real stack exists.
+        sendResponse(request, { stackFrames: [], totalFrames: 0 });
+        return;
+    }
+
+    // Switch to the requested thread, then list frames
+    sendMICommand(`-thread-select ${threadId}`)
+        .then(() => sendMICommand('-stack-list-frames'))
+        .then((record) => {
+            const stackFrames: any[] = [];
+            const miStack = record.data?.stack;
+
+            if (Array.isArray(miStack)) {
+                for (const entry of miStack) {
+                    // MI returns: frame={level="0",addr="0x...",func="main",file="main.rs",fullname="/path/main.rs",line="10"}
+                    // In result-list form, each element is the frame object directly
+                    const f = entry.level !== undefined ? entry : (entry.frame || entry);
+                    const level = parseInt(f.level || '0', 10);
+                    const frameId = threadId * 10000 + level; // Unique ID encoding
+
+                    const frame: any = {
+                        id: frameId,
+                        name: f.func || '<unknown>',
+                        line: parseInt(f.line || '0', 10),
+                        column: 0,
+                    };
+
+                    if (f.fullname || f.file) {
+                        frame.source = {
+                            name: f.file || '',
+                            path: f.fullname || f.file || '',
+                        };
+                    }
+
+                    if (f.addr) {
+                        frame.instructionPointerReference = f.addr;
+                    }
+
+                    stackFrames.push(frame);
+                }
+            }
+
+            sendResponse(request, {
+                stackFrames,
+                totalFrames: stackFrames.length,
+            });
+        })
+        .catch((err) => {
+            process.stderr.write(`[Adapter] stackTrace failed: ${err.message}\n`);
+            sendResponse(request, { stackFrames: [], totalFrames: 0 });
+        });
+}
+
+/**
+ * Handle "continue" request.
+ * First continue: execute -exec-run to start the inferior.
+ * Subsequent continues: execute -exec-continue to resume.
+ */
+function handleContinue(request: any): void {
+    if (!inferiorStarted) {
+        // First time: actually start the program
+        inferiorStarted = true;
+        sendMICommand('-exec-run')
+            .then(() => {
+                sendResponse(request, { allThreadsContinued: true });
+            })
+            .catch((err) => {
+                process.stderr.write(`[Adapter] -exec-run failed: ${err.message}\n`);
+                sendErrorResponse(request, err.message);
+            });
+    } else {
+        // Program already running, just resume
+        sendMICommand('-exec-continue')
+            .then(() => {
+                sendResponse(request, { allThreadsContinued: true });
+            })
+            .catch((err) => {
+                process.stderr.write(`[Adapter] -exec-continue failed: ${err.message}\n`);
+                sendErrorResponse(request, err.message);
+            });
+    }
+}
+
+/**
+ * Handle "next" request (step over).
+ * Executes -exec-next to step to the next source line, stepping over calls.
+ */
+function handleNext(request: any): void {
+    if (!inferiorStarted) {
+        sendErrorResponse(request, 'Program has not started yet. Press Continue first.');
+        return;
+    }
+    sendMICommand('-exec-next')
+        .then(() => {
+            sendResponse(request);
+        })
+        .catch((err) => {
+            process.stderr.write(`[Adapter] -exec-next failed: ${err.message}\n`);
+            sendErrorResponse(request, err.message);
+        });
+}
+
+/**
+ * Handle "stepIn" request.
+ * Executes -exec-step to step into the next function call.
+ */
+function handleStepIn(request: any): void {
+    if (!inferiorStarted) {
+        sendErrorResponse(request, 'Program has not started yet. Press Continue first.');
+        return;
+    }
+    sendMICommand('-exec-step')
+        .then(() => {
+            sendResponse(request);
+        })
+        .catch((err) => {
+            process.stderr.write(`[Adapter] -exec-step failed: ${err.message}\n`);
+            sendErrorResponse(request, err.message);
+        });
+}
+
+/**
+ * Handle "stepOut" request.
+ * Executes -exec-finish to run until the current function returns.
+ */
+function handleStepOut(request: any): void {
+    if (!inferiorStarted) {
+        sendErrorResponse(request, 'Program has not started yet. Press Continue first.');
+        return;
+    }
+    sendMICommand('-exec-finish')
+        .then(() => {
+            sendResponse(request);
+        })
+        .catch((err) => {
+            process.stderr.write(`[Adapter] -exec-finish failed: ${err.message}\n`);
+            sendErrorResponse(request, err.message);
+        });
+}
+
+/**
+ * Handle "pause" request.
+ * Executes -exec-interrupt to suspend the running inferior.
+ */
+function handlePause(request: any): void {
+    if (!inferiorStarted) {
+        sendErrorResponse(request, 'Program has not started yet.');
+        return;
+    }
+    sendMICommand('-exec-interrupt')
+        .then(() => {
+            sendResponse(request);
+        })
+        .catch((err) => {
+            process.stderr.write(`[Adapter] -exec-interrupt failed: ${err.message}\n`);
+            sendErrorResponse(request, err.message);
+        });
+}
+
+// ---------------------------------------------------------------------------
+// Breakpoint handlers
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle "setBreakpoints" request.
+ * VS Code sends this for each source file that has breakpoints.
+ * The request contains the FULL set of desired breakpoints for a file —
+ * we must delete any previous breakpoints for that file and re-create them.
+ */
+async function handleSetBreakpoints(request: any): Promise<void> {
+    const source = request.arguments?.source;
+    const filePath: string = source?.path || '';
+    const requestedLines: Array<{ line: number; condition?: string; hitCondition?: string }> =
+        (request.arguments?.breakpoints || []);
+
+    if (!filePath) {
+        sendResponse(request, { breakpoints: [] });
+        return;
+    }
+
+    try {
+        // 1. Delete old breakpoints for this file
+        const oldNumbers = fileBreakpoints.get(filePath) || [];
+        for (const num of oldNumbers) {
+            await sendMICommand(`-break-delete ${num}`).catch(() => {});
+            gdbBkptToDap.delete(num);
+        }
+        fileBreakpoints.delete(filePath);
+
+        // 2. Insert new breakpoints
+        const newNumbers: number[] = [];
+        const dapBreakpoints: any[] = [];
+
+        for (const bp of requestedLines) {
+            const location = `${filePath}:${bp.line}`;
+            try {
+                const record = await sendMICommand(`-break-insert -f ${location}`);
+                const bkpt = record.data?.bkpt;
+                const gdbNumber = parseInt(bkpt?.number || '0', 10);
+                const actualLine = parseInt(bkpt?.line || `${bp.line}`, 10);
+                const verified = bkpt?.pending === undefined; // pending means not yet resolved
+
+                // Set condition if provided
+                if (bp.condition && gdbNumber > 0) {
+                    await sendMICommand(`-break-condition ${gdbNumber} ${bp.condition}`).catch(() => {});
+                }
+
+                const dapId = nextDapBreakpointId++;
+                newNumbers.push(gdbNumber);
+                gdbBkptToDap.set(gdbNumber, { id: dapId, line: actualLine, verified });
+
+                dapBreakpoints.push({
+                    id: dapId,
+                    verified,
+                    line: actualLine,
+                    source: { name: source?.name || '', path: filePath },
+                });
+            } catch (err: any) {
+                // Breakpoint insertion failed — report as unverified
+                const dapId = nextDapBreakpointId++;
+                dapBreakpoints.push({
+                    id: dapId,
+                    verified: false,
+                    line: bp.line,
+                    message: err.message || 'Failed to set breakpoint',
+                    source: { name: source?.name || '', path: filePath },
+                });
+            }
+        }
+
+        fileBreakpoints.set(filePath, newNumbers);
+        sendResponse(request, { breakpoints: dapBreakpoints });
+    } catch (err: any) {
+        process.stderr.write(`[Adapter] setBreakpoints failed: ${err.message}\n`);
+        sendErrorResponse(request, err.message);
+    }
+}
+
+/**
+ * Handle "setFunctionBreakpoints" request.
+ * Clears all previous function breakpoints, then sets new ones by function name.
+ */
+async function handleSetFunctionBreakpoints(request: any): Promise<void> {
+    const requestedFunctions: Array<{ name: string; condition?: string }> =
+        (request.arguments?.breakpoints || []);
+
+    try {
+        // 1. Delete old function breakpoints
+        for (const num of functionBreakpointNumbers) {
+            await sendMICommand(`-break-delete ${num}`).catch(() => {});
+            gdbBkptToDap.delete(num);
+        }
+        functionBreakpointNumbers = [];
+
+        // 2. Insert new function breakpoints
+        const dapBreakpoints: any[] = [];
+
+        for (const fbp of requestedFunctions) {
+            try {
+                const record = await sendMICommand(`-break-insert -f ${fbp.name}`);
+                const bkpt = record.data?.bkpt;
+                const gdbNumber = parseInt(bkpt?.number || '0', 10);
+                const actualLine = parseInt(bkpt?.line || '0', 10);
+                const verified = bkpt?.pending === undefined;
+
+                if (fbp.condition && gdbNumber > 0) {
+                    await sendMICommand(`-break-condition ${gdbNumber} ${fbp.condition}`).catch(() => {});
+                }
+
+                const dapId = nextDapBreakpointId++;
+                functionBreakpointNumbers.push(gdbNumber);
+                gdbBkptToDap.set(gdbNumber, { id: dapId, line: actualLine, verified });
+
+                dapBreakpoints.push({
+                    id: dapId,
+                    verified,
+                    line: actualLine,
+                    source: bkpt?.fullname ? { path: bkpt.fullname, name: bkpt.file || '' } : undefined,
+                });
+            } catch (err: any) {
+                const dapId = nextDapBreakpointId++;
+                dapBreakpoints.push({
+                    id: dapId,
+                    verified: false,
+                    message: err.message || 'Failed to set function breakpoint',
+                });
+            }
+        }
+
+        sendResponse(request, { breakpoints: dapBreakpoints });
+    } catch (err: any) {
+        process.stderr.write(`[Adapter] setFunctionBreakpoints failed: ${err.message}\n`);
+        sendErrorResponse(request, err.message);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Evaluate handler
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle "evaluate" request.
+ * Sends the expression to GDB via `-interpreter-exec console` and returns
+ * the captured console-stream output as the result.
+ *
+ * For "repl" context (Debug Console input), the output is also emitted as
+ * an "output" event so it appears in the Debug Console.
+ */
+async function handleEvaluate(request: any): Promise<void> {
+    if (!gdbProcess || !request.arguments?.expression) {
+        sendResponse(request, { result: '', variablesReference: 0 });
+        return;
+    }
+
+    const expr = request.arguments.expression;
+    const context = request.arguments?.context || 'repl';
+
+    // Escape the expression for MI C-string: backslash and double-quote
+    const escaped = expr.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+    try {
+        const record = await sendMICommand(`-interpreter-exec console "${escaped}"`);
+        const result = record.data?.msg || '';
+
+        // For repl context, also emit output event so the result shows
+        // in the Debug Console output area (not just the inline response)
+        if (context === 'repl' && result) {
+            sendEvent('output', {
+                category: 'console',
+                output: result.endsWith('\n') ? result : result + '\n',
+            });
+        }
+
+        sendResponse(request, { result: result || 'OK', variablesReference: 0 });
+    } catch (err: any) {
+        const msg = err.message || 'Command failed';
+        if (context === 'repl') {
+            sendEvent('output', {
+                category: 'stderr',
+                output: msg.endsWith('\n') ? msg : msg + '\n',
+            });
+        }
+        sendResponse(request, { result: msg, variablesReference: 0 });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Send MI command to GDB with token-based response tracking
+// ---------------------------------------------------------------------------
+
+/**
+ * Send an MI command to GDB and return a promise that resolves with the
+ * result record (^done / ^error / ^running).
+ */
+function sendMICommand(command: string): Promise<MIRecord> {
+    return new Promise((resolve, reject) => {
+        if (!gdbProcess || !gdbProcess.stdin) {
+            reject(new Error('GDB process not available'));
+            return;
+        }
+
+        const token = nextToken++;
+        pendingCommands.set(token, { resolve, reject, consoleOutput: [] });
+        lastSentToken = token;
+
+        const fullCommand = `${token}${command}\n`;
+        process.stderr.write(`[Adapter -> GDB] ${fullCommand.trim()}\n`);
+        gdbProcess.stdin.write(fullCommand);
+    });
+}
+
+/**
+ * Send a raw string to GDB stdin without token tracking.
+ * Use this only for commands where you don't need the response.
+ */
+function sendGDBRaw(command: string): void {
+    if (gdbProcess && gdbProcess.stdin) {
+        process.stderr.write(`[Adapter -> GDB (raw)] ${command.trim()}\n`);
+        gdbProcess.stdin.write(command);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DAP message helpers
+// ---------------------------------------------------------------------------
 
 function sendResponse(request: any, body: any = {}) {
     const response = {
@@ -84,7 +656,20 @@ function sendResponse(request: any, body: any = {}) {
         request_seq: request.seq,
         success: true,
         command: request.command,
-        body: body
+        body: body,
+    };
+    const json = JSON.stringify(response);
+    process.stdout.write(`Content-Length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`);
+}
+
+function sendErrorResponse(request: any, message: string) {
+    const response = {
+        type: 'response',
+        request_seq: request.seq,
+        success: false,
+        command: request.command,
+        message: message,
+        body: {},
     };
     const json = JSON.stringify(response);
     process.stdout.write(`Content-Length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`);
@@ -94,10 +679,209 @@ function sendEvent(event: string, body: any = {}) {
     const message = JSON.stringify({
         type: 'event',
         event: event,
-        body: body
+        body: body,
     });
     process.stdout.write(`Content-Length: ${Buffer.byteLength(message, 'utf8')}\r\n\r\n${message}`);
 }
+
+// ---------------------------------------------------------------------------
+// GDB MI2 output processing
+// ---------------------------------------------------------------------------
+
+/**
+ * Feed raw bytes from GDB stdout into the line buffer, then parse
+ * each complete line through the MI2 parser.
+ */
+function handleGDBOutput(data: Buffer): void {
+    gdbOutputBuffer += data.toString('utf8');
+
+    // Process complete lines
+    let newlineIdx: number;
+    while ((newlineIdx = gdbOutputBuffer.indexOf('\n')) !== -1) {
+        const line = gdbOutputBuffer.substring(0, newlineIdx).replace(/\r$/, '');
+        gdbOutputBuffer = gdbOutputBuffer.substring(newlineIdx + 1);
+
+        if (!line) continue;
+
+        const record = parseMILine(line);
+        if (!record) {
+            process.stderr.write(`[GDB ?] ${line}\n`);
+            continue;
+        }
+
+        process.stderr.write(`[GDB ${record.type}] ${line}\n`);
+        dispatchMIRecord(record);
+    }
+}
+
+/**
+ * The token of the most recently sent MI command.
+ * Console-stream output (~"...") is routed to this token's pending entry,
+ * since GDB emits stream output before the result record of the same command.
+ */
+let lastSentToken = 0;
+
+/**
+ * Route a parsed MI record to the appropriate handler.
+ */
+function dispatchMIRecord(record: MIRecord): void {
+    switch (record.type) {
+        case 'result':
+            handleResultRecord(record);
+            break;
+
+        case 'exec-async':
+            handleExecAsync(record);
+            break;
+
+        case 'notify-async':
+            handleNotifyAsync(record);
+            break;
+
+        case 'console-stream':
+            // Route console output to the most recent pending command
+            if (record.data?.msg) {
+                const pending = pendingCommands.get(lastSentToken);
+                if (pending) {
+                    pending.consoleOutput.push(record.data.msg);
+                }
+            }
+            break;
+
+        case 'target-stream':
+        case 'log-stream':
+            // Log for debugging, no action needed
+            break;
+
+        case 'status-async':
+            // Rarely used, log only
+            break;
+
+        case 'prompt':
+            // (gdb) prompt — MI is ready for next command
+            break;
+    }
+}
+
+/**
+ * Handle result records (^done, ^error, ^running).
+ * Resolves the pending command promise if a matching token exists.
+ */
+function handleResultRecord(record: MIRecord): void {
+    if (record.token !== undefined) {
+        const pending = pendingCommands.get(record.token);
+        if (pending) {
+            pendingCommands.delete(record.token);
+
+            // Attach accumulated console stream output to the result
+            if (pending.consoleOutput.length > 0) {
+                record.data.msg = pending.consoleOutput.join('');
+            }
+
+            if (record.cls === 'error') {
+                pending.reject(new Error(record.data?.msg || 'GDB error'));
+            } else {
+                pending.resolve(record);
+            }
+            return;
+        }
+    }
+}
+
+/**
+ * Handle exec-async records (*stopped, *running).
+ * Translates GDB async notifications into DAP events.
+ */
+function handleExecAsync(record: MIRecord): void {
+    process.stderr.write(`[GDB exec-async] class=${record.cls} data=${JSON.stringify(record.data)}\n`);
+
+    if (record.cls === 'stopped') {
+        // Map GDB stop reason to DAP stop reason
+        const gdbReason = record.data?.reason || '';
+        let dapReason = 'pause';
+        let description = '';
+
+        switch (gdbReason) {
+            case 'breakpoint-hit':
+                dapReason = 'breakpoint';
+                description = `Breakpoint ${record.data?.bkptno || ''} hit`;
+                break;
+            case 'end-stepping-range':
+                dapReason = 'step';
+                description = 'Step completed';
+                break;
+            case 'function-finished':
+                dapReason = 'step';
+                description = 'Function finished';
+                break;
+            case 'signal-received':
+                dapReason = 'exception';
+                description = `Signal: ${record.data?.['signal-name'] || 'unknown'}`;
+                break;
+            case 'exited':
+            case 'exited-normally':
+            case 'exited-signalled':
+                sendEvent('terminated');
+                return;
+            default:
+                dapReason = 'pause';
+                description = gdbReason || 'Paused';
+                break;
+        }
+
+        // Extract thread ID from GDB data
+        const threadId = parseInt(record.data?.['thread-id'] || '1', 10);
+
+        sendEvent('stopped', {
+            reason: dapReason,
+            description,
+            threadId,
+            allThreadsStopped: record.data?.['stopped-threads'] === 'all' || true,
+        });
+    } else if (record.cls === 'running') {
+        const threadId = parseInt(record.data?.['thread-id'] || '1', 10);
+        sendEvent('continued', {
+            threadId,
+            allThreadsContinued: true,
+        });
+    }
+}
+
+/**
+ * Handle notify-async records (=thread-created, =breakpoint-modified, etc.).
+ */
+function handleNotifyAsync(record: MIRecord): void {
+    process.stderr.write(`[GDB notify] ${record.cls}: ${JSON.stringify(record.data)}\n`);
+
+    if (record.cls === 'breakpoint-modified') {
+        const bkpt = record.data?.bkpt;
+        if (!bkpt) return;
+
+        const gdbNumber = parseInt(bkpt.number || '0', 10);
+        const entry = gdbBkptToDap.get(gdbNumber);
+        if (!entry) return;
+
+        // Update verified status — a pending breakpoint may become resolved
+        const nowVerified = bkpt.pending === undefined;
+        const actualLine = parseInt(bkpt.line || `${entry.line}`, 10);
+        entry.verified = nowVerified;
+        entry.line = actualLine;
+
+        sendEvent('breakpoint', {
+            reason: 'changed',
+            breakpoint: {
+                id: entry.id,
+                verified: nowVerified,
+                line: actualLine,
+                source: bkpt.fullname ? { path: bkpt.fullname, name: bkpt.file || '' } : undefined,
+            },
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Launch GDB
+// ---------------------------------------------------------------------------
 
 function launchGDB() {
     const args = JSON.parse(argsStr);
@@ -106,20 +890,22 @@ function launchGDB() {
         '-ex', `python import sys; sys.path.insert(0, '${pythonPath}'); import async_rust_debugger`,
         '-ex', 'set pagination off',
         program!,
-        ...args
+        ...args,
     ];
 
     gdbProcess = spawn('gdb', gdbArgs, { cwd });
 
-    gdbProcess.stdout?.on('data', (data) => {
-        process.stderr.write(`[GDB Output]: ${data.toString()}`);
+    // Route GDB stdout through the MI2 parser
+    gdbProcess.stdout?.on('data', (data: Buffer) => {
+        handleGDBOutput(data);
     });
 
-    gdbProcess.stderr?.on('data', (data) => {
+    gdbProcess.stderr?.on('data', (data: Buffer) => {
         process.stderr.write(`[GDB Error]: ${data.toString()}`);
     });
 
-    gdbProcess.on('exit', () => {
+    gdbProcess.on('exit', (code) => {
+        process.stderr.write(`[GDB] Process exited with code ${code}\n`);
         sendEvent('terminated');
     });
 }

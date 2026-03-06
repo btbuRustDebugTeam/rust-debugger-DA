@@ -1,30 +1,29 @@
 (function() {
     const vscode = acquireVsCodeApi();
-    console.log("Webview JS Loaded!"); // 调试日志
     let treeData = window.treeData || [];
     let selectedNode = null;
     let candidates = [];
+    let callStackData = [];
+    let selectedFrameId = null;
 
     // Initialize UI
     function init() {
         renderTree(treeData);
+        renderCallStack(callStackData);
         setupEventListeners();
         requestCandidates();
     }
 
     function setupEventListeners() {
         document.getElementById('resetBtn').addEventListener('click', () => {
-            console.log("Reset button clicked!");
             vscode.postMessage({ command: 'reset' });
         });
 
         document.getElementById('genWhitelistBtn').addEventListener('click', () => {
-            console.log("GenWhitelist button clicked!");
             vscode.postMessage({ command: 'genWhitelist' });
         });
 
         document.getElementById('snapshotBtn').addEventListener('click', () => {
-            console.log("Snapshot button clicked!");
             vscode.postMessage({ command: 'snapshot' });
         });
     }
@@ -34,7 +33,7 @@
         container.innerHTML = '';
 
         if (roots.length === 0) {
-            container.innerHTML = '<div style="padding: 20px; color: var(--vscode-descriptionForeground);">No async execution tree available. Start debugging and set a trace point.</div>';
+            container.innerHTML = '<div class="placeholder-text">No async execution tree available. Start debugging and set a trace point.</div>';
             return;
         }
 
@@ -100,7 +99,6 @@
 
     function selectNode(cid) {
         selectedNode = cid;
-        // Re-render to update selection
         renderTree(treeData);
     }
 
@@ -108,12 +106,87 @@
         vscode.postMessage({ command: 'refreshCandidates' });
     }
 
+    // -----------------------------------------------------------------------
+    // Call Stack rendering
+    // -----------------------------------------------------------------------
+
+    function renderCallStack(threadStacks) {
+        const container = document.getElementById('callStackContainer');
+        container.innerHTML = '';
+
+        if (!threadStacks || threadStacks.length === 0) {
+            container.innerHTML = '<div class="placeholder-text">No call stack available.</div>';
+            return;
+        }
+
+        threadStacks.forEach(threadInfo => {
+            // Thread header
+            const threadHeader = document.createElement('div');
+            threadHeader.className = 'callstack-thread-header';
+            threadHeader.textContent = `Thread ${threadInfo.threadId}: ${threadInfo.threadName}`;
+            container.appendChild(threadHeader);
+
+            // Frames
+            if (threadInfo.frames.length === 0) {
+                const empty = document.createElement('div');
+                empty.className = 'placeholder-text';
+                empty.textContent = 'No frames.';
+                container.appendChild(empty);
+                return;
+            }
+
+            threadInfo.frames.forEach((frame, index) => {
+                const frameEl = document.createElement('div');
+                frameEl.className = 'callstack-frame' + (selectedFrameId === frame.id ? ' selected' : '');
+
+                const indexSpan = document.createElement('span');
+                indexSpan.className = 'callstack-frame-index';
+                indexSpan.textContent = `#${index}`;
+
+                const nameSpan = document.createElement('span');
+                nameSpan.className = 'callstack-frame-name';
+                nameSpan.textContent = frame.name;
+
+                const locSpan = document.createElement('span');
+                locSpan.className = 'callstack-frame-location';
+                if (frame.file && frame.line > 0) {
+                    locSpan.textContent = `${frame.file}:${frame.line}`;
+                } else if (frame.addr) {
+                    locSpan.textContent = frame.addr;
+                }
+
+                frameEl.appendChild(indexSpan);
+                frameEl.appendChild(nameSpan);
+                frameEl.appendChild(locSpan);
+
+                // Click to jump to source
+                frameEl.addEventListener('click', () => {
+                    selectedFrameId = frame.id;
+                    renderCallStack(callStackData);
+                    if (frame.path && frame.line > 0) {
+                        vscode.postMessage({
+                            command: 'selectFrame',
+                            file: frame.path,
+                            line: frame.line,
+                        });
+                    }
+                });
+
+                container.appendChild(frameEl);
+            });
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Candidates rendering
+    // -----------------------------------------------------------------------
+
     function renderCandidates(candidatesList) {
         const container = document.getElementById('candidatesList');
         container.innerHTML = '';
 
         if (candidatesList.length === 0) {
-            container.innerHTML = '<div style="padding: 10px; color: var(--vscode-descriptionForeground); font-size: 11px;">No candidates. Generate whitelist first.</div>';
+            container.innerHTML = '<div class="placeholder-text">No candidates. Generate whitelist first.</div>';
             return;
         }
 
@@ -150,6 +223,10 @@
         });
     }
 
+    // -----------------------------------------------------------------------
+    // Log rendering
+    // -----------------------------------------------------------------------
+
     function renderLogs(logs, cid) {
         const container = document.getElementById('logContainer');
         if (!logs || logs.length === 0) {
@@ -169,7 +246,10 @@
         });
     }
 
-    // Listen for messages from extension
+    // -----------------------------------------------------------------------
+    // Message listener
+    // -----------------------------------------------------------------------
+
     window.addEventListener('message', event => {
         const message = event.data;
         switch (message.command) {
@@ -183,6 +263,10 @@
                 break;
             case 'updateLogs':
                 renderLogs(message.logs, message.cid);
+                break;
+            case 'updateCallStack':
+                callStackData = message.threadStacks;
+                renderCallStack(callStackData);
                 break;
         }
     });
