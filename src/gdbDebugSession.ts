@@ -131,11 +131,13 @@ export class GDBDebugSession {
      */
     async getSnapshot(): Promise<SnapshotData | undefined> {
         if (!this.debugSession) {
+            console.warn('[GDBDebugSession] getSnapshot: no debug session');
             return undefined;
         }
 
         try {
             const output = await this.executeGDBCommand('ardb-get-snapshot');
+            console.log('[GDBDebugSession] ardb-get-snapshot raw output length:', output.length, 'first 200 chars:', output.substring(0, 200));
             if (!output) {
                 return this.lastSnapshot;
             }

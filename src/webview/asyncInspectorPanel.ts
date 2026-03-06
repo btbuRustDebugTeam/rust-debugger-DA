@@ -74,7 +74,7 @@ export class AsyncInspectorPanel {
                     onDidSendMessage: (message: any) => {
                         if (message.type === 'event' && message.event === 'stopped') {
                             this._debugSession = _session;
-                            this.onDebugStopped();
+                            this.onDebugStopped(message.body);
                         }
                     }
                 };
@@ -116,13 +116,27 @@ export class AsyncInspectorPanel {
 
     /**
      * Called when the debug adapter sends a "stopped" event.
-     * Triggers snapshot + call stack refresh automatically.
+     * Triggers call stack refresh automatically, and snapshot only
+     * if the inferior has been started (not the synthetic "entry" stop).
+     *
+     * Uses a small delay to let VS Code's own stopped-event handling
+     * (threads, stackTrace) settle first, avoiding request conflicts.
      */
-    private async onDebugStopped(): Promise<void> {
-        await Promise.all([
-            this.handleSnapshot(),
-            this.handleCallStack(),
-        ]);
+    private onDebugStopped(stoppedBody: any): void {
+        const isEntry = stoppedBody?.reason === 'entry';
+        console.log(`[AsyncInspector] onDebugStopped reason=${stoppedBody?.reason} isEntry=${isEntry} hasSession=${!!this._debugSession}`);
+
+        setTimeout(async () => {
+            try {
+                const tasks: Promise<void>[] = [this.handleCallStack()];
+                if (!isEntry) {
+                    tasks.push(this.handleSnapshot());
+                }
+                await Promise.all(tasks);
+            } catch (e) {
+                console.error('[AsyncInspector] onDebugStopped handlers failed:', e);
+            }
+        }, 300);
     }
 
     private async handleReset(): Promise<void> {
@@ -154,9 +168,13 @@ export class AsyncInspectorPanel {
 
     private async handleSnapshot(): Promise<void> {
         const session = this._debugAdapterFactory?.getActiveSession();
-        if (!session) return;
+        if (!session) {
+            console.warn('[AsyncInspector] handleSnapshot: no GDB session from factory');
+            return;
+        }
 
         const snapshot = await session.getSnapshot();
+        console.log('[AsyncInspector] handleSnapshot: result =', snapshot ? `thread_id=${snapshot.thread_id}, path.length=${snapshot.path.length}` : 'null');
         if (snapshot) {
             this._lastSnapshot = snapshot;
             this.updateTreeFromSnapshot(snapshot);
@@ -266,6 +284,7 @@ export class AsyncInspectorPanel {
      */
     private async handleCallStack(): Promise<void> {
         if (!this._debugSession) {
+            console.warn('[AsyncInspector] handleCallStack: no debug session');
             return;
         }
 
@@ -273,6 +292,7 @@ export class AsyncInspectorPanel {
             // 1. Get threads
             const threadsResponse = await this._debugSession.customRequest('threads');
             const threads: Array<{ id: number; name: string }> = threadsResponse?.threads || [];
+            console.log(`[AsyncInspector] handleCallStack: ${threads.length} threads`);
 
             // 2. For each thread, get stack trace
             const threadStacks: Array<{
@@ -305,14 +325,15 @@ export class AsyncInspectorPanel {
                         addr: f.instructionPointerReference || '',
                     }));
 
+                    console.log(`[AsyncInspector] Thread ${thread.id}: ${frames.length} frames`);
+
                     threadStacks.push({
                         threadId: thread.id,
                         threadName: thread.name,
                         frames,
                     });
                 } catch (e) {
-                    // Thread might have exited between listing and stack query
-                    console.warn(`Failed to get stack for thread ${thread.id}:`, e);
+                    console.warn(`[AsyncInspector] Failed to get stack for thread ${thread.id}:`, e);
                 }
             }
 
