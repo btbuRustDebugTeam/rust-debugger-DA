@@ -79,21 +79,6 @@ class AsyncInspectorPanel {
         vscode.debug.onDidChangeActiveDebugSession((session) => {
             this._debugSession = session?.type === 'ardb' ? session : undefined;
         }, null, this._disposables);
-        // Register a DebugAdapterTracker to intercept stopped events from the adapter.
-        // This replaces the 500ms polling timer with event-driven updates.
-        const trackerDisposable = vscode.debug.registerDebugAdapterTrackerFactory('ardb', {
-            createDebugAdapterTracker: (_session) => {
-                return {
-                    onDidSendMessage: (message) => {
-                        if (message.type === 'event' && message.event === 'stopped') {
-                            this._debugSession = _session;
-                            this.onDebugStopped(message.body);
-                        }
-                    }
-                };
-            }
-        });
-        this._disposables.push(trackerDisposable);
     }
     static createOrShow(extensionUri, debugAdapterFactory) {
         const column = vscode.window.activeTextEditor
@@ -124,7 +109,8 @@ class AsyncInspectorPanel {
      * Uses a small delay to let VS Code's own stopped-event handling
      * (threads, stackTrace) settle first, avoiding request conflicts.
      */
-    onDebugStopped(stoppedBody) {
+    onDebugStopped(session, stoppedBody) {
+        this._debugSession = session;
         const isEntry = stoppedBody?.reason === 'entry';
         console.log(`[AsyncInspector] onDebugStopped reason=${stoppedBody?.reason} isEntry=${isEntry} hasSession=${!!this._debugSession}`);
         // Serialize requests to avoid race conditions in the GDB MI2 command
@@ -240,7 +226,7 @@ class AsyncInspectorPanel {
             return;
         }
         try {
-            const output = await session.executeGDBCommand(`info line ${symbol}`);
+            const output = await session.executeGDBCommand(`info line '${symbol}'`);
             // GDB output format: "Line 42 of \"src/main.rs\" starts at address ..."
             const match = output.match(/Line\s+(\d+)\s+of\s+"([^"]+)"/);
             if (match) {

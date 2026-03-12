@@ -46,6 +46,22 @@ function activate(context) {
     debugAdapterFactory = new debugAdapter_1.ARDDebugAdapterFactory(context);
     const disposable = vscode.debug.registerDebugAdapterDescriptorFactory('ardb', debugAdapterFactory);
     context.subscriptions.push(disposable, debugAdapterFactory);
+    // Register DebugAdapterTracker EARLY — before any session starts —
+    // so that stopped events from the very first session are captured.
+    const trackerDisposable = vscode.debug.registerDebugAdapterTrackerFactory('ardb', {
+        createDebugAdapterTracker: (_session) => {
+            return {
+                onDidSendMessage: (message) => {
+                    if (message.type === 'event' && message.event === 'stopped') {
+                        if (inspectorPanel) {
+                            inspectorPanel.onDebugStopped(_session, message.body);
+                        }
+                    }
+                }
+            };
+        }
+    });
+    context.subscriptions.push(trackerDisposable);
     // Register command to open async inspector
     const openInspectorCommand = vscode.commands.registerCommand('ardb.openInspector', () => {
         if (!debugAdapterFactory) {
@@ -91,10 +107,9 @@ function activate(context) {
     context.subscriptions.push(openInspectorCommand, traceFunctionCommand);
     // Open inspector automatically when debug session starts
     const onDidStartDebugSession = vscode.debug.onDidStartDebugSession((session) => {
-        if (session.type === 'ardb' && debugAdapterFactory) { // 增加检查
+        if (session.type === 'ardb' && debugAdapterFactory) {
             if (!inspectorPanel) {
-                inspectorPanel = asyncInspectorPanel_1.AsyncInspectorPanel.createOrShow(context.extensionUri, debugAdapterFactory // 移除感叹号，改用上面的 if 判断
-                );
+                inspectorPanel = asyncInspectorPanel_1.AsyncInspectorPanel.createOrShow(context.extensionUri, debugAdapterFactory);
             }
         }
     });

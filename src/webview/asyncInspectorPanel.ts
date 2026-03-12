@@ -62,22 +62,6 @@ export class AsyncInspectorPanel {
         vscode.debug.onDidChangeActiveDebugSession((session) => {
             this._debugSession = session?.type === 'ardb' ? session : undefined;
         }, null, this._disposables);
-
-        // Register a DebugAdapterTracker to intercept stopped events from the adapter.
-        // This replaces the 500ms polling timer with event-driven updates.
-        const trackerDisposable = vscode.debug.registerDebugAdapterTrackerFactory('ardb', {
-            createDebugAdapterTracker: (_session: vscode.DebugSession) => {
-                return {
-                    onDidSendMessage: (message: any) => {
-                        if (message.type === 'event' && message.event === 'stopped') {
-                            this._debugSession = _session;
-                            this.onDebugStopped(message.body);
-                        }
-                    }
-                };
-            }
-        });
-        this._disposables.push(trackerDisposable);
     }
 
     public static createOrShow(extensionUri: vscode.Uri, debugAdapterFactory: ARDDebugAdapterFactory): AsyncInspectorPanel {
@@ -119,7 +103,8 @@ export class AsyncInspectorPanel {
      * Uses a small delay to let VS Code's own stopped-event handling
      * (threads, stackTrace) settle first, avoiding request conflicts.
      */
-    private onDebugStopped(stoppedBody: any): void {
+    public onDebugStopped(session: vscode.DebugSession, stoppedBody: any): void {
+        this._debugSession = session;
         const isEntry = stoppedBody?.reason === 'entry';
         console.log(`[AsyncInspector] onDebugStopped reason=${stoppedBody?.reason} isEntry=${isEntry} hasSession=${!!this._debugSession}`);
 
@@ -249,7 +234,7 @@ export class AsyncInspectorPanel {
         }
 
         try {
-            const output = await session.executeGDBCommand(`info line ${symbol}`);
+            const output = await session.executeGDBCommand(`info line '${symbol}'`);
             // GDB output format: "Line 42 of \"src/main.rs\" starts at address ..."
             const match = output.match(/Line\s+(\d+)\s+of\s+"([^"]+)"/);
             if (match) {
