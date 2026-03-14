@@ -70,6 +70,27 @@ let nextDapBreakpointId = 1;
 let functionBreakpointNumbers: number[] = [];
 
 // ---------------------------------------------------------------------------
+// Variable / scope state
+// ---------------------------------------------------------------------------
+
+/** Next variablesReference to assign for expandable variables. */
+let nextVarRef = 1;
+
+/**
+ * Map from variablesReference → info needed to fetch its contents.
+ * - 'scope': a top-level scope (Locals) — needs threadId + frameLevel to query GDB.
+ * - 'var': an expandable GDB var-object — needs the var-object name to list children.
+ */
+const varRefMap: Map<
+    number,
+    | { type: 'scope'; threadId: number; frameLevel: number }
+    | { type: 'var'; varName: string }
+> = new Map();
+
+/** Names of GDB var-objects created during the current stop. Deleted on resume. */
+const createdVarObjects: string[] = [];
+
+// ---------------------------------------------------------------------------
 // DAP message parsing (stdin)
 // ---------------------------------------------------------------------------
 
@@ -112,6 +133,7 @@ function handleRequest(request: any) {
                 supportsConfigurationDoneRequest: true,
                 supportsEvaluateForHovers: false,
                 supportsFunctionBreakpoints: true,
+                supportsVariableType: true,
             });
             sendEvent('initialized');
             break;
@@ -158,6 +180,14 @@ function handleRequest(request: any) {
 
         case 'stackTrace':
             handleStackTrace(request);
+            break;
+
+        case 'scopes':
+            handleScopes(request);
+            break;
+
+        case 'variables':
+            handleVariables(request);
             break;
 
         case 'evaluate':
@@ -423,7 +453,8 @@ function handleContinue(request: any): void {
     if (!inferiorStarted) {
         // First time: actually start the program
         inferiorStarted = true;
-        sendMICommand('-exec-run')
+        cleanupVariables()
+            .then(() => sendMICommand('-exec-run'))
             .then(() => {
                 sendResponse(request, { allThreadsContinued: true });
             })
@@ -433,7 +464,8 @@ function handleContinue(request: any): void {
             });
     } else {
         // Program already running, just resume
-        sendMICommand('-exec-continue')
+        cleanupVariables()
+            .then(() => sendMICommand('-exec-continue'))
             .then(() => {
                 sendResponse(request, { allThreadsContinued: true });
             })
@@ -453,7 +485,8 @@ function handleNext(request: any): void {
         sendErrorResponse(request, 'Program has not started yet. Press Continue first.');
         return;
     }
-    sendMICommand('-exec-next')
+    cleanupVariables()
+        .then(() => sendMICommand('-exec-next'))
         .then(() => {
             sendResponse(request);
         })
@@ -472,7 +505,8 @@ function handleStepIn(request: any): void {
         sendErrorResponse(request, 'Program has not started yet. Press Continue first.');
         return;
     }
-    sendMICommand('-exec-step')
+    cleanupVariables()
+        .then(() => sendMICommand('-exec-step'))
         .then(() => {
             sendResponse(request);
         })
@@ -491,7 +525,8 @@ function handleStepOut(request: any): void {
         sendErrorResponse(request, 'Program has not started yet. Press Continue first.');
         return;
     }
-    sendMICommand('-exec-finish')
+    cleanupVariables()
+        .then(() => sendMICommand('-exec-finish'))
         .then(() => {
             sendResponse(request);
         })
@@ -655,6 +690,198 @@ async function handleSetFunctionBreakpoints(request: any): Promise<void> {
         process.stderr.write(`[Adapter] setFunctionBreakpoints failed: ${err.message}\n`);
         sendErrorResponse(request, err.message);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Scopes & Variables handlers
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle "scopes" request.
+ * Returns a single "Locals" scope for the given stack frame, which
+ * includes both local variables and function arguments.
+ */
+function handleScopes(request: any): void {
+    const frameId = request.arguments?.frameId ?? 0;
+    const threadId = Math.floor(frameId / 10000);
+    const frameLevel = frameId % 10000;
+
+    // Allocate a variablesReference for this scope
+    const ref = nextVarRef++;
+    varRefMap.set(ref, { type: 'scope', threadId, frameLevel });
+
+    sendResponse(request, {
+        scopes: [
+            {
+                name: 'Locals',
+                variablesReference: ref,
+                expensive: false,
+            },
+        ],
+    });
+}
+
+/**
+ * Handle "variables" request.
+ * Resolves the variablesReference to either a scope (top-level variable
+ * listing) or a var-object (expanding a complex type's children).
+ */
+async function handleVariables(request: any): Promise<void> {
+    const ref = request.arguments?.variablesReference ?? 0;
+    const entry = varRefMap.get(ref);
+
+    if (!entry) {
+        sendResponse(request, { variables: [] });
+        return;
+    }
+
+    try {
+        if (entry.type === 'scope') {
+            await handleScopeVariables(request, entry.threadId, entry.frameLevel);
+        } else {
+            await handleVarChildren(request, entry.varName);
+        }
+    } catch (err: any) {
+        process.stderr.write(`[Adapter] variables failed: ${err.message}\n`);
+        sendResponse(request, { variables: [] });
+    }
+}
+
+/**
+ * Fetch all variables for a scope (locals + args) from GDB.
+ */
+async function handleScopeVariables(
+    request: any,
+    threadId: number,
+    frameLevel: number,
+): Promise<void> {
+    // Switch to the correct thread and frame
+    await sendMICommand(`-thread-select ${threadId}`);
+    await sendMICommand(`-stack-select-frame ${frameLevel}`);
+
+    // Get all variables (args + locals) with values
+    const record = await sendMICommand('-stack-list-variables --all-values');
+    const miVars = record.data?.variables;
+
+    const variables: any[] = [];
+
+    if (Array.isArray(miVars)) {
+        for (const v of miVars) {
+            const name = v.name || '';
+            const value = v.value || '';
+            const type = v.type || '';
+
+            // Determine if this variable is expandable (complex type).
+            // Simple heuristic: if the value starts with '{' or the type
+            // looks like a struct/enum/tuple, try to create a var-object.
+            let variablesReference = 0;
+
+            if (looksExpandable(type, value)) {
+                try {
+                    const varObj = await sendMICommand(
+                        `-var-create - * ${name}`
+                    );
+                    const varName = varObj.data?.name;
+                    const numchild = parseInt(varObj.data?.numchild || '0', 10);
+
+                    if (varName) {
+                        createdVarObjects.push(varName);
+
+                        if (numchild > 0) {
+                            const childRef = nextVarRef++;
+                            varRefMap.set(childRef, { type: 'var', varName });
+                            variablesReference = childRef;
+                        }
+                    }
+                } catch {
+                    // var-create failed — treat as non-expandable
+                }
+            }
+
+            variables.push({
+                name,
+                value,
+                type,
+                variablesReference,
+            });
+        }
+    }
+
+    sendResponse(request, { variables });
+}
+
+/**
+ * Fetch children of an expandable GDB var-object.
+ */
+async function handleVarChildren(
+    request: any,
+    parentVarName: string,
+): Promise<void> {
+    const record = await sendMICommand(
+        `-var-list-children --all-values ${parentVarName}`
+    );
+    const children = record.data?.children;
+    const variables: any[] = [];
+
+    if (Array.isArray(children)) {
+        for (const entry of children) {
+            // MI returns: child={name="var1.field",exp="field",numchild="0",value="42",type="i32"}
+            const child = entry.child || entry;
+            const name = child.exp || child.name || '';
+            const value = child.value || '';
+            const type = child.type || '';
+            const numchild = parseInt(child.numchild || '0', 10);
+            const childVarName = child.name || '';
+
+            let variablesReference = 0;
+            if (numchild > 0 && childVarName) {
+                const childRef = nextVarRef++;
+                varRefMap.set(childRef, { type: 'var', varName: childVarName });
+                variablesReference = childRef;
+            }
+
+            variables.push({
+                name,
+                value,
+                type,
+                variablesReference,
+            });
+        }
+    }
+
+    sendResponse(request, { variables });
+}
+
+/**
+ * Heuristic: does this variable look like it might be expandable?
+ * Returns true for structs, enums, tuples, arrays, etc.
+ */
+function looksExpandable(type: string, value: string): boolean {
+    // If value starts with '{', it's likely a struct/tuple
+    if (value.startsWith('{')) return true;
+    // Rust slice / array types
+    if (type.startsWith('[') || type.startsWith('&[')) return true;
+    // Tuple types
+    if (type.startsWith('(') && type.includes(',')) return true;
+    // Common Rust smart pointer / collection types
+    if (/^(alloc::|std::)/.test(type)) return true;
+    // Named struct types (contains ::)
+    if (type.includes('::') && !type.includes('*')) return true;
+    return false;
+}
+
+/**
+ * Clean up all GDB var-objects and reset variable state.
+ * Called when the inferior resumes execution.
+ */
+async function cleanupVariables(): Promise<void> {
+    // Delete all var-objects from GDB
+    for (const name of createdVarObjects) {
+        await sendMICommand(`-var-delete ${name}`).catch(() => {});
+    }
+    createdVarObjects.length = 0;
+    varRefMap.clear();
+    nextVarRef = 1;
 }
 
 // ---------------------------------------------------------------------------
