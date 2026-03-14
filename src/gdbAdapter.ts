@@ -78,12 +78,12 @@ let nextVarRef = 1;
 
 /**
  * Map from variablesReference → info needed to fetch its contents.
- * - 'scope': a top-level scope (Locals) — needs threadId + frameLevel to query GDB.
+ * - 'scope': a top-level scope (Args or Locals) — needs threadId + frameLevel to query GDB.
  * - 'var': an expandable GDB var-object — needs the var-object name to list children.
  */
 const varRefMap: Map<
     number,
-    | { type: 'scope'; threadId: number; frameLevel: number }
+    | { type: 'scope'; scopeKind: 'args' | 'locals'; threadId: number; frameLevel: number }
     | { type: 'var'; varName: string }
 > = new Map();
 
@@ -698,23 +698,31 @@ async function handleSetFunctionBreakpoints(request: any): Promise<void> {
 
 /**
  * Handle "scopes" request.
- * Returns a single "Locals" scope for the given stack frame, which
- * includes both local variables and function arguments.
+ * Returns two scopes for the given stack frame:
+ * - "Arguments" — function parameters
+ * - "Locals" — local variables
+ * This avoids duplicate entries that occur when using -stack-list-variables.
  */
 function handleScopes(request: any): void {
     const frameId = request.arguments?.frameId ?? 0;
     const threadId = Math.floor(frameId / 10000);
     const frameLevel = frameId % 10000;
 
-    // Allocate a variablesReference for this scope
-    const ref = nextVarRef++;
-    varRefMap.set(ref, { type: 'scope', threadId, frameLevel });
+    const argsRef = nextVarRef++;
+    const localsRef = nextVarRef++;
+    varRefMap.set(argsRef, { type: 'scope', scopeKind: 'args', threadId, frameLevel });
+    varRefMap.set(localsRef, { type: 'scope', scopeKind: 'locals', threadId, frameLevel });
 
     sendResponse(request, {
         scopes: [
             {
+                name: 'Arguments',
+                variablesReference: argsRef,
+                expensive: false,
+            },
+            {
                 name: 'Locals',
-                variablesReference: ref,
+                variablesReference: localsRef,
                 expensive: false,
             },
         ],
@@ -737,7 +745,7 @@ async function handleVariables(request: any): Promise<void> {
 
     try {
         if (entry.type === 'scope') {
-            await handleScopeVariables(request, entry.threadId, entry.frameLevel);
+            await handleScopeVariables(request, entry.threadId, entry.frameLevel, entry.scopeKind);
         } else {
             await handleVarChildren(request, entry.varName);
         }
@@ -748,20 +756,36 @@ async function handleVariables(request: any): Promise<void> {
 }
 
 /**
- * Fetch all variables for a scope (locals + args) from GDB.
+ * Fetch variables for a scope from GDB.
+ * - 'args' scope uses -stack-list-arguments to get function parameters.
+ * - 'locals' scope uses -stack-list-locals to get local variables.
  */
 async function handleScopeVariables(
     request: any,
     threadId: number,
     frameLevel: number,
+    scopeKind: 'args' | 'locals',
 ): Promise<void> {
     // Switch to the correct thread and frame
     await sendMICommand(`-thread-select ${threadId}`);
     await sendMICommand(`-stack-select-frame ${frameLevel}`);
 
-    // Get all variables (args + locals) with values
-    const record = await sendMICommand('-stack-list-variables --all-values');
-    const miVars = record.data?.variables;
+    let miVars: any[] | undefined;
+
+    if (scopeKind === 'args') {
+        // Get function arguments for the current frame
+        const record = await sendMICommand(`-stack-list-arguments --all-values 0 0`);
+        // Response: stack-args=[frame={level="0",args=[{name="x",type="i32",value="1"},..]}]
+        const stackArgs = record.data?.['stack-args'];
+        if (Array.isArray(stackArgs) && stackArgs.length > 0) {
+            const frameEntry = stackArgs[0]?.frame || stackArgs[0];
+            miVars = frameEntry?.args;
+        }
+    } else {
+        // Get local variables (excluding arguments)
+        const record = await sendMICommand('-stack-list-locals --all-values');
+        miVars = record.data?.locals;
+    }
 
     const variables: any[] = [];
 
