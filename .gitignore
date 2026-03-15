@@ -9,3 +9,7 @@ __pycache__/
 
 # ignore temp folder
 /temp
+
+# Hugo build output
+website/public/
+website/.hugo_build.lock
