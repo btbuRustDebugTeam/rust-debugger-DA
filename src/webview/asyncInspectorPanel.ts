@@ -99,29 +99,20 @@ export class AsyncInspectorPanel {
      * Called when the debug adapter sends a "stopped" event.
      * Triggers snapshot refresh automatically when the inferior has been
      * started (not the synthetic "entry" stop).
-     *
-     * Uses a small delay to let VS Code's own stopped-event handling
-     * (threads, stackTrace) settle first, avoiding request conflicts.
      */
     public onDebugStopped(session: vscode.DebugSession, stoppedBody: any): void {
         this._debugSession = session;
         const isEntry = stoppedBody?.reason === 'entry';
         console.log(`[AsyncInspector] onDebugStopped reason=${stoppedBody?.reason} isEntry=${isEntry} hasSession=${!!this._debugSession}`);
 
-        // Serialize requests to avoid race conditions in the GDB MI2 command
-        // pipeline — concurrent evaluate requests can cause console output to
-        // be misrouted via the shared lastSentToken in gdbAdapter.
-        // Use 800ms delay to let VS Code's stackTrace request (which also
-        // triggers ardb-get-snapshot) complete first.
-        setTimeout(async () => {
-            try {
-                if (!isEntry) {
-                    await this.handleSnapshot();
-                }
-            } catch (e) {
+        if (!isEntry) {
+            // No delay needed — the FIFO command queue in gdbAdapter
+            // correctly routes console output even when MI commands
+            // are in flight concurrently.
+            this.handleSnapshot().catch((e) => {
                 console.error('[AsyncInspector] onDebugStopped handlers failed:', e);
-            }
-        }, 800);
+            });
+        }
     }
 
     private async handleReset(): Promise<void> {
@@ -314,7 +305,7 @@ export class AsyncInspectorPanel {
         }
 
         if (rootIndex < 0) {
-            return; // No async nodes
+            return; // No async nodes, keep existing tree
         }
 
         const rootNode = snapshot.path[rootIndex];

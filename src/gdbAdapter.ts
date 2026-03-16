@@ -975,7 +975,7 @@ function sendMICommand(command: string): Promise<MIRecord> {
 
         const token = nextToken++;
         pendingCommands.set(token, { resolve, reject, consoleOutput: [] });
-        lastSentToken = token;
+        commandQueue.push(token);
 
         const fullCommand = `${token}${command}\n`;
         process.stderr.write(`[Adapter -> GDB] ${fullCommand.trim()}\n`);
@@ -1063,11 +1063,13 @@ function handleGDBOutput(data: Buffer): void {
 }
 
 /**
- * The token of the most recently sent MI command.
- * Console-stream output (~"...") is routed to this token's pending entry,
- * since GDB emits stream output before the result record of the same command.
+ * FIFO queue of tokens for in-flight MI commands.
+ * GDB processes MI commands sequentially, so console-stream output (~"...")
+ * always belongs to the oldest (first) pending command in the queue.
+ * This replaces the old `lastSentToken` approach which was racy when
+ * multiple commands were in flight concurrently.
  */
-let lastSentToken = 0;
+const commandQueue: number[] = [];
 
 /**
  * Route a parsed MI record to the appropriate handler.
@@ -1087,9 +1089,12 @@ function dispatchMIRecord(record: MIRecord): void {
             break;
 
         case 'console-stream':
-            // Route console output to the most recent pending command
-            if (record.data?.msg) {
-                const pending = pendingCommands.get(lastSentToken);
+            // Route console output to the oldest in-flight command (FIFO).
+            // GDB processes MI commands sequentially, so stream output
+            // always belongs to the command at the head of the queue.
+            if (record.data?.msg && commandQueue.length > 0) {
+                const headToken = commandQueue[0];
+                const pending = pendingCommands.get(headToken);
                 if (pending) {
                     pending.consoleOutput.push(record.data.msg);
                 }
@@ -1120,6 +1125,12 @@ function handleResultRecord(record: MIRecord): void {
         const pending = pendingCommands.get(record.token);
         if (pending) {
             pendingCommands.delete(record.token);
+
+            // Remove this token from the FIFO command queue
+            const queueIdx = commandQueue.indexOf(record.token);
+            if (queueIdx !== -1) {
+                commandQueue.splice(queueIdx, 1);
+            }
 
             // Attach accumulated console stream output to the result
             if (pending.consoleOutput.length > 0) {

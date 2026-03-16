@@ -51,6 +51,19 @@ let nextDapBreakpointId = 1;
  */
 let functionBreakpointNumbers = [];
 // ---------------------------------------------------------------------------
+// Variable / scope state
+// ---------------------------------------------------------------------------
+/** Next variablesReference to assign for expandable variables. */
+let nextVarRef = 1;
+/**
+ * Map from variablesReference → info needed to fetch its contents.
+ * - 'scope': a top-level scope (Args or Locals) — needs threadId + frameLevel to query GDB.
+ * - 'var': an expandable GDB var-object — needs the var-object name to list children.
+ */
+const varRefMap = new Map();
+/** Names of GDB var-objects created during the current stop. Deleted on resume. */
+const createdVarObjects = [];
+// ---------------------------------------------------------------------------
 // DAP message parsing (stdin)
 // ---------------------------------------------------------------------------
 process.stdin.on('data', (data) => {
@@ -89,6 +102,7 @@ function handleRequest(request) {
                 supportsConfigurationDoneRequest: true,
                 supportsEvaluateForHovers: false,
                 supportsFunctionBreakpoints: true,
+                supportsVariableType: true,
             });
             sendEvent('initialized');
             break;
@@ -124,6 +138,12 @@ function handleRequest(request) {
             break;
         case 'stackTrace':
             handleStackTrace(request);
+            break;
+        case 'scopes':
+            handleScopes(request);
+            break;
+        case 'variables':
+            handleVariables(request);
             break;
         case 'evaluate':
             handleEvaluate(request);
@@ -211,8 +231,9 @@ function handleThreads(request) {
 }
 /**
  * Handle "stackTrace" request.
- * Queries GDB for the call stack of the given thread and returns
- * DAP StackFrame objects with source location info.
+ * First attempts to get the async logical call stack via ardb-get-snapshot.
+ * If a valid snapshot exists, returns logical stack frames (async + sync).
+ * Otherwise, falls back to GDB's physical stack frames (-stack-list-frames).
  */
 function handleStackTrace(request) {
     const threadId = request.arguments?.threadId || 1;
@@ -221,9 +242,97 @@ function handleStackTrace(request) {
         sendResponse(request, { stackFrames: [], totalFrames: 0 });
         return;
     }
-    // Switch to the requested thread, then list frames
+    // Switch to the requested thread, then try to get a logical snapshot
     sendMICommand(`-thread-select ${threadId}`)
-        .then(() => sendMICommand('-stack-list-frames'))
+        .then(() => {
+        // Try to get async snapshot for logical call stack
+        const escaped = 'ardb-get-snapshot';
+        return sendMICommand(`-interpreter-exec console "${escaped}"`);
+    })
+        .then((record) => {
+        const output = record.data?.msg || '';
+        const snapshot = parseSnapshot(output);
+        if (snapshot && snapshot.path.length > 0) {
+            // Build logical stack frames from snapshot
+            // Snapshot path is root→leaf (caller→callee), but VS Code
+            // expects leaf→root (top of stack first), so reverse it.
+            const reversedPath = [...snapshot.path].reverse();
+            const stackFrames = [];
+            for (let i = 0; i < reversedPath.length; i++) {
+                const node = reversedPath[i];
+                const frameId = threadId * 10000 + i;
+                let name;
+                if (node.type === 'async') {
+                    name = `[async CID:${node.cid}] ${node.func}`;
+                }
+                else {
+                    name = node.func || '<unknown>';
+                }
+                const frame = {
+                    id: frameId,
+                    name,
+                    line: node.line || 0,
+                    column: 0,
+                };
+                if (node.fullname || node.file) {
+                    frame.source = {
+                        name: node.file || '',
+                        path: node.fullname || node.file || '',
+                    };
+                }
+                if (node.addr) {
+                    frame.instructionPointerReference = node.addr;
+                }
+                stackFrames.push(frame);
+            }
+            sendResponse(request, {
+                stackFrames,
+                totalFrames: stackFrames.length,
+            });
+        }
+        else {
+            // Fallback to physical GDB stack frames
+            return fallbackPhysicalStackTrace(request, threadId);
+        }
+    })
+        .catch((err) => {
+        process.stderr.write(`[Adapter] snapshot stackTrace failed, falling back: ${err.message}\n`);
+        // Fallback on error
+        fallbackPhysicalStackTrace(request, threadId).catch((err2) => {
+            process.stderr.write(`[Adapter] stackTrace fallback also failed: ${err2.message}\n`);
+            sendResponse(request, { stackFrames: [], totalFrames: 0 });
+        });
+    });
+}
+/**
+ * Parse a snapshot JSON from GDB console output.
+ * Returns the parsed snapshot or undefined if parsing fails.
+ */
+function parseSnapshot(output) {
+    if (!output)
+        return undefined;
+    const jsonStart = output.indexOf('{');
+    const jsonEnd = output.lastIndexOf('}');
+    if (jsonStart === -1 || jsonEnd === -1 || jsonEnd <= jsonStart) {
+        return undefined;
+    }
+    try {
+        const jsonStr = output.substring(jsonStart, jsonEnd + 1);
+        const snapshot = JSON.parse(jsonStr);
+        if (snapshot.thread_id !== undefined && Array.isArray(snapshot.path)) {
+            return snapshot;
+        }
+    }
+    catch {
+        // JSON parse failed
+    }
+    return undefined;
+}
+/**
+ * Fallback: query GDB for physical stack frames via -stack-list-frames.
+ */
+function fallbackPhysicalStackTrace(request, threadId) {
+    return sendMICommand('-stack-list-frames')
         .then((record) => {
         const stackFrames = [];
         const miStack = record.data?.stack;
@@ -271,7 +380,8 @@ function handleContinue(request) {
     if (!inferiorStarted) {
         // First time: actually start the program
         inferiorStarted = true;
-        sendMICommand('-exec-run')
+        cleanupVariables()
+            .then(() => sendMICommand('-exec-run'))
             .then(() => {
             sendResponse(request, { allThreadsContinued: true });
         })
@@ -282,7 +392,8 @@ function handleContinue(request) {
     }
     else {
         // Program already running, just resume
-        sendMICommand('-exec-continue')
+        cleanupVariables()
+            .then(() => sendMICommand('-exec-continue'))
             .then(() => {
             sendResponse(request, { allThreadsContinued: true });
         })
@@ -301,7 +412,8 @@ function handleNext(request) {
         sendErrorResponse(request, 'Program has not started yet. Press Continue first.');
         return;
     }
-    sendMICommand('-exec-next')
+    cleanupVariables()
+        .then(() => sendMICommand('-exec-next'))
         .then(() => {
         sendResponse(request);
     })
@@ -319,7 +431,8 @@ function handleStepIn(request) {
         sendErrorResponse(request, 'Program has not started yet. Press Continue first.');
         return;
     }
-    sendMICommand('-exec-step')
+    cleanupVariables()
+        .then(() => sendMICommand('-exec-step'))
         .then(() => {
         sendResponse(request);
     })
@@ -337,7 +450,8 @@ function handleStepOut(request) {
         sendErrorResponse(request, 'Program has not started yet. Press Continue first.');
         return;
     }
-    sendMICommand('-exec-finish')
+    cleanupVariables()
+        .then(() => sendMICommand('-exec-finish'))
         .then(() => {
         sendResponse(request);
     })
@@ -486,6 +600,194 @@ async function handleSetFunctionBreakpoints(request) {
     }
 }
 // ---------------------------------------------------------------------------
+// Scopes & Variables handlers
+// ---------------------------------------------------------------------------
+/**
+ * Handle "scopes" request.
+ * Returns two scopes for the given stack frame:
+ * - "Arguments" — function parameters
+ * - "Locals" — local variables
+ * This avoids duplicate entries that occur when using -stack-list-variables.
+ */
+function handleScopes(request) {
+    const frameId = request.arguments?.frameId ?? 0;
+    const threadId = Math.floor(frameId / 10000);
+    const frameLevel = frameId % 10000;
+    const argsRef = nextVarRef++;
+    const localsRef = nextVarRef++;
+    varRefMap.set(argsRef, { type: 'scope', scopeKind: 'args', threadId, frameLevel });
+    varRefMap.set(localsRef, { type: 'scope', scopeKind: 'locals', threadId, frameLevel });
+    sendResponse(request, {
+        scopes: [
+            {
+                name: 'Arguments',
+                variablesReference: argsRef,
+                expensive: false,
+            },
+            {
+                name: 'Locals',
+                variablesReference: localsRef,
+                expensive: false,
+            },
+        ],
+    });
+}
+/**
+ * Handle "variables" request.
+ * Resolves the variablesReference to either a scope (top-level variable
+ * listing) or a var-object (expanding a complex type's children).
+ */
+async function handleVariables(request) {
+    const ref = request.arguments?.variablesReference ?? 0;
+    const entry = varRefMap.get(ref);
+    if (!entry) {
+        sendResponse(request, { variables: [] });
+        return;
+    }
+    try {
+        if (entry.type === 'scope') {
+            await handleScopeVariables(request, entry.threadId, entry.frameLevel, entry.scopeKind);
+        }
+        else {
+            await handleVarChildren(request, entry.varName);
+        }
+    }
+    catch (err) {
+        process.stderr.write(`[Adapter] variables failed: ${err.message}\n`);
+        sendResponse(request, { variables: [] });
+    }
+}
+/**
+ * Fetch variables for a scope from GDB.
+ * - 'args' scope uses -stack-list-arguments to get function parameters.
+ * - 'locals' scope uses -stack-list-locals to get local variables.
+ */
+async function handleScopeVariables(request, threadId, frameLevel, scopeKind) {
+    // Switch to the correct thread and frame
+    await sendMICommand(`-thread-select ${threadId}`);
+    await sendMICommand(`-stack-select-frame ${frameLevel}`);
+    let miVars;
+    if (scopeKind === 'args') {
+        // Get function arguments for the current frame
+        const record = await sendMICommand(`-stack-list-arguments --all-values 0 0`);
+        // Response: stack-args=[frame={level="0",args=[{name="x",type="i32",value="1"},..]}]
+        const stackArgs = record.data?.['stack-args'];
+        if (Array.isArray(stackArgs) && stackArgs.length > 0) {
+            const frameEntry = stackArgs[0]?.frame || stackArgs[0];
+            miVars = frameEntry?.args;
+        }
+    }
+    else {
+        // Get local variables (excluding arguments)
+        const record = await sendMICommand('-stack-list-locals --all-values');
+        miVars = record.data?.locals;
+    }
+    const variables = [];
+    if (Array.isArray(miVars)) {
+        for (const v of miVars) {
+            const name = v.name || '';
+            const value = v.value || '';
+            const type = v.type || '';
+            // Determine if this variable is expandable (complex type).
+            // Simple heuristic: if the value starts with '{' or the type
+            // looks like a struct/enum/tuple, try to create a var-object.
+            let variablesReference = 0;
+            if (looksExpandable(type, value)) {
+                try {
+                    const varObj = await sendMICommand(`-var-create - * ${name}`);
+                    const varName = varObj.data?.name;
+                    const numchild = parseInt(varObj.data?.numchild || '0', 10);
+                    if (varName) {
+                        createdVarObjects.push(varName);
+                        if (numchild > 0) {
+                            const childRef = nextVarRef++;
+                            varRefMap.set(childRef, { type: 'var', varName });
+                            variablesReference = childRef;
+                        }
+                    }
+                }
+                catch {
+                    // var-create failed — treat as non-expandable
+                }
+            }
+            variables.push({
+                name,
+                value,
+                type,
+                variablesReference,
+            });
+        }
+    }
+    sendResponse(request, { variables });
+}
+/**
+ * Fetch children of an expandable GDB var-object.
+ */
+async function handleVarChildren(request, parentVarName) {
+    const record = await sendMICommand(`-var-list-children --all-values ${parentVarName}`);
+    const children = record.data?.children;
+    const variables = [];
+    if (Array.isArray(children)) {
+        for (const entry of children) {
+            // MI returns: child={name="var1.field",exp="field",numchild="0",value="42",type="i32"}
+            const child = entry.child || entry;
+            const name = child.exp || child.name || '';
+            const value = child.value || '';
+            const type = child.type || '';
+            const numchild = parseInt(child.numchild || '0', 10);
+            const childVarName = child.name || '';
+            let variablesReference = 0;
+            if (numchild > 0 && childVarName) {
+                const childRef = nextVarRef++;
+                varRefMap.set(childRef, { type: 'var', varName: childVarName });
+                variablesReference = childRef;
+            }
+            variables.push({
+                name,
+                value,
+                type,
+                variablesReference,
+            });
+        }
+    }
+    sendResponse(request, { variables });
+}
+/**
+ * Heuristic: does this variable look like it might be expandable?
+ * Returns true for structs, enums, tuples, arrays, etc.
+ */
+function looksExpandable(type, value) {
+    // If value starts with '{', it's likely a struct/tuple
+    if (value.startsWith('{'))
+        return true;
+    // Rust slice / array types
+    if (type.startsWith('[') || type.startsWith('&['))
+        return true;
+    // Tuple types
+    if (type.startsWith('(') && type.includes(','))
+        return true;
+    // Common Rust smart pointer / collection types
+    if (/^(alloc::|std::)/.test(type))
+        return true;
+    // Named struct types (contains ::)
+    if (type.includes('::') && !type.includes('*'))
+        return true;
+    return false;
+}
+/**
+ * Clean up all GDB var-objects and reset variable state.
+ * Called when the inferior resumes execution.
+ */
+async function cleanupVariables() {
+    // Delete all var-objects from GDB
+    for (const name of createdVarObjects) {
+        await sendMICommand(`-var-delete ${name}`).catch(() => { });
+    }
+    createdVarObjects.length = 0;
+    varRefMap.clear();
+    nextVarRef = 1;
+}
+// ---------------------------------------------------------------------------
 // Evaluate handler
 // ---------------------------------------------------------------------------
 /**
@@ -544,7 +846,7 @@ function sendMICommand(command) {
         }
         const token = nextToken++;
         pendingCommands.set(token, { resolve, reject, consoleOutput: [] });
-        lastSentToken = token;
+        commandQueue.push(token);
         const fullCommand = `${token}${command}\n`;
         process.stderr.write(`[Adapter -> GDB] ${fullCommand.trim()}\n`);
         gdbProcess.stdin.write(fullCommand);
@@ -620,11 +922,13 @@ function handleGDBOutput(data) {
     }
 }
 /**
- * The token of the most recently sent MI command.
- * Console-stream output (~"...") is routed to this token's pending entry,
- * since GDB emits stream output before the result record of the same command.
+ * FIFO queue of tokens for in-flight MI commands.
+ * GDB processes MI commands sequentially, so console-stream output (~"...")
+ * always belongs to the oldest (first) pending command in the queue.
+ * This replaces the old `lastSentToken` approach which was racy when
+ * multiple commands were in flight concurrently.
  */
-let lastSentToken = 0;
+const commandQueue = [];
 /**
  * Route a parsed MI record to the appropriate handler.
  */
@@ -640,9 +944,12 @@ function dispatchMIRecord(record) {
             handleNotifyAsync(record);
             break;
         case 'console-stream':
-            // Route console output to the most recent pending command
-            if (record.data?.msg) {
-                const pending = pendingCommands.get(lastSentToken);
+            // Route console output to the oldest in-flight command (FIFO).
+            // GDB processes MI commands sequentially, so stream output
+            // always belongs to the command at the head of the queue.
+            if (record.data?.msg && commandQueue.length > 0) {
+                const headToken = commandQueue[0];
+                const pending = pendingCommands.get(headToken);
                 if (pending) {
                     pending.consoleOutput.push(record.data.msg);
                 }
@@ -669,6 +976,11 @@ function handleResultRecord(record) {
         const pending = pendingCommands.get(record.token);
         if (pending) {
             pendingCommands.delete(record.token);
+            // Remove this token from the FIFO command queue
+            const queueIdx = commandQueue.indexOf(record.token);
+            if (queueIdx !== -1) {
+                commandQueue.splice(queueIdx, 1);
+            }
             // Attach accumulated console stream output to the result
             if (pending.consoleOutput.length > 0) {
                 record.data.msg = pending.consoleOutput.join('');
