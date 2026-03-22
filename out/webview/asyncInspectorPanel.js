@@ -379,7 +379,7 @@ class AsyncInspectorPanel {
             }
             else {
                 // Untracked node (from physical stack, no CID)
-                // 保留 snapshot 中的真实类型（async/sync），不要硬编码
+                // Preserve the real type (async/sync) from the snapshot
                 const existing = current.children.find(c => c.cid === null && c.func === node.func && c.addr === node.addr);
                 if (!existing) {
                     const untrackedChild = {

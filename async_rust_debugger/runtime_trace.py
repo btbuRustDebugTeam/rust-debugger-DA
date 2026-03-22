@@ -822,11 +822,14 @@ class ARDGetSnapshotCommand(gdb.Command):
                 "line": async_line
             })
             
-        # 2. Extract the physical stack tail (frames above the top traced function)
-        sync_tail = []
+        # 2. Extract the physical stack tail (frames above the top traced function).
+        #    For async function frames, attempt to assign CIDs and read state,
+        #    so they appear as proper tracked nodes in the tree.
+        phys_tail = []
+        shadow_cids = set(stack)  # CIDs already on the shadow stack
         try:
-            # Start from the currently selected frame (deepest)
-            frame = gdb.selected_frame()
+            saved_frame = gdb.selected_frame()
+            frame = saved_frame
             while frame:
                 fname = frame.name()
 
@@ -836,40 +839,75 @@ class ARDGetSnapshotCommand(gdb.Command):
                     break
 
                 if fname:
-                    # 根据函数名判断真实类型
                     frame_type = "async" if _is_async_symbol(fname) else "sync"
 
                     # Get source location from the frame
-                    sync_file = ""
-                    sync_fullname = ""
-                    sync_line = 0
+                    phys_file = ""
+                    phys_fullname = ""
+                    phys_line = 0
                     try:
                         sal = frame.find_sal()
                         if sal and sal.symtab:
-                            sync_file = sal.symtab.filename or ""
-                            sync_fullname = sal.symtab.fullname() if hasattr(sal.symtab, 'fullname') else sync_file
-                            sync_line = sal.line or 0
+                            phys_file = sal.symtab.filename or ""
+                            phys_fullname = sal.symtab.fullname() if hasattr(sal.symtab, 'fullname') else phys_file
+                            phys_line = sal.line or 0
                     except Exception:
                         pass
 
-                    sync_tail.append({
+                    node_cid = None
+                    node_poll = 0
+                    node_state = "NON-ASYNC"
+                    node_addr = hex(frame.pc())
+
+                    if frame_type == "async":
+                        # For async frames, select the frame and read the env ptr
+                        # to assign a CID and read __state
+                        node_state = "N/A"
+                        try:
+                            frame.select()
+                            this_ptr = _reg_u64("rdi")
+                            if this_ptr:
+                                cid_phys, _ = _get_or_make_coro_id(fname, this_ptr)
+                                if cid_phys not in shadow_cids:
+                                    node_cid = cid_phys
+                                    node_poll = _CO_POLL_SEQ.get(cid_phys, 0)
+                                    node_addr = hex(this_ptr)
+                                    # Try to read __state from the env
+                                    env_type_name = _pollsym_to_envtype(fname)
+                                    if env_type_name and this_ptr:
+                                        try:
+                                            env_t = gdb.lookup_type(env_type_name)
+                                            env_val = gdb.Value(this_ptr).cast(env_t.pointer()).dereference()
+                                            node_state = int(env_val["__state"])
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            pass
+
+                    phys_tail.append({
                         "type": frame_type,
-                        "cid": None,
+                        "cid": node_cid,
                         "func": fname,
-                        "addr": hex(frame.pc()),
-                        "poll": 0,
-                        "state": "N/A" if frame_type == "async" else "NON-ASYNC",
-                        "file": sync_file,
-                        "fullname": sync_fullname,
-                        "line": sync_line
+                        "addr": node_addr,
+                        "poll": node_poll,
+                        "state": node_state,
+                        "file": phys_file,
+                        "fullname": phys_fullname,
+                        "line": phys_line
                     })
                 frame = frame.older()
+
+            # Restore the originally selected frame
+            try:
+                saved_frame.select()
+            except Exception:
+                pass
         except Exception:
             pass
-            
-        # Physical frames are captured in reverse order (deepest first), 
+
+        # Physical frames are captured in reverse order (deepest first),
         # so we reverse them before appending to the path.
-        snapshot["path"].extend(reversed(sync_tail))
+        snapshot["path"].extend(reversed(phys_tail))
             
         # Output pure JSON for the Debug Adapter
         json_output = json.dumps(snapshot) + "\n"
