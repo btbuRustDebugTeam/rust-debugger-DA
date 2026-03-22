@@ -32,6 +32,7 @@ export interface GroupedWhitelist {
                 name: string;
                 file: string | null;
                 line: number | null;
+                kind: 'async' | 'sync';
             }>;
         };
     };

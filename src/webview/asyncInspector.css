@@ -152,41 +152,23 @@ h3 {
     border: 1px solid var(--vscode-input-border, transparent);
     border-radius: 3px;
     margin-top: 8px;
-    word-break: break-all;
     color: var(--vscode-descriptionForeground);
     min-height: 28px;
+    max-height: 120px;
+    overflow-y: auto;
 }
 
-.trace-root-active {
+.trace-root-item {
+    padding: 3px 0;
     color: var(--vscode-foreground);
-    font-weight: 500;
-}
-
-.trace-root-suggestion {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-
-.trace-root-symbol {
-    flex: 1;
     font-family: var(--vscode-editor-font-family);
-    font-size: 12px;
+    font-size: 11px;
     word-break: break-all;
-    color: var(--vscode-foreground);
+    border-bottom: 1px solid var(--vscode-panel-border);
 }
 
-.trace-root-select {
-    width: 100%;
-    margin-top: 8px;
-    padding: 4px 8px;
-    font-size: 12px;
-    font-family: var(--vscode-editor-font-family);
-    background: var(--vscode-dropdown-background);
-    color: var(--vscode-dropdown-foreground);
-    border: 1px solid var(--vscode-dropdown-border, transparent);
-    border-radius: 3px;
-    cursor: pointer;
+.trace-root-item:last-child {
+    border-bottom: none;
 }
 
 /* -----------------------------------------------------------------------
@@ -293,6 +275,40 @@ h3 {
     padding: 3px 0;
     font-size: 11px;
     font-family: var(--vscode-editor-font-family);
+}
+
+.symbol-kind-badge {
+    font-size: 9px;
+    font-weight: bold;
+    width: 16px;
+    height: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 3px;
+    flex-shrink: 0;
+}
+
+.symbol-kind-badge.kind-async {
+    background: rgba(255, 107, 107, 0.2);
+    color: #ff6b6b;
+}
+
+.symbol-kind-badge.kind-sync {
+    background: rgba(81, 207, 102, 0.2);
+    color: #51cf66;
+}
+
+.sub-section-label {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--vscode-descriptionForeground);
+    padding: 4px 0 2px 0;
+    margin-top: 4px;
+}
+
+.sub-section-label:first-child {
+    margin-top: 0;
 }
 
 .symbol-item label {

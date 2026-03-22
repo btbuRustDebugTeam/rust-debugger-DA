@@ -7,9 +7,8 @@
     let groupedWhitelist = null;
     let enabledCrates = new Set();
 
-    // Trace root state
-    let currentTraceRoot = null;
-    let inferredTraceRoot = null;
+    // Trace root state (仅展示当前已 trace 的函数)
+    let traceRoots = [];
 
     // Flat candidates fallback
     let candidates = [];
@@ -23,6 +22,8 @@
 
     function setupEventListeners() {
         document.getElementById('resetBtn').addEventListener('click', () => {
+            traceRoots = [];
+            renderTraceRootSection();
             vscode.postMessage({ command: 'reset' });
         });
 
@@ -32,10 +33,6 @@
 
         document.getElementById('snapshotBtn').addEventListener('click', () => {
             vscode.postMessage({ command: 'snapshot' });
-        });
-
-        document.getElementById('inferTraceRootBtn').addEventListener('click', () => {
-            vscode.postMessage({ command: 'inferTraceRoot' });
         });
     }
 
@@ -122,91 +119,35 @@
     }
 
     // -----------------------------------------------------------------------
-    // Trace Root section
+    // Trace Root section（仅展示当前已 trace 的根函数列表）
     // -----------------------------------------------------------------------
 
     function renderTraceRootSection() {
         const display = document.getElementById('traceRootDisplay');
-        const dropdown = document.getElementById('traceRootDropdown');
-        if (!display || !dropdown) return;
+        if (!display) return;
 
-        // Show current or inferred trace root
-        if (currentTraceRoot) {
-            display.innerHTML = '';
-            const label = document.createElement('div');
-            label.className = 'trace-root-active';
-            label.textContent = currentTraceRoot;
-            display.appendChild(label);
-        } else if (inferredTraceRoot && inferredTraceRoot.trace_root) {
-            display.innerHTML = '';
-
-            const suggestion = document.createElement('div');
-            suggestion.className = 'trace-root-suggestion';
-
-            const label = document.createElement('span');
-            label.textContent = inferredTraceRoot.trace_root;
-            label.className = 'trace-root-symbol';
-
-            const traceBtn = document.createElement('button');
-            traceBtn.className = 'candidate-btn';
-            traceBtn.textContent = 'Trace';
-            traceBtn.addEventListener('click', () => {
-                currentTraceRoot = inferredTraceRoot.trace_root;
-                vscode.postMessage({ command: 'trace', symbol: inferredTraceRoot.trace_root });
-                renderTraceRootSection();
-            });
-
-            suggestion.appendChild(label);
-            suggestion.appendChild(traceBtn);
-            display.appendChild(suggestion);
-        } else {
-            display.textContent = 'No trace root set. Click "Infer from Breakpoint" or select from whitelist.';
+        if (traceRoots.length === 0) {
+            display.textContent = 'No trace root set. Use "Trace" button in whitelist to set.';
+            return;
         }
 
-        // Dropdown: show user-crate async symbols for manual selection
-        dropdown.innerHTML = '';
-        if (groupedWhitelist && groupedWhitelist.crates) {
-            const userSymbols = [];
-            for (const [crateName, crateData] of Object.entries(groupedWhitelist.crates)) {
-                if (crateData.is_user_crate) {
-                    for (const sym of crateData.symbols) {
-                        // Only show async functions (not manual poll implementations)
-                        if (sym.name.includes('{async_fn#') || sym.name.includes('{async_block#')) {
-                            userSymbols.push(sym.name);
-                        }
-                    }
-                }
-            }
+        display.innerHTML = '';
+        traceRoots.forEach(sym => {
+            const item = document.createElement('div');
+            item.className = 'trace-root-item';
+            item.textContent = sym;
+            display.appendChild(item);
+        });
+    }
 
-            if (userSymbols.length > 0) {
-                const select = document.createElement('select');
-                select.className = 'trace-root-select';
-                select.id = 'traceRootSelect';
-
-                const defaultOpt = document.createElement('option');
-                defaultOpt.value = '';
-                defaultOpt.textContent = '-- Select async function --';
-                select.appendChild(defaultOpt);
-
-                userSymbols.forEach(sym => {
-                    const opt = document.createElement('option');
-                    opt.value = sym;
-                    // Show shortened name for readability
-                    opt.textContent = sym;
-                    select.appendChild(opt);
-                });
-
-                select.addEventListener('change', () => {
-                    if (select.value) {
-                        currentTraceRoot = select.value;
-                        vscode.postMessage({ command: 'trace', symbol: select.value });
-                        renderTraceRootSection();
-                    }
-                });
-
-                dropdown.appendChild(select);
-            }
+    /**
+     * 当用户在白名单中点击 Trace 按钮时调用
+     */
+    function addTraceRoot(symbol) {
+        if (!traceRoots.includes(symbol)) {
+            traceRoots.push(symbol);
         }
+        renderTraceRootSection();
     }
 
     // -----------------------------------------------------------------------
@@ -266,6 +207,10 @@
         const isEnabled = enabledCrates.has(crateName);
         const isExpanded = defaultExpanded;
 
+        // 统计异步/同步函数数量
+        const asyncCount = crateData.symbols.filter(s => s.kind === 'async').length;
+        const syncCount = crateData.symbols.filter(s => s.kind !== 'async').length;
+
         // Header
         const header = document.createElement('div');
         header.className = 'crate-group-header';
@@ -284,9 +229,6 @@
             } else {
                 enabledCrates.delete(crateName);
             }
-            // Update all child checkboxes
-            const childCheckboxes = body.querySelectorAll('input[type="checkbox"]');
-            childCheckboxes.forEach(cb => { cb.checked = checkbox.checked; });
         });
         checkbox.addEventListener('click', (e) => e.stopPropagation());
 
@@ -296,7 +238,11 @@
 
         const badge = document.createElement('span');
         badge.className = 'crate-badge';
-        badge.textContent = `${crateData.symbols.length}`;
+        // 展示异步/同步数量
+        const parts = [];
+        if (asyncCount > 0) parts.push(`${asyncCount} async`);
+        if (syncCount > 0) parts.push(`${syncCount} sync`);
+        badge.textContent = parts.join(', ');
 
         header.appendChild(chevron);
         header.appendChild(checkbox);
@@ -314,46 +260,69 @@
             chevron.classList.toggle('collapsed', !isCollapsed);
         });
 
-        // Render symbols
-        crateData.symbols.forEach(sym => {
-            const item = document.createElement('div');
-            item.className = 'symbol-item';
+        // 先渲染异步函数，再渲染同步函数
+        const asyncSymbols = crateData.symbols.filter(s => s.kind === 'async');
+        const syncSymbols = crateData.symbols.filter(s => s.kind !== 'async');
 
-            const label = document.createElement('label');
-            label.textContent = sym.name;
-            label.title = sym.file ? `${sym.file}:${sym.line || '?'}` : sym.name;
+        if (asyncSymbols.length > 0) {
+            const subLabel = document.createElement('div');
+            subLabel.className = 'sub-section-label';
+            subLabel.textContent = 'Async';
+            body.appendChild(subLabel);
+            asyncSymbols.forEach(sym => renderSymbolItem(body, sym));
+        }
 
-            const actions = document.createElement('div');
-            actions.className = 'symbol-actions';
-
-            const traceBtn = document.createElement('button');
-            traceBtn.className = 'candidate-btn';
-            traceBtn.textContent = 'Trace';
-            traceBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                currentTraceRoot = sym.name;
-                vscode.postMessage({ command: 'trace', symbol: sym.name });
-                renderTraceRootSection();
-            });
-
-            const locateBtn = document.createElement('button');
-            locateBtn.className = 'candidate-btn';
-            locateBtn.textContent = 'Locate';
-            locateBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                vscode.postMessage({ command: 'locate', symbol: sym.name });
-            });
-
-            actions.appendChild(traceBtn);
-            actions.appendChild(locateBtn);
-            item.appendChild(label);
-            item.appendChild(actions);
-            body.appendChild(item);
-        });
+        if (syncSymbols.length > 0) {
+            const subLabel = document.createElement('div');
+            subLabel.className = 'sub-section-label';
+            subLabel.textContent = 'Sync';
+            body.appendChild(subLabel);
+            syncSymbols.forEach(sym => renderSymbolItem(body, sym));
+        }
 
         group.appendChild(header);
         group.appendChild(body);
         container.appendChild(group);
+    }
+
+    function renderSymbolItem(container, sym) {
+        const item = document.createElement('div');
+        item.className = 'symbol-item';
+
+        const kindBadge = document.createElement('span');
+        kindBadge.className = `symbol-kind-badge ${sym.kind === 'async' ? 'kind-async' : 'kind-sync'}`;
+        kindBadge.textContent = sym.kind === 'async' ? 'A' : 'S';
+
+        const label = document.createElement('label');
+        label.textContent = sym.name;
+        label.title = sym.file ? `${sym.file}:${sym.line || '?'}` : sym.name;
+
+        const actions = document.createElement('div');
+        actions.className = 'symbol-actions';
+
+        const traceBtn = document.createElement('button');
+        traceBtn.className = 'candidate-btn';
+        traceBtn.textContent = 'Trace';
+        traceBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            addTraceRoot(sym.name);
+            vscode.postMessage({ command: 'trace', symbol: sym.name });
+        });
+
+        const locateBtn = document.createElement('button');
+        locateBtn.className = 'candidate-btn';
+        locateBtn.textContent = 'Locate';
+        locateBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            vscode.postMessage({ command: 'locate', symbol: sym.name });
+        });
+
+        actions.appendChild(traceBtn);
+        actions.appendChild(locateBtn);
+        item.appendChild(kindBadge);
+        item.appendChild(label);
+        item.appendChild(actions);
+        container.appendChild(item);
     }
 
     // -----------------------------------------------------------------------
@@ -385,9 +354,8 @@
             traceBtn.className = 'candidate-btn';
             traceBtn.textContent = 'Trace';
             traceBtn.addEventListener('click', () => {
-                currentTraceRoot = symbol;
+                addTraceRoot(symbol);
                 vscode.postMessage({ command: 'trace', symbol: symbol });
-                renderTraceRootSection();
             });
 
             const locateBtn = document.createElement('button');
@@ -432,11 +400,6 @@
                     }
                 }
                 renderGroupedWhitelist(groupedWhitelist);
-                renderTraceRootSection();
-                break;
-            case 'updateInferredTraceRoot':
-                inferredTraceRoot = message.traceRoot;
-                renderTraceRootSection();
                 break;
         }
     });

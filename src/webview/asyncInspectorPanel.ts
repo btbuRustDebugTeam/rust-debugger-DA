@@ -55,9 +55,6 @@ export class AsyncInspectorPanel {
                     case 'updateWhitelistCrates':
                         await this.handleUpdateWhitelistCrates(message.enabledCrates);
                         break;
-                    case 'inferTraceRoot':
-                        await this.handleInferTraceRoot();
-                        break;
                 }
             },
             null,
@@ -112,11 +109,8 @@ export class AsyncInspectorPanel {
         console.log(`[AsyncInspector] onDebugStopped reason=${stoppedBody?.reason} isEntry=${isEntry} hasSession=${!!this._debugSession}`);
 
         if (!isEntry) {
-            // Refresh snapshot and auto-infer trace root on breakpoint stop
-            Promise.all([
-                this.handleSnapshot(),
-                this.handleInferTraceRoot(),
-            ]).catch((e) => {
+            // Refresh snapshot on breakpoint stop
+            this.handleSnapshot().catch((e) => {
                 console.error('[AsyncInspector] onDebugStopped handlers failed:', e);
             });
         }
@@ -280,21 +274,6 @@ export class AsyncInspectorPanel {
         if (session) {
             await session.updateWhitelistSelection(enabledCrates);
             vscode.window.showInformationMessage(`Whitelist updated: ${enabledCrates.length} crate(s) enabled`);
-        }
-    }
-
-    private async handleInferTraceRoot(): Promise<void> {
-        const session = this._debugAdapterFactory?.getActiveSession();
-        if (!session) {
-            return;
-        }
-
-        const result = await session.inferTraceRoot();
-        if (result) {
-            this._panel.webview.postMessage({
-                command: 'updateInferredTraceRoot',
-                traceRoot: result
-            });
         }
     }
 
@@ -475,9 +454,7 @@ export class AsyncInspectorPanel {
                         <div class="side-panel">
                             <div class="trace-root-section">
                                 <h3>Trace Root</h3>
-                                <button id="inferTraceRootBtn" class="btn">Infer from Breakpoint</button>
-                                <div id="traceRootDisplay" class="trace-root-display">No trace root set</div>
-                                <div id="traceRootDropdown"></div>
+                                <div id="traceRootDisplay" class="trace-root-display">No trace root set. Use "Trace" button in whitelist to set.</div>
                             </div>
                             <div class="whitelist-section">
                                 <h3>Whitelist</h3>

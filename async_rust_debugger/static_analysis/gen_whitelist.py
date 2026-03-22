@@ -187,58 +187,95 @@ def _write_filtered_whitelist(grouped_data: dict, out_path: str):
 # Grouped whitelist generation (new JSON format)
 # -------------------------
 
+def _is_interesting_function(signature: str, return_type: str | None) -> bool:
+    """
+    判断一个函数是否应该被收录到白名单中。
+    收录标准：
+    1. 返回 Poll<T> 的函数（异步函数的 poll 实现）
+    2. 用户 crate 中的所有函数（同步 + 异步）
+    我们在这里不做 crate 过滤，而是收录所有函数，后续按 crate 分组时再区分。
+    """
+    return True  # 收录所有函数，由 crate 分组和 UI 来控制可见性
+
+
+def _classify_symbol(sym: str, return_type: str | None) -> str:
+    """
+    对符号进行分类：async（异步 poll 函数）或 sync（同步函数）
+    """
+    rt = return_type or ""
+    if "core::task::poll::Poll<" in rt:
+        return "async"
+    if "{async_fn#" in sym or "{async_block#" in sym:
+        return "async"
+    return "sync"
+
+
 def gen_grouped_whitelist(out_path: str) -> dict:
     """
     Generate a grouped whitelist JSON file organized by crate.
+    包含所有函数（同步 + 异步），按 crate 分组。
     Returns the grouped data dict.
     """
     output = gdb.execute("info functions", to_string=True)
     funcs = parse_info_functions(output)
 
-    # Collect poll functions with metadata
-    poll_funcs = []
+    # 收集所有函数及其元信息
+    all_funcs = []
     seen_syms = set()
     for f in funcs:
-        rt = f.get("return_type") or ""
-        if "core::task::poll::Poll<" not in rt:
-            continue
         sym = _extract_symbol_name(f["signature"])
         if not sym or sym in seen_syms:
             continue
         seen_syms.add(sym)
-        poll_funcs.append({
+        all_funcs.append({
             "name": sym,
             "file": f.get("file"),
             "line": f.get("line"),
+            "return_type": f.get("return_type"),
         })
 
-    # Group by crate
+    # 第一遍：按 crate 分组，确定哪些是用户 crate
+    crate_files: dict[str, set] = {}  # crate_name -> set of file paths
+    for af in all_funcs:
+        crate_name = _extract_crate_name(af["name"])
+        if crate_name not in crate_files:
+            crate_files[crate_name] = set()
+        if af["file"]:
+            crate_files[crate_name].add(af["file"])
+
+    # 确定每个 crate 是否为用户 crate
+    crate_is_user: dict[str, bool] = {}
+    for crate_name, files in crate_files.items():
+        sample_file = next(iter(files), None)
+        crate_is_user[crate_name] = _detect_user_crate(crate_name, sample_file)
+
+    # 第二遍：构建分组数据
+    # 对于用户 crate：收录所有函数（同步 + 异步）
+    # 对于框架 crate：只收录异步函数（返回 Poll<T> 的），减少噪音
     crates: dict[str, dict] = {}
-    for pf in poll_funcs:
-        crate_name = _extract_crate_name(pf["name"])
+    for af in all_funcs:
+        crate_name = _extract_crate_name(af["name"])
+        is_user = crate_is_user.get(crate_name, False)
+        kind = _classify_symbol(af["name"], af["return_type"])
+
+        # 框架 crate 只收录异步函数
+        if not is_user and kind != "async":
+            continue
+
         if crate_name not in crates:
             crates[crate_name] = {
-                "is_user_crate": None,  # determined below
+                "is_user_crate": is_user,
                 "symbols": [],
-                "_files": set(),  # temp: collect file paths for user-crate detection
             }
         crates[crate_name]["symbols"].append({
-            "name": pf["name"],
-            "file": pf["file"],
-            "line": pf["line"],
+            "name": af["name"],
+            "file": af["file"],
+            "line": af["line"],
+            "kind": kind,  # "async" 或 "sync"
         })
-        if pf["file"]:
-            crates[crate_name]["_files"].add(pf["file"])
-
-    # Determine user crate status
-    for crate_name, crate_info in crates.items():
-        # Use the first file path from this crate's symbols for detection
-        sample_file = next(iter(crate_info["_files"]), None)
-        crate_info["is_user_crate"] = _detect_user_crate(crate_name, sample_file)
-        del crate_info["_files"]  # remove temp field
 
     grouped_data = {
-        "version": 1,
+        "version": 2,
         "crates": crates,
     }
 
@@ -248,7 +285,10 @@ def gen_grouped_whitelist(out_path: str) -> dict:
 
     user_count = sum(1 for c in crates.values() if c["is_user_crate"])
     total_syms = sum(len(c["symbols"]) for c in crates.values())
-    gdb.write(f"[ARD] wrote grouped whitelist: {len(crates)} crates ({user_count} user), {total_syms} symbols -> {out_path}\n")
+    async_syms = sum(1 for c in crates.values() for s in c["symbols"] if s.get("kind") == "async")
+    sync_syms = total_syms - async_syms
+    gdb.write(f"[ARD] wrote grouped whitelist: {len(crates)} crates ({user_count} user), "
+              f"{total_syms} symbols ({async_syms} async, {sync_syms} sync) -> {out_path}\n")
 
     return grouped_data
 
