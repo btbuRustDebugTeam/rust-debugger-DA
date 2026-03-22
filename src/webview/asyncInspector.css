@@ -55,12 +55,13 @@ body {
 }
 
 .side-panel {
-    width: 300px;
+    width: 340px;
     display: flex;
     flex-direction: column;
-    gap: 20px;
+    gap: 10px;
     border-left: 1px solid var(--vscode-panel-border);
     padding-left: 10px;
+    overflow: hidden;
 }
 
 h3 {
@@ -73,6 +74,10 @@ h3 {
     flex: 1;
     overflow: auto;
 }
+
+/* -----------------------------------------------------------------------
+   Tree nodes
+   ----------------------------------------------------------------------- */
 
 .tree-node {
     margin: 5px 0;
@@ -130,15 +135,189 @@ h3 {
     margin-top: 5px;
 }
 
-.candidates-section {
-    flex: 1;
-    overflow: auto;
+/* -----------------------------------------------------------------------
+   Trace Root section
+   ----------------------------------------------------------------------- */
+
+.trace-root-section {
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--vscode-panel-border);
 }
 
-#candidatesList {
-    max-height: 300px;
+.trace-root-display {
+    font-family: var(--vscode-editor-font-family);
+    font-size: 12px;
+    padding: 6px 8px;
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, transparent);
+    border-radius: 3px;
+    margin-top: 8px;
+    word-break: break-all;
+    color: var(--vscode-descriptionForeground);
+    min-height: 28px;
+}
+
+.trace-root-active {
+    color: var(--vscode-foreground);
+    font-weight: 500;
+}
+
+.trace-root-suggestion {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.trace-root-symbol {
+    flex: 1;
+    font-family: var(--vscode-editor-font-family);
+    font-size: 12px;
+    word-break: break-all;
+    color: var(--vscode-foreground);
+}
+
+.trace-root-select {
+    width: 100%;
+    margin-top: 8px;
+    padding: 4px 8px;
+    font-size: 12px;
+    font-family: var(--vscode-editor-font-family);
+    background: var(--vscode-dropdown-background);
+    color: var(--vscode-dropdown-foreground);
+    border: 1px solid var(--vscode-dropdown-border, transparent);
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+/* -----------------------------------------------------------------------
+   Whitelist section
+   ----------------------------------------------------------------------- */
+
+.whitelist-section {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+#whitelistContainer {
+    flex: 1;
+    overflow-y: auto;
+    padding: 4px 0;
+}
+
+.section-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--vscode-descriptionForeground);
+    padding: 8px 0 4px 0;
+    border-bottom: 1px solid var(--vscode-panel-border);
+    margin-bottom: 4px;
+}
+
+/* Crate group */
+
+.crate-group {
+    margin: 4px 0;
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 3px;
+}
+
+.crate-group.user-crate {
+    border-color: var(--vscode-inputValidation-infoBorder, #007acc);
+}
+
+.crate-group-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.crate-group-header:hover {
+    background-color: var(--vscode-list-hoverBackground);
+}
+
+.crate-chevron {
+    font-size: 10px;
+    transition: transform 0.15s ease;
+    width: 14px;
+    text-align: center;
+    flex-shrink: 0;
+}
+
+.crate-chevron.collapsed {
+    transform: rotate(-90deg);
+}
+
+.crate-group-header input[type="checkbox"] {
+    flex-shrink: 0;
+    cursor: pointer;
+}
+
+.crate-name {
+    font-weight: 500;
+    font-size: 12px;
+    flex: 1;
+}
+
+.crate-badge {
+    font-size: 10px;
+    background: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+    padding: 1px 6px;
+    border-radius: 8px;
+    flex-shrink: 0;
+}
+
+.crate-group-body {
+    padding: 0 8px 8px 28px;
+    max-height: 200px;
     overflow-y: auto;
 }
+
+.crate-group-body.collapsed {
+    display: none;
+}
+
+/* Symbol item within a crate group */
+
+.symbol-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 0;
+    font-size: 11px;
+    font-family: var(--vscode-editor-font-family);
+}
+
+.symbol-item label {
+    flex: 1;
+    cursor: default;
+    word-break: break-all;
+    line-height: 1.4;
+}
+
+.symbol-actions {
+    display: flex;
+    gap: 3px;
+    flex-shrink: 0;
+}
+
+/* Apply button */
+
+.apply-btn {
+    margin-top: 10px;
+    width: 100%;
+}
+
+/* -----------------------------------------------------------------------
+   Flat candidates (fallback)
+   ----------------------------------------------------------------------- */
 
 .candidate-item {
     display: flex;
@@ -177,6 +356,10 @@ h3 {
 .candidate-btn:hover {
     background-color: var(--vscode-button-secondaryHoverBackground);
 }
+
+/* -----------------------------------------------------------------------
+   Shared
+   ----------------------------------------------------------------------- */
 
 .placeholder-text {
     padding: 10px;

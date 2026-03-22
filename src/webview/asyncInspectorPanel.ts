@@ -52,6 +52,12 @@ export class AsyncInspectorPanel {
                     case 'refreshCandidates':
                         await this.handleRefreshCandidates();
                         break;
+                    case 'updateWhitelistCrates':
+                        await this.handleUpdateWhitelistCrates(message.enabledCrates);
+                        break;
+                    case 'inferTraceRoot':
+                        await this.handleInferTraceRoot();
+                        break;
                 }
             },
             null,
@@ -106,10 +112,11 @@ export class AsyncInspectorPanel {
         console.log(`[AsyncInspector] onDebugStopped reason=${stoppedBody?.reason} isEntry=${isEntry} hasSession=${!!this._debugSession}`);
 
         if (!isEntry) {
-            // No delay needed — the FIFO command queue in gdbAdapter
-            // correctly routes console output even when MI commands
-            // are in flight concurrently.
-            this.handleSnapshot().catch((e) => {
+            // Refresh snapshot and auto-infer trace root on breakpoint stop
+            Promise.all([
+                this.handleSnapshot(),
+                this.handleInferTraceRoot(),
+            ]).catch((e) => {
                 console.error('[AsyncInspector] onDebugStopped handlers failed:', e);
             });
         }
@@ -128,9 +135,13 @@ export class AsyncInspectorPanel {
     private async handleGenWhitelist(): Promise<void> {
         const session = this._debugAdapterFactory?.getActiveSession();
         if (session) {
-            await session.genWhitelist();
-            // Refresh candidates after generating
-            await this.handleRefreshCandidates();
+            const grouped = await session.genWhitelist();
+            if (grouped) {
+                this._panel.webview.postMessage({
+                    command: 'updateGroupedWhitelist',
+                    groupedWhitelist: grouped
+                });
+            }
         }
     }
 
@@ -246,10 +257,43 @@ export class AsyncInspectorPanel {
     private async handleRefreshCandidates(): Promise<void> {
         const session = this._debugAdapterFactory?.getActiveSession();
         if (session) {
-            const candidates = await session.getWhitelistCandidates();
+            // Try grouped whitelist first
+            const grouped = await session.getGroupedWhitelist();
+            if (grouped) {
+                this._panel.webview.postMessage({
+                    command: 'updateGroupedWhitelist',
+                    groupedWhitelist: grouped
+                });
+            } else {
+                // Fallback to flat candidate list
+                const candidates = await session.getWhitelistCandidates();
+                this._panel.webview.postMessage({
+                    command: 'updateCandidates',
+                    candidates: candidates
+                });
+            }
+        }
+    }
+
+    private async handleUpdateWhitelistCrates(enabledCrates: string[]): Promise<void> {
+        const session = this._debugAdapterFactory?.getActiveSession();
+        if (session) {
+            await session.updateWhitelistSelection(enabledCrates);
+            vscode.window.showInformationMessage(`Whitelist updated: ${enabledCrates.length} crate(s) enabled`);
+        }
+    }
+
+    private async handleInferTraceRoot(): Promise<void> {
+        const session = this._debugAdapterFactory?.getActiveSession();
+        if (!session) {
+            return;
+        }
+
+        const result = await session.inferTraceRoot();
+        if (result) {
             this._panel.webview.postMessage({
-                command: 'updateCandidates',
-                candidates: candidates
+                command: 'updateInferredTraceRoot',
+                traceRoot: result
             });
         }
     }
@@ -429,9 +473,15 @@ export class AsyncInspectorPanel {
                             <div id="treeContainer"></div>
                         </div>
                         <div class="side-panel">
-                            <div class="candidates-section">
-                                <h3>Candidates</h3>
-                                <div id="candidatesList"></div>
+                            <div class="trace-root-section">
+                                <h3>Trace Root</h3>
+                                <button id="inferTraceRootBtn" class="btn">Infer from Breakpoint</button>
+                                <div id="traceRootDisplay" class="trace-root-display">No trace root set</div>
+                                <div id="traceRootDropdown"></div>
+                            </div>
+                            <div class="whitelist-section">
+                                <h3>Whitelist</h3>
+                                <div id="whitelistContainer"></div>
                             </div>
                         </div>
                     </div>

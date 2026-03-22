@@ -21,6 +21,31 @@ export interface SnapshotData {
 }
 
 /**
+ * Grouped whitelist data structure (crate-level grouping)
+ */
+export interface GroupedWhitelist {
+    version: number;
+    crates: {
+        [crateName: string]: {
+            is_user_crate: boolean;
+            symbols: Array<{
+                name: string;
+                file: string | null;
+                line: number | null;
+            }>;
+        };
+    };
+}
+
+/**
+ * Inferred trace root from breakpoint position
+ */
+export interface InferredTraceRoot {
+    trace_root: string | null;
+    all_async_frames: string[];
+}
+
+/**
  * GDB Debug Session that communicates with GDB via VS Code debug session API
  * and executes ARD-specific commands.
  */
@@ -30,6 +55,7 @@ export class GDBDebugSession {
     private tempDir: string;
     private logPath: string;
     private whitelistPath: string;
+    private groupedWhitelistPath: string;
     private fileWatcher: vscode.FileSystemWatcher | undefined;
     private lastSnapshot: SnapshotData | undefined;
 
@@ -42,6 +68,7 @@ export class GDBDebugSession {
         this.tempDir = envTempDir || (workspaceFolder ? path.join(workspaceFolder, 'temp') : './temp');
         this.logPath = path.join(this.tempDir, 'ardb.log');
         this.whitelistPath = path.join(this.tempDir, 'poll_functions.txt');
+        this.groupedWhitelistPath = path.join(this.tempDir, 'poll_functions_grouped.json');
 
         // Ensure temp directory exists
         if (!fs.existsSync(this.tempDir)) {
@@ -179,15 +206,12 @@ export class GDBDebugSession {
     }
 
     /**
-     * Execute ardb-gen-whitelist command and open the file.
+     * Execute ardb-gen-whitelist command and return grouped whitelist.
+     * No longer opens the flat file in editor — the webview handles display.
      */
-    async genWhitelist(): Promise<void> {
+    async genWhitelist(): Promise<GroupedWhitelist | undefined> {
         await this.executeGDBCommand('ardb-gen-whitelist');
-        // Open the generated file
-        if (fs.existsSync(this.whitelistPath)) {
-            const doc = await vscode.workspace.openTextDocument(this.whitelistPath);
-            await vscode.window.showTextDocument(doc);
-        }
+        return this.getGroupedWhitelist();
     }
 
     /**
@@ -216,7 +240,7 @@ export class GDBDebugSession {
     }
 
     /**
-     * Get whitelist candidates from poll_functions.txt.
+     * Get whitelist candidates from poll_functions.txt (flat format, backward compat).
      */
     async getWhitelistCandidates(): Promise<string[]> {
         try {
@@ -239,6 +263,87 @@ export class GDBDebugSession {
         } catch (error) {
             console.error('Failed to read whitelist:', error);
             return [];
+        }
+    }
+
+    /**
+     * Get grouped whitelist (crate-level grouping).
+     * Reads from disk first (fast path), falls back to GDB command.
+     */
+    async getGroupedWhitelist(): Promise<GroupedWhitelist | undefined> {
+        // Fast path: read from disk
+        try {
+            if (fs.existsSync(this.groupedWhitelistPath)) {
+                const content = fs.readFileSync(this.groupedWhitelistPath, 'utf-8');
+                const grouped = JSON.parse(content) as GroupedWhitelist;
+                if (grouped.version !== undefined && grouped.crates) {
+                    return grouped;
+                }
+            }
+        } catch (error) {
+            console.error('Failed to read grouped whitelist from disk:', error);
+        }
+
+        // Fallback: ask GDB
+        if (!this.debugSession) {
+            return undefined;
+        }
+
+        try {
+            const output = await this.executeGDBCommand('ardb-get-whitelist-grouped');
+            if (!output) {
+                return undefined;
+            }
+            const jsonStart = output.indexOf('{');
+            const jsonEnd = output.lastIndexOf('}');
+            if (jsonStart === -1 || jsonEnd === -1 || jsonEnd <= jsonStart) {
+                return undefined;
+            }
+            const jsonStr = output.substring(jsonStart, jsonEnd + 1);
+            const grouped = JSON.parse(jsonStr) as GroupedWhitelist;
+            if (grouped.version !== undefined && grouped.crates) {
+                return grouped;
+            }
+        } catch (error) {
+            console.error('Failed to get grouped whitelist from GDB:', error);
+        }
+
+        return undefined;
+    }
+
+    /**
+     * Update whitelist selection by specifying which crates are enabled.
+     * Sends ardb-update-whitelist to GDB which rewrites poll_functions.txt and reloads.
+     */
+    async updateWhitelistSelection(enabledCrates: string[]): Promise<void> {
+        const payload = JSON.stringify({ enabled_crates: enabledCrates });
+        await this.executeGDBCommand(`ardb-update-whitelist ${payload}`);
+    }
+
+    /**
+     * Infer trace root from current breakpoint position.
+     * Walks the GDB stack to find the outermost user-crate async function.
+     */
+    async inferTraceRoot(): Promise<InferredTraceRoot | undefined> {
+        if (!this.debugSession) {
+            return undefined;
+        }
+
+        try {
+            const output = await this.executeGDBCommand('ardb-infer-trace-root');
+            if (!output) {
+                return undefined;
+            }
+            const jsonStart = output.indexOf('{');
+            const jsonEnd = output.lastIndexOf('}');
+            if (jsonStart === -1 || jsonEnd === -1 || jsonEnd <= jsonStart) {
+                return undefined;
+            }
+            const jsonStr = output.substring(jsonStart, jsonEnd + 1);
+            return JSON.parse(jsonStr) as InferredTraceRoot;
+        } catch (error) {
+            console.error('Failed to infer trace root:', error);
+            return undefined;
         }
     }
 

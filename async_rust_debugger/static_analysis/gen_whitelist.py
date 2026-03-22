@@ -1,6 +1,27 @@
 import os
 import re
+import json
 import gdb
+
+# -------------------------
+# Known framework / runtime crates (not user code)
+# -------------------------
+
+KNOWN_FRAMEWORK_CRATES = {
+    "tokio", "futures", "futures_core", "futures_util", "futures_io",
+    "futures_sink", "futures_channel", "futures_executor", "futures_macro",
+    "hyper", "hyper_util", "tower", "tower_service", "tower_layer",
+    "tonic", "axum", "axum_core", "actix", "actix_web", "actix_rt",
+    "mio", "bytes", "http", "http_body", "http_body_util",
+    "pin_project", "pin_project_lite", "pin_utils",
+    "tracing", "tracing_core", "tracing_futures",
+    "async_trait", "async_stream",
+    "core", "std", "alloc",
+}
+
+# -------------------------
+# Parsing helpers
+# -------------------------
 
 def parse_info_functions(output: str):
     functions = []
@@ -54,6 +75,69 @@ def _extract_symbol_name(signature: str) -> str | None:
         return None
     return s[:i].strip()
 
+
+def _extract_crate_name(symbol: str) -> str:
+    """
+    Extract the crate name (first path segment) from a Rust symbol.
+
+    Examples:
+      "my_app::foo::bar::{async_fn#0}" -> "my_app"
+      "tokio::runtime::task::harness::poll" -> "tokio"
+      "<my_app::MyStruct as core::future::Future>::poll" -> "my_app"
+      "core::future::poll_with_context" -> "core"
+    """
+    s = symbol.strip()
+
+    # Handle angle-bracket impl blocks: <crate::Type as Trait>::method
+    if s.startswith("<"):
+        # Extract the type path inside < ... as ... >
+        inner = s[1:]
+        # Find the first "::" to get crate name from the type path
+        idx = inner.find("::")
+        if idx > 0:
+            return inner[:idx]
+        # Fallback: find ">" and take what's before
+        idx = inner.find(">")
+        if idx > 0:
+            return inner[:idx]
+
+    # Normal path: crate::module::item
+    idx = s.find("::")
+    if idx > 0:
+        return s[:idx]
+
+    # No :: found, the whole symbol is the "crate name"
+    return s
+
+
+def _detect_user_crate(crate_name: str, file_path: str | None) -> bool:
+    """
+    Determine whether a crate is user code or framework/library code.
+
+    Heuristics (in priority order):
+    1. If file_path contains ".cargo/registry" or "rustup/toolchains" → framework
+    2. If file_path starts with "src/" or is a relative path without .cargo → user crate
+    3. If crate_name is in KNOWN_FRAMEWORK_CRATES → framework
+    4. Otherwise → user crate (assume unknown crates are user code)
+    """
+    if file_path:
+        fp = file_path.replace("\\", "/")
+        if ".cargo/registry" in fp or "rustup/toolchains" in fp:
+            return False
+        # Relative paths starting with src/ are almost certainly user code
+        if fp.startswith("src/") or fp.startswith("./src/"):
+            return True
+        # Absolute path but not in .cargo or rustup — could be user code
+        if not fp.startswith("/") and ".cargo" not in fp:
+            return True
+
+    return crate_name not in KNOWN_FRAMEWORK_CRATES
+
+
+# -------------------------
+# Flat whitelist generation (existing format)
+# -------------------------
+
 def gen_poll_whitelist(out_path: str):
     output = gdb.execute("info functions", to_string=True)
     funcs = parse_info_functions(output)
@@ -82,11 +166,105 @@ def gen_poll_whitelist(out_path: str):
 
     gdb.write(f"[ARD] wrote whitelist: {len(uniq)} symbols -> {out_path}\n")
 
+
+def _write_filtered_whitelist(grouped_data: dict, out_path: str):
+    """
+    Write a flat poll_functions.txt containing only symbols from user crates.
+    This is used as the default runtime whitelist.
+    """
+    idx = 0
+    with open(out_path, "w", encoding="utf-8") as fp:
+        for crate_name, crate_info in grouped_data["crates"].items():
+            if not crate_info["is_user_crate"]:
+                continue
+            for sym_info in crate_info["symbols"]:
+                fp.write(f"{idx} {sym_info['name']}\n")
+                idx += 1
+    return idx
+
+
+# -------------------------
+# Grouped whitelist generation (new JSON format)
+# -------------------------
+
+def gen_grouped_whitelist(out_path: str) -> dict:
+    """
+    Generate a grouped whitelist JSON file organized by crate.
+    Returns the grouped data dict.
+    """
+    output = gdb.execute("info functions", to_string=True)
+    funcs = parse_info_functions(output)
+
+    # Collect poll functions with metadata
+    poll_funcs = []
+    seen_syms = set()
+    for f in funcs:
+        rt = f.get("return_type") or ""
+        if "core::task::poll::Poll<" not in rt:
+            continue
+        sym = _extract_symbol_name(f["signature"])
+        if not sym or sym in seen_syms:
+            continue
+        seen_syms.add(sym)
+        poll_funcs.append({
+            "name": sym,
+            "file": f.get("file"),
+            "line": f.get("line"),
+        })
+
+    # Group by crate
+    crates: dict[str, dict] = {}
+    for pf in poll_funcs:
+        crate_name = _extract_crate_name(pf["name"])
+        if crate_name not in crates:
+            crates[crate_name] = {
+                "is_user_crate": None,  # determined below
+                "symbols": [],
+                "_files": set(),  # temp: collect file paths for user-crate detection
+            }
+        crates[crate_name]["symbols"].append({
+            "name": pf["name"],
+            "file": pf["file"],
+            "line": pf["line"],
+        })
+        if pf["file"]:
+            crates[crate_name]["_files"].add(pf["file"])
+
+    # Determine user crate status
+    for crate_name, crate_info in crates.items():
+        # Use the first file path from this crate's symbols for detection
+        sample_file = next(iter(crate_info["_files"]), None)
+        crate_info["is_user_crate"] = _detect_user_crate(crate_name, sample_file)
+        del crate_info["_files"]  # remove temp field
+
+    grouped_data = {
+        "version": 1,
+        "crates": crates,
+    }
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fp:
+        json.dump(grouped_data, fp, indent=2, ensure_ascii=False)
+
+    user_count = sum(1 for c in crates.values() if c["is_user_crate"])
+    total_syms = sum(len(c["symbols"]) for c in crates.values())
+    gdb.write(f"[ARD] wrote grouped whitelist: {len(crates)} crates ({user_count} user), {total_syms} symbols -> {out_path}\n")
+
+    return grouped_data
+
+
 def gen_default_whitelist():
     temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
     if not temp_dir:
         raise RuntimeError("ASYNC_RUST_DEBUGGER_TEMP_DIR is not set")
     cwd = os.getcwd()
     out_dir = os.path.join(cwd, temp_dir)
-    out_path = os.path.join(out_dir, "poll_functions.txt")
-    gen_poll_whitelist(out_path)
+
+    # 1. Generate grouped JSON (new format)
+    grouped_path = os.path.join(out_dir, "poll_functions_grouped.json")
+    grouped_data = gen_grouped_whitelist(grouped_path)
+
+    # 2. Generate flat whitelist filtered to user crates only (default runtime whitelist)
+    flat_path = os.path.join(out_dir, "poll_functions.txt")
+    count = _write_filtered_whitelist(grouped_data, flat_path)
+    gdb.write(f"[ARD] wrote default whitelist (user crates only): {count} symbols -> {flat_path}\n")

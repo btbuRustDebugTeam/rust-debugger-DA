@@ -875,6 +875,151 @@ class ARDGetSnapshotCommand(gdb.Command):
             except Exception:
                 pass  # Best-effort file write, don't fail if it doesn't work
 
+class ARDGetGroupedWhitelistCommand(gdb.Command):
+    """
+    Return the grouped whitelist JSON (crate-level grouping with user-crate detection).
+    Reads poll_functions_grouped.json from the temp directory.
+    Usage: ardb-get-whitelist-grouped
+    """
+    def __init__(self):
+        super().__init__("ardb-get-whitelist-grouped", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
+        if not temp_dir:
+            gdb.write('[ARD] ASYNC_RUST_DEBUGGER_TEMP_DIR is not set.\n')
+            return
+
+        grouped_path = os.path.join(os.getcwd(), temp_dir, "poll_functions_grouped.json")
+        if not os.path.exists(grouped_path):
+            gdb.write('[ARD] grouped whitelist not found. Run ardb-gen-whitelist first.\n')
+            return
+
+        try:
+            with open(grouped_path, "r", encoding="utf-8") as fp:
+                content = fp.read()
+            gdb.write(content + "\n")
+        except Exception as e:
+            gdb.write(f'[ARD] failed to read grouped whitelist: {e}\n')
+
+
+class ARDUpdateWhitelistCommand(gdb.Command):
+    """
+    Update the runtime whitelist based on enabled crates.
+    Reads the grouped JSON, filters to enabled crates, writes flat poll_functions.txt,
+    and reloads the whitelist.
+    Usage: ardb-update-whitelist {"enabled_crates": ["my_app", "my_lib"]}
+    """
+    def __init__(self):
+        super().__init__("ardb-update-whitelist", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        global _WHITELIST_EXACT, _WHITELIST_PREFIX, _WHITELIST_PATH
+
+        temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
+        if not temp_dir:
+            gdb.write('[ARD] ASYNC_RUST_DEBUGGER_TEMP_DIR is not set.\n')
+            return
+
+        cwd = os.getcwd()
+        grouped_path = os.path.join(cwd, temp_dir, "poll_functions_grouped.json")
+        flat_path = os.path.join(cwd, temp_dir, "poll_functions.txt")
+
+        if not os.path.exists(grouped_path):
+            gdb.write('[ARD] grouped whitelist not found. Run ardb-gen-whitelist first.\n')
+            return
+
+        # Parse the enabled crates from the argument
+        arg = arg.strip()
+        if not arg:
+            gdb.write('Usage: ardb-update-whitelist {"enabled_crates": ["crate1", ...]}\n')
+            return
+
+        try:
+            payload = json.loads(arg)
+            enabled_crates = set(payload.get("enabled_crates", []))
+        except Exception as e:
+            gdb.write(f'[ARD] failed to parse argument: {e}\n')
+            return
+
+        # Read grouped JSON
+        try:
+            with open(grouped_path, "r", encoding="utf-8") as fp:
+                grouped_data = json.load(fp)
+        except Exception as e:
+            gdb.write(f'[ARD] failed to read grouped whitelist: {e}\n')
+            return
+
+        # Write filtered flat whitelist
+        idx = 0
+        try:
+            with open(flat_path, "w", encoding="utf-8") as fp:
+                for crate_name, crate_info in grouped_data.get("crates", {}).items():
+                    if crate_name not in enabled_crates:
+                        continue
+                    for sym_info in crate_info.get("symbols", []):
+                        fp.write(f"{idx} {sym_info['name']}\n")
+                        idx += 1
+        except Exception as e:
+            gdb.write(f'[ARD] failed to write filtered whitelist: {e}\n')
+            return
+
+        # Reload the whitelist
+        try:
+            wl_exact, wl_prefix = _load_whitelist_file(flat_path)
+            _WHITELIST_EXACT = wl_exact
+            _WHITELIST_PREFIX = wl_prefix
+            _WHITELIST_PATH = flat_path
+            _invalidate_whitelist_addrs()
+        except Exception as e:
+            gdb.write(f'[ARD] failed to reload whitelist: {e}\n')
+            return
+
+        gdb.write(f'[ARD] whitelist updated: {len(enabled_crates)} crates enabled, {idx} symbols -> {flat_path}\n')
+
+
+class ARDInferTraceRootCommand(gdb.Command):
+    """
+    Infer the trace root by walking the GDB stack from the current breakpoint position.
+    Finds the outermost user-crate async function in the call stack.
+    Usage: ardb-infer-trace-root
+    """
+    def __init__(self):
+        super().__init__("ardb-infer-trace-root", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        from async_rust_debugger.static_analysis.gen_whitelist import (
+            _extract_crate_name, KNOWN_FRAMEWORK_CRATES
+        )
+
+        all_async_frames = []
+        outermost_user_async = None
+        max_frames = 100
+
+        try:
+            frame = gdb.selected_frame()
+            count = 0
+            while frame and count < max_frames:
+                fname = frame.name()
+                if fname and ("{async_fn#" in fname or "{async_block#" in fname):
+                    all_async_frames.append(fname)
+                    # Check if this is a user-crate async function
+                    crate_name = _extract_crate_name(fname)
+                    if crate_name not in KNOWN_FRAMEWORK_CRATES:
+                        outermost_user_async = fname  # keep overwriting → outermost wins
+                frame = frame.older()
+                count += 1
+        except Exception:
+            pass
+
+        result = {
+            "trace_root": outermost_user_async,
+            "all_async_frames": all_async_frames,
+        }
+
+        gdb.write(json.dumps(result) + "\n")
+
+
 # -------------------------
 # Entry
 # -------------------------
@@ -890,6 +1035,9 @@ def install():
     ARDLoadWhitelistCommand()
     ARDGenWhitelistCommand()
     ARDGetSnapshotCommand()
+    ARDGetGroupedWhitelistCommand()
+    ARDUpdateWhitelistCommand()
+    ARDInferTraceRootCommand()
 
     if not _EVENTS_INSTALLED:
         try:
@@ -902,4 +1050,4 @@ def install():
             pass
         _EVENTS_INSTALLED = True
 
-    gdb.write("[ARD] installed. Commands: ardb-gen-whitelist, ardb-load-whitelist, ardb-trace, ardb-get-snapshot, ardb-reset\n")
+    gdb.write("[ARD] installed. Commands: ardb-gen-whitelist, ardb-load-whitelist, ardb-trace, ardb-get-snapshot, ardb-reset, ardb-get-whitelist-grouped, ardb-update-whitelist, ardb-infer-trace-root\n")
