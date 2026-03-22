@@ -175,7 +175,7 @@
             header.className = 'section-label';
             header.textContent = 'Your Crates';
             container.appendChild(header);
-            userCrates.forEach(name => renderCrateGroup(container, name, grouped.crates[name], true));
+            userCrates.forEach(name => renderCrateGroup(container, name, grouped.crates[name], false));
         }
 
         // Framework crates section

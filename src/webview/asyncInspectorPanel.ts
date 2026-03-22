@@ -395,21 +395,22 @@ export class AsyncInspectorPanel {
                 }
                 current = child;
             } else {
-                // Untracked sync node (from physical stack, no CID)
+                // Untracked node (from physical stack, no CID)
+                // 保留 snapshot 中的真实类型（async/sync），不要硬编码
                 const existing = current.children.find(
                     c => c.cid === null && c.func === node.func && c.addr === node.addr
                 );
                 if (!existing) {
-                    const syncChild: TreeNode = {
-                        type: 'sync',
+                    const untrackedChild: TreeNode = {
+                        type: node.type,
                         cid: null,
                         func: node.func,
                         addr: node.addr,
-                        poll: 0,
-                        state: 'NON-ASYNC',
+                        poll: node.poll,
+                        state: node.state,
                         children: [],
                     };
-                    current.children.push(syncChild);
+                    current.children.push(untrackedChild);
                 }
             }
         }
