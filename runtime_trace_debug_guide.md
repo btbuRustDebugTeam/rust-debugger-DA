@@ -50,7 +50,7 @@ if os.environ.get("ARDB_PY_DEBUG") == "1":
 
 ### 3. 配置 VS Code 调试器
 
-确保 `.vscode/launch.json` 中包含：
+确保 ~/rust-debugger-DA/.vscode/launch.json 中包含：
 
 ```json
 {
@@ -72,7 +72,7 @@ if os.environ.get("ARDB_PY_DEBUG") == "1":
 建议打在：
 
 * 函数入口
-* 关键逻辑位置
+* 关键逻辑位置(例: _ptr_size 等)
 
 ---
 
@@ -86,11 +86,24 @@ cd ~/rust-debugger-DA
 
 ---
 
-### 2. 激活虚拟环境（需提前配置）
+### 2. 激活虚拟环境
 
 ```bash
 source .pydebug/bin/activate
 ```
+
+> 📌 说明：
+>
+> 1.创建虚拟环境通常需要执行
+>
+> ```bash
+> python3 -m venv .pydebug
+> ```
+> 2.在虚拟环境安装包
+>
+>```bash
+> pip install debugpy
+> ```
 
 ---
 
@@ -106,12 +119,12 @@ gdb --args ./testcases/embassy/examples/std/target/debug/tick
 
 > 📌 说明：
 >
-> testcases/embassy/examples/std/target/debug/tick下的 `tick` 是 Rust 项目编译生成的可执行文件：
->
+> testcases/embassy/examples/std/target/debug/tick 是 Rust 项目编译生成的可执行文件，
+>也就是这个指令下的产物：
 > ```bash
 > cargo build --bin tick
 > ```
-> 也就是这个指令下的产物
+> 
 ---
 
 ## 🐞 GDB
@@ -185,4 +198,3 @@ run
 * 命中 `runtime_trace.py` 断点
 * 可以查看变量和调用栈
 
-````
