@@ -3,7 +3,8 @@
 
 ## 📌 说明
 
-本指南用于在 VS Code + GDB 环境下调试 `runtime_trace.py`。
+本指南用于在 VS Code + GDB 环境下调试 runtime_trace.py 。
+
 以启动embassy/examples/std/src/bin/tick.rs为例
 
 
