@@ -276,9 +276,20 @@ export class GDBDebugSession extends DebugSession {
         }
 
         // Register initial hook breakpoints from launch.json
+        // launch.json uses { functionArguments, functionBody } but HookBreakpointJSONFriendly
+        // uses ObjectAsFunction { body, args[] } — convert here.
         if (config.hook_breakpoints) {
             for (const h of config.hook_breakpoints) {
-                this.breakpointGroups.updateHookBreakpoint(h);
+                const normalized: HookBreakpointJSONFriendly = {
+                    breakpoint: h.breakpoint,
+                    behavior: {
+                        body: h.behavior?.functionBody ?? h.behavior?.body ?? '',
+                        args: h.behavior?.functionArguments !== undefined
+                            ? [h.behavior.functionArguments]
+                            : (h.behavior?.args ?? []),
+                    },
+                };
+                this.breakpointGroups.updateHookBreakpoint(normalized);
             }
         }
 
@@ -875,14 +886,32 @@ export class GDBDebugSession extends DebugSession {
 
             case 'setHookBreakpoint':
                 if (this.breakpointGroups && args) {
-                    this.breakpointGroups.updateHookBreakpoint(args as HookBreakpointJSONFriendly);
+                    const normalized: HookBreakpointJSONFriendly = {
+                        breakpoint: args.breakpoint,
+                        behavior: {
+                            body: args.behavior?.functionBody ?? args.behavior?.body ?? '',
+                            args: args.behavior?.functionArguments !== undefined
+                                ? [args.behavior.functionArguments]
+                                : (args.behavior?.args ?? []),
+                        },
+                    };
+                    this.breakpointGroups.updateHookBreakpoint(normalized);
                 }
                 this.sendResponse(response);
                 break;
 
             case 'disableHookBreakpoint':
                 if (this.breakpointGroups && args) {
-                    this.breakpointGroups.disableHookBreakpoint(args as HookBreakpointJSONFriendly);
+                    const normalized: HookBreakpointJSONFriendly = {
+                        breakpoint: args.breakpoint,
+                        behavior: {
+                            body: args.behavior?.functionBody ?? args.behavior?.body ?? '',
+                            args: args.behavior?.functionArguments !== undefined
+                                ? [args.behavior.functionArguments]
+                                : (args.behavior?.args ?? []),
+                        },
+                    };
+                    this.breakpointGroups.disableHookBreakpoint(normalized);
                 }
                 this.sendResponse(response);
                 break;

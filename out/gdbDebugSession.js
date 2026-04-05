@@ -157,9 +157,20 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
             }
         }
         // Register initial hook breakpoints from launch.json
+        // launch.json uses { functionArguments, functionBody } but HookBreakpointJSONFriendly
+        // uses ObjectAsFunction { body, args[] } — convert here.
         if (config.hook_breakpoints) {
             for (const h of config.hook_breakpoints) {
-                this.breakpointGroups.updateHookBreakpoint(h);
+                const normalized = {
+                    breakpoint: h.breakpoint,
+                    behavior: {
+                        body: h.behavior?.functionBody ?? h.behavior?.body ?? '',
+                        args: h.behavior?.functionArguments !== undefined
+                            ? [h.behavior.functionArguments]
+                            : (h.behavior?.args ?? []),
+                    },
+                };
+                this.breakpointGroups.updateHookBreakpoint(normalized);
             }
         }
         // Launch QEMU in the integrated terminal, then start GDB after a short delay
@@ -648,13 +659,31 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
                 break;
             case 'setHookBreakpoint':
                 if (this.breakpointGroups && args) {
-                    this.breakpointGroups.updateHookBreakpoint(args);
+                    const normalized = {
+                        breakpoint: args.breakpoint,
+                        behavior: {
+                            body: args.behavior?.functionBody ?? args.behavior?.body ?? '',
+                            args: args.behavior?.functionArguments !== undefined
+                                ? [args.behavior.functionArguments]
+                                : (args.behavior?.args ?? []),
+                        },
+                    };
+                    this.breakpointGroups.updateHookBreakpoint(normalized);
                 }
                 this.sendResponse(response);
                 break;
             case 'disableHookBreakpoint':
                 if (this.breakpointGroups && args) {
-                    this.breakpointGroups.disableHookBreakpoint(args);
+                    const normalized = {
+                        breakpoint: args.breakpoint,
+                        behavior: {
+                            body: args.behavior?.functionBody ?? args.behavior?.body ?? '',
+                            args: args.behavior?.functionArguments !== undefined
+                                ? [args.behavior.functionArguments]
+                                : (args.behavior?.args ?? []),
+                        },
+                    };
+                    this.breakpointGroups.disableHookBreakpoint(normalized);
                 }
                 this.sendResponse(response);
                 break;
