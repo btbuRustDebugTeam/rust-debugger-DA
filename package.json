@@ -44,6 +44,97 @@
                 "description": "Environment variables"
               }
             }
+          },
+          "attach": {
+            "required": ["target", "cwd", "qemuPath", "qemuArgs"],
+            "properties": {
+              "target": {
+                "type": "string",
+                "description": "GDB remote connection string, e.g. \":1234\"",
+                "default": ":1234"
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory",
+                "default": "${workspaceFolder}"
+              },
+              "gdbpath": {
+                "type": "string",
+                "description": "Path to GDB executable (or wrapper script)",
+                "default": "gdb"
+              },
+              "debugger_args": {
+                "type": "array",
+                "description": "Extra arguments passed to GDB",
+                "default": []
+              },
+              "executable": {
+                "type": "string",
+                "description": "Path to ELF file for debug symbols (e.g. kernel binary)"
+              },
+              "autorun": {
+                "type": "array",
+                "description": "GDB commands to run after connecting",
+                "default": []
+              },
+              "stopAtConnect": {
+                "type": "boolean",
+                "description": "Whether to stop immediately after connecting to the remote target",
+                "default": false
+              },
+              "qemuPath": {
+                "type": "string",
+                "description": "Path to QEMU executable",
+                "default": "qemu-system-riscv64"
+              },
+              "qemuArgs": {
+                "type": "array",
+                "description": "Command-line arguments passed to QEMU",
+                "default": []
+              },
+              "program_counter_id": {
+                "type": "number",
+                "description": "Register ID of the program counter (32 for RISC-V)",
+                "default": 32
+              },
+              "first_breakpoint_group": {
+                "type": "string",
+                "description": "Name of the initial breakpoint group (typically \"kernel\")",
+                "default": "kernel"
+              },
+              "second_breakpoint_group": {
+                "type": "string",
+                "description": "Fallback breakpoint group name if the next group cannot be determined automatically"
+              },
+              "kernel_memory_ranges": {
+                "type": "array",
+                "description": "Kernel address ranges as [start, end) hex string pairs",
+                "default": [["0xefffffffffffffff", "0xffffffffffffffff"]]
+              },
+              "user_memory_ranges": {
+                "type": "array",
+                "description": "User address ranges as [start, end) hex string pairs",
+                "default": [["0x0000000000000000", "0xe000000000000000"]]
+              },
+              "border_breakpoints": {
+                "type": "array",
+                "description": "Border breakpoints that mark kernel↔user transitions",
+                "default": []
+              },
+              "hook_breakpoints": {
+                "type": "array",
+                "description": "Hook breakpoints with JS behavior for fetching the next process name",
+                "default": []
+              },
+              "filePathToBreakpointGroupNames": {
+                "type": "object",
+                "description": "JS function (as object with functionArguments/functionBody) mapping a file path to breakpoint group names"
+              },
+              "breakpointGroupNameToDebugFilePaths": {
+                "type": "object",
+                "description": "JS function (as object with functionArguments/functionBody) mapping a breakpoint group name to debug symbol file paths"
+              }
+            }
           }
         },
         "initialConfigurations": [
@@ -52,6 +143,20 @@
             "request": "launch",
             "name": "Launch Rust Program",
             "program": "${workspaceFolder}/target/debug/${workspaceFolderBasename}"
+          },
+          {
+            "type": "ardb",
+            "request": "attach",
+            "name": "Attach via QEMU (OS Debug)",
+            "cwd": "${workspaceFolder}",
+            "target": ":1234",
+            "qemuPath": "qemu-system-riscv64",
+            "qemuArgs": [],
+            "executable": "${workspaceFolder}/os/target/riscv64gc-unknown-none-elf/release/os",
+            "first_breakpoint_group": "kernel",
+            "program_counter_id": 32,
+            "kernel_memory_ranges": [["0xefffffffffffffff", "0xffffffffffffffff"]],
+            "user_memory_ranges": [["0x0000000000000000", "0xe000000000000000"]]
           }
         ]
       }
@@ -66,6 +171,26 @@
         "command": "ardb.traceFunction",
         "title": "Trace Function",
         "icon": "$(debug-start)"
+      },
+      {
+        "command": "ardb.setBorderBreakpointsFromLaunchJSON",
+        "title": "ARD: Set Border Breakpoints from launch.json"
+      },
+      {
+        "command": "ardb.setHookBreakpointsFromLaunchJSON",
+        "title": "ARD: Set Hook Breakpoints from launch.json"
+      },
+      {
+        "command": "ardb.setBreakpointAsBorder",
+        "title": "ARD: Set This Breakpoint as Border"
+      },
+      {
+        "command": "ardb.disableBorderOfThisBreakpointGroup",
+        "title": "ARD: Disable Border of This Breakpoint Group"
+      },
+      {
+        "command": "ardb.removeAllCliBreakpoints",
+        "title": "ARD: Remove All Breakpoints"
       }
     ],
     "menus": {
