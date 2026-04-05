@@ -23,7 +23,11 @@
     function setupEventListeners() {
         document.getElementById('resetBtn').addEventListener('click', () => {
             traceRoots = [];
+            groupedWhitelist = null;
+            enabledCrates = new Set();
+            candidates = [];
             renderTraceRootSection();
+            renderGroupedWhitelist(null);
             vscode.postMessage({ command: 'reset' });
         });
 

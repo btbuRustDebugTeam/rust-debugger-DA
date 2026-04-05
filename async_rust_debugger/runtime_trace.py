@@ -973,10 +973,22 @@ class ARDGetSnapshotCommand(gdb.Command):
             })
             
         # 2. Extract the physical stack tail (frames above the top traced function).
-        #    For async function frames, attempt to assign CIDs and read state,
-        #    so they appear as proper tracked nodes in the tree.
+        #    Only do this if the shadow stack is non-empty; if nothing has been
+        #    traced yet, we should not fabricate nodes from physical frames.
         phys_tail = []
         shadow_cids = set(stack)  # CIDs already on the shadow stack
+        if not stack:
+            json_output = json.dumps(snapshot) + "\n"
+            gdb.write(json_output)
+            temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
+            if temp_dir:
+                snapshot_path = os.path.join(os.getcwd(), temp_dir, "ardb_snapshot.json")
+                try:
+                    with open(snapshot_path, "w", encoding="utf-8") as f:
+                        f.write(json_output)
+                except Exception:
+                    pass
+            return
         try:
             saved_frame = gdb.selected_frame()
             frame = saved_frame
