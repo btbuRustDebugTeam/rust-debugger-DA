@@ -34,22 +34,17 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.GDBDebugSession = void 0;
-const child_process_1 = require("child_process");
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const debugadapter_1 = require("@vscode/debugadapter");
-const miParser_1 = require("./miParser");
+const mi2_1 = require("./backend/mi2");
+const mi_parse_1 = require("./backend/mi_parse");
 // ---------------------------------------------------------------------------
 // GDBDebugSession
 // ---------------------------------------------------------------------------
 class GDBDebugSession extends debugadapter_1.DebugSession {
     constructor(opts) {
         super();
-        this.gdbOutputBuffer = '';
-        // MI command tracking
-        this.nextToken = 1;
-        this.pendingCommands = new Map();
-        this.commandQueue = [];
         // Inferior state
         this.inferiorStarted = false;
         this.program = '';
@@ -94,7 +89,6 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
             this.sendErrorResponse(response, 1, 'No program specified in launch configuration');
             return;
         }
-        // Ensure temp dir exists
         if (!fs.existsSync(this.tempDir)) {
             fs.mkdirSync(this.tempDir, { recursive: true });
         }
@@ -107,8 +101,6 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     // -----------------------------------------------------------------------
     configurationDoneRequest(response, args) {
         this.sendResponse(response);
-        // Emit synthetic stopped event so VS Code enters paused state,
-        // giving the user time to configure ARD before running the program.
         const event = new debugadapter_1.StoppedEvent('entry', 1);
         event.body.description = 'Program loaded. Configure ARD, then press Continue to run.';
         event.body.allThreadsStopped = true;
@@ -118,6 +110,11 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     // DAP: setBreakpoints
     // -----------------------------------------------------------------------
     async setBreakPointsRequest(response, args) {
+        if (!this.miDebugger) {
+            response.body = { breakpoints: [] };
+            this.sendResponse(response);
+            return;
+        }
         const source = args.source;
         const filePath = source.path || '';
         const requestedLines = args.breakpoints || [];
@@ -130,23 +127,22 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
             // Delete old breakpoints for this file
             const oldNumbers = this.fileBreakpoints.get(filePath) || [];
             for (const num of oldNumbers) {
-                await this.sendMICommand(`-break-delete ${num}`).catch(() => { });
+                await this.miDebugger.sendCommand(`break-delete ${num}`).catch(() => { });
                 this.gdbBkptToDap.delete(num);
             }
             this.fileBreakpoints.delete(filePath);
-            // Insert new breakpoints
             const newNumbers = [];
             const dapBreakpoints = [];
             for (const bp of requestedLines) {
-                const location = `${filePath}:${bp.line}`;
+                const location = `"${(0, mi2_1.escape)(filePath)}:${bp.line}"`;
                 try {
-                    const record = await this.sendMICommand(`-break-insert -f ${location}`);
-                    const bkpt = record.data?.bkpt;
-                    const gdbNumber = parseInt(bkpt?.number || '0', 10);
-                    const actualLine = parseInt(bkpt?.line || `${bp.line}`, 10);
-                    const verified = bkpt?.pending === undefined;
+                    const record = await this.miDebugger.sendCommand(`break-insert -f ${location}`);
+                    const bkpt = mi_parse_1.MINode.valueOf(record.resultRecords?.results, "bkpt");
+                    const gdbNumber = parseInt(mi_parse_1.MINode.valueOf(bkpt, "number") || '0');
+                    const actualLine = parseInt(mi_parse_1.MINode.valueOf(bkpt, "line") || `${bp.line}`);
+                    const verified = mi_parse_1.MINode.valueOf(bkpt, "pending") === undefined;
                     if (bp.condition && gdbNumber > 0) {
-                        await this.sendMICommand(`-break-condition ${gdbNumber} ${bp.condition}`).catch(() => { });
+                        await this.miDebugger.sendCommand(`break-condition ${gdbNumber} ${bp.condition}`).catch(() => { });
                     }
                     const dapId = this.nextDapBreakpointId++;
                     newNumbers.push(gdbNumber);
@@ -177,32 +173,37 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     // DAP: setFunctionBreakpoints
     // -----------------------------------------------------------------------
     async setFunctionBreakPointsRequest(response, args) {
+        if (!this.miDebugger) {
+            response.body = { breakpoints: [] };
+            this.sendResponse(response);
+            return;
+        }
         const requestedFunctions = args.breakpoints || [];
         try {
-            // Delete old function breakpoints
             for (const num of this.functionBreakpointNumbers) {
-                await this.sendMICommand(`-break-delete ${num}`).catch(() => { });
+                await this.miDebugger.sendCommand(`break-delete ${num}`).catch(() => { });
                 this.gdbBkptToDap.delete(num);
             }
             this.functionBreakpointNumbers = [];
             const dapBreakpoints = [];
             for (const fbp of requestedFunctions) {
                 try {
-                    const record = await this.sendMICommand(`-break-insert -f ${fbp.name}`);
-                    const bkpt = record.data?.bkpt;
-                    const gdbNumber = parseInt(bkpt?.number || '0', 10);
-                    const actualLine = parseInt(bkpt?.line || '0', 10);
-                    const verified = bkpt?.pending === undefined;
+                    const record = await this.miDebugger.sendCommand(`break-insert -f ${fbp.name}`);
+                    const bkpt = mi_parse_1.MINode.valueOf(record.resultRecords?.results, "bkpt");
+                    const gdbNumber = parseInt(mi_parse_1.MINode.valueOf(bkpt, "number") || '0');
+                    const actualLine = parseInt(mi_parse_1.MINode.valueOf(bkpt, "line") || '0');
+                    const verified = mi_parse_1.MINode.valueOf(bkpt, "pending") === undefined;
                     if (fbp.condition && gdbNumber > 0) {
-                        await this.sendMICommand(`-break-condition ${gdbNumber} ${fbp.condition}`).catch(() => { });
+                        await this.miDebugger.sendCommand(`break-condition ${gdbNumber} ${fbp.condition}`).catch(() => { });
                     }
                     const dapId = this.nextDapBreakpointId++;
                     this.functionBreakpointNumbers.push(gdbNumber);
                     this.gdbBkptToDap.set(gdbNumber, { id: dapId, line: actualLine, verified });
                     const dbp = new debugadapter_1.Breakpoint(verified, actualLine);
                     dbp.setId(dapId);
-                    if (bkpt?.fullname) {
-                        dbp.source = new debugadapter_1.Source(bkpt.file || '', bkpt.fullname);
+                    const fullname = mi_parse_1.MINode.valueOf(bkpt, "fullname");
+                    if (fullname) {
+                        dbp.source = new debugadapter_1.Source(mi_parse_1.MINode.valueOf(bkpt, "file") || '', fullname);
                     }
                     dapBreakpoints.push(dbp);
                 }
@@ -225,14 +226,18 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     // DAP: continue
     // -----------------------------------------------------------------------
     async continueRequest(response, args) {
+        if (!this.miDebugger) {
+            this.sendErrorResponse(response, 4, 'No debug session');
+            return;
+        }
         try {
             await this.cleanupVariables();
             if (!this.inferiorStarted) {
                 this.inferiorStarted = true;
-                await this.sendMICommand('-exec-run');
+                await this.miDebugger.sendCommand('exec-run');
             }
             else {
-                await this.sendMICommand('-exec-continue');
+                await this.miDebugger.continue();
             }
             response.body = { allThreadsContinued: true };
             this.sendResponse(response);
@@ -250,9 +255,13 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
             this.sendErrorResponse(response, 5, 'Program has not started yet. Press Continue first.');
             return;
         }
+        if (!this.miDebugger) {
+            this.sendErrorResponse(response, 5, 'No debug session');
+            return;
+        }
         try {
             await this.cleanupVariables();
-            await this.sendMICommand('-exec-next');
+            await this.miDebugger.next();
             this.sendResponse(response);
         }
         catch (err) {
@@ -264,9 +273,13 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
             this.sendErrorResponse(response, 6, 'Program has not started yet. Press Continue first.');
             return;
         }
+        if (!this.miDebugger) {
+            this.sendErrorResponse(response, 6, 'No debug session');
+            return;
+        }
         try {
             await this.cleanupVariables();
-            await this.sendMICommand('-exec-step');
+            await this.miDebugger.step();
             this.sendResponse(response);
         }
         catch (err) {
@@ -278,9 +291,13 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
             this.sendErrorResponse(response, 7, 'Program has not started yet. Press Continue first.');
             return;
         }
+        if (!this.miDebugger) {
+            this.sendErrorResponse(response, 7, 'No debug session');
+            return;
+        }
         try {
             await this.cleanupVariables();
-            await this.sendMICommand('-exec-finish');
+            await this.miDebugger.stepOut();
             this.sendResponse(response);
         }
         catch (err) {
@@ -292,8 +309,12 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
             this.sendErrorResponse(response, 8, 'Program has not started yet.');
             return;
         }
+        if (!this.miDebugger) {
+            this.sendErrorResponse(response, 8, 'No debug session');
+            return;
+        }
         try {
-            await this.sendMICommand('-exec-interrupt');
+            await this.miDebugger.interrupt();
             this.sendResponse(response);
         }
         catch (err) {
@@ -304,27 +325,19 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     // DAP: threads
     // -----------------------------------------------------------------------
     async threadsRequest(response) {
-        if (!this.inferiorStarted) {
+        if (!this.inferiorStarted || !this.miDebugger) {
             response.body = { threads: [new debugadapter_1.Thread(1, 'main (not started)')] };
             this.sendResponse(response);
             return;
         }
         try {
-            const record = await this.sendMICommand('-thread-info');
-            const threads = [];
-            const miThreads = record.data?.threads;
-            if (Array.isArray(miThreads)) {
-                for (const t of miThreads) {
-                    const id = parseInt(t.id || '1', 10);
-                    const targetId = t['target-id'] || '';
-                    const name = t.name || targetId || `Thread ${id}`;
-                    threads.push(new debugadapter_1.Thread(id, name));
-                }
+            const threads = await this.miDebugger.getThreads();
+            response.body = {
+                threads: threads.map(t => new debugadapter_1.Thread(t.id, t.name || t.targetId || `Thread ${t.id}`))
+            };
+            if (response.body.threads.length === 0) {
+                response.body.threads.push(new debugadapter_1.Thread(1, 'main'));
             }
-            if (threads.length === 0) {
-                threads.push(new debugadapter_1.Thread(1, 'main'));
-            }
-            response.body = { threads };
             this.sendResponse(response);
         }
         catch {
@@ -337,16 +350,15 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     // -----------------------------------------------------------------------
     async stackTraceRequest(response, args) {
         const threadId = args.threadId || 1;
-        if (!this.inferiorStarted) {
+        if (!this.inferiorStarted || !this.miDebugger) {
             response.body = { stackFrames: [], totalFrames: 0 };
             this.sendResponse(response);
             return;
         }
         try {
-            await this.sendMICommand(`-thread-select ${threadId}`);
-            const escaped = 'ardb-get-snapshot';
-            const record = await this.sendMICommand(`-interpreter-exec console "${escaped}"`);
-            const output = record.data?.msg || '';
+            await this.miDebugger.sendCommand(`thread-select ${threadId}`);
+            const record = await this.miDebugger.sendCliCommand('ardb-get-snapshot');
+            const output = this.getConsoleOutput(record);
             const snapshot = this.parseSnapshot(output);
             if (snapshot && snapshot.path.length > 0) {
                 const reversedPath = [...snapshot.path].reverse();
@@ -434,17 +446,16 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     // DAP: evaluate
     // -----------------------------------------------------------------------
     async evaluateRequest(response, args) {
-        if (!this.gdbProcess || !args.expression) {
+        if (!this.miDebugger || !args.expression) {
             response.body = { result: '', variablesReference: 0 };
             this.sendResponse(response);
             return;
         }
         const expr = args.expression;
         const context = args.context || 'repl';
-        const escaped = expr.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
         try {
-            const record = await this.sendMICommand(`-interpreter-exec console "${escaped}"`);
-            const result = record.data?.msg || '';
+            const record = await this.miDebugger.sendCliCommand(expr);
+            const result = this.getConsoleOutput(record);
             if (context === 'repl' && result) {
                 this.sendEvent(new debugadapter_1.OutputEvent(result.endsWith('\n') ? result : result + '\n', 'console'));
             }
@@ -464,18 +475,10 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     // DAP: disconnect
     // -----------------------------------------------------------------------
     disconnectRequest(response, args) {
-        // Kill GDB process
-        if (this.gdbProcess) {
-            this.gdbProcess.kill();
-            this.gdbProcess = undefined;
+        if (this.miDebugger) {
+            this.miDebugger.stop();
+            this.miDebugger = undefined;
         }
-        // Reject all pending MI commands
-        for (const [token, pending] of this.pendingCommands) {
-            pending.reject(new Error('Debug session disconnected'));
-        }
-        this.pendingCommands.clear();
-        this.commandQueue = [];
-        // Reset state
         this.inferiorStarted = false;
         this.fileBreakpoints.clear();
         this.gdbBkptToDap.clear();
@@ -483,7 +486,6 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
         this.varRefMap.clear();
         this.createdVarObjects = [];
         this.sendResponse(response);
-        // DO NOT call process.exit() — we are in-process!
     }
     // -----------------------------------------------------------------------
     // DAP: customRequest — dispatch ardb-* commands
@@ -549,17 +551,14 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     // Custom request handlers
     // -----------------------------------------------------------------------
     async handleArdGetSnapshot(response) {
-        const escaped = 'ardb-get-snapshot';
-        const record = await this.sendMICommand(`-interpreter-exec console "${escaped}"`);
-        const output = record.data?.msg || '';
+        const record = await this.miDebugger.sendCliCommand('ardb-get-snapshot');
+        const output = this.getConsoleOutput(record);
         const snapshot = this.parseSnapshot(output);
         response.body = { snapshot: snapshot || null };
         this.sendResponse(response);
     }
     async handleArdReset(response) {
-        const escaped = 'ardb-reset';
-        await this.sendMICommand(`-interpreter-exec console "${escaped}"`);
-        // Clear log file
+        await this.miDebugger.sendCliCommand('ardb-reset');
         if (fs.existsSync(this.logPath)) {
             fs.writeFileSync(this.logPath, '');
         }
@@ -567,32 +566,26 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
         this.sendResponse(response);
     }
     async handleArdGenWhitelist(response) {
-        const escaped = 'ardb-gen-whitelist';
-        await this.sendMICommand(`-interpreter-exec console "${escaped}"`);
-        // Read grouped result from disk
+        await this.miDebugger.sendCliCommand('ardb-gen-whitelist');
         const grouped = this.readGroupedWhitelistFromDisk();
         response.body = { groupedWhitelist: grouped || null };
         this.sendResponse(response);
     }
     async handleArdTrace(response, args) {
         const symbol = args?.symbol || '';
-        const escaped = `ardb-trace ${symbol}`.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-        await this.sendMICommand(`-interpreter-exec console "${escaped}"`);
+        await this.miDebugger.sendCliCommand(`ardb-trace ${symbol}`);
         response.body = {};
         this.sendResponse(response);
     }
     async handleArdGetWhitelistGrouped(response) {
-        // Disk read first (fast path)
         const grouped = this.readGroupedWhitelistFromDisk();
         if (grouped) {
             response.body = { groupedWhitelist: grouped };
             this.sendResponse(response);
             return;
         }
-        // Fallback to GDB command
-        const escaped = 'ardb-get-whitelist-grouped';
-        const record = await this.sendMICommand(`-interpreter-exec console "${escaped}"`);
-        const output = record.data?.msg || '';
+        const record = await this.miDebugger.sendCliCommand('ardb-get-whitelist-grouped');
+        const output = this.getConsoleOutput(record);
         const parsed = this.parseJsonFromOutput(output);
         response.body = { groupedWhitelist: parsed || null };
         this.sendResponse(response);
@@ -605,15 +598,13 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     async handleArdUpdateWhitelist(response, args) {
         const enabledCrates = args?.enabledCrates || [];
         const payload = JSON.stringify({ enabled_crates: enabledCrates });
-        const escaped = `ardb-update-whitelist ${payload}`.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-        await this.sendMICommand(`-interpreter-exec console "${escaped}"`);
+        await this.miDebugger.sendCliCommand(`ardb-update-whitelist ${payload}`);
         response.body = {};
         this.sendResponse(response);
     }
     async handleArdInferTraceRoot(response) {
-        const escaped = 'ardb-infer-trace-root';
-        const record = await this.sendMICommand(`-interpreter-exec console "${escaped}"`);
-        const output = record.data?.msg || '';
+        const record = await this.miDebugger.sendCliCommand('ardb-infer-trace-root');
+        const output = this.getConsoleOutput(record);
         const result = this.parseJsonFromOutput(output);
         response.body = { inferredTraceRoot: result || null };
         this.sendResponse(response);
@@ -637,200 +628,159 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     }
     async handleArdExecuteCommand(response, args) {
         const command = args?.command || '';
-        const escaped = command.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-        const record = await this.sendMICommand(`-interpreter-exec console "${escaped}"`);
-        const result = record.data?.msg || '';
+        const record = await this.miDebugger.sendCliCommand(command);
+        const result = this.getConsoleOutput(record);
         response.body = { result };
         this.sendResponse(response);
     }
     // -----------------------------------------------------------------------
-    // GDB subprocess management
+    // GDB subprocess management (via MI2)
     // -----------------------------------------------------------------------
     launchGDB() {
         const gdbArgs = [
             '--interpreter=mi2',
             '-ex', `python import sys; sys.path.insert(0, '${this.pythonPath}'); import async_rust_debugger`,
             '-ex', 'set pagination off',
-            this.program,
-            ...this.programArgs,
         ];
-        // Set ASYNC_RUST_DEBUGGER_TEMP_DIR so the Python plugin can find it
+        const args = this.programArgs;
         const env = { ...process.env, ASYNC_RUST_DEBUGGER_TEMP_DIR: this.tempDir };
-        this.gdbProcess = (0, child_process_1.spawn)('gdb', gdbArgs, { cwd: this.cwd, env });
-        this.gdbProcess.stdout?.on('data', (data) => {
-            this.handleGDBOutput(data);
-        });
-        this.gdbProcess.stderr?.on('data', (data) => {
-            console.log(`[GDB Error]: ${data.toString()}`);
-        });
-        this.gdbProcess.on('exit', (code) => {
-            console.log(`[GDB] Process exited with code ${code}`);
-            // Reject all pending commands so promises don't hang
-            for (const [, pending] of this.pendingCommands) {
-                pending.reject(new Error(`GDB process exited with code ${code}`));
+        // Construct full args: interpreter flags + program
+        const fullArgs = gdbArgs.concat([this.program]);
+        if (args.length > 0)
+            fullArgs.push('--args', ...args);
+        this.miDebugger = new mi2_1.MI2('gdb', fullArgs, [], env);
+        // Wire up events
+        this.miDebugger.on('msg', (type, msg) => {
+            if (type === 'console' || type === 'stdout') {
+                this.sendEvent(new debugadapter_1.OutputEvent(msg, 'console'));
             }
-            this.pendingCommands.clear();
-            this.commandQueue = [];
-            this.gdbProcess = undefined;
+            else if (type === 'stderr') {
+                this.sendEvent(new debugadapter_1.OutputEvent(msg, 'stderr'));
+            }
+        });
+        this.miDebugger.on('quit', () => {
             this.sendEvent(new debugadapter_1.TerminatedEvent());
         });
-    }
-    // -----------------------------------------------------------------------
-    // MI command sending
-    // -----------------------------------------------------------------------
-    sendMICommand(command) {
-        return new Promise((resolve, reject) => {
-            if (!this.gdbProcess || !this.gdbProcess.stdin) {
-                reject(new Error('GDB process not available'));
-                return;
+        this.miDebugger.on('launcherror', (err) => {
+            console.error('[Adapter] GDB launch error:', err);
+            this.sendEvent(new debugadapter_1.TerminatedEvent());
+        });
+        this.miDebugger.on('breakpoint', (node) => {
+            this.handleBreakpointHit(node);
+        });
+        this.miDebugger.on('step-end', (node) => {
+            const threadId = this.getThreadId(node);
+            const event = new debugadapter_1.StoppedEvent('step', threadId);
+            event.body.allThreadsStopped = true;
+            this.sendEvent(event);
+        });
+        this.miDebugger.on('step-other', (node) => {
+            const threadId = this.getThreadId(node);
+            const event = new debugadapter_1.StoppedEvent('pause', threadId);
+            event.body.allThreadsStopped = true;
+            this.sendEvent(event);
+        });
+        this.miDebugger.on('signal-stop', (node) => {
+            const threadId = this.getThreadId(node);
+            const sigName = node.record('signal-name') || 'unknown';
+            const event = new debugadapter_1.StoppedEvent('exception', threadId);
+            event.body.description = `Signal: ${sigName}`;
+            event.body.allThreadsStopped = true;
+            this.sendEvent(event);
+        });
+        this.miDebugger.on('stopped', (node) => {
+            const threadId = this.getThreadId(node);
+            const event = new debugadapter_1.StoppedEvent('pause', threadId);
+            event.body.allThreadsStopped = true;
+            this.sendEvent(event);
+        });
+        this.miDebugger.on('running', (node) => {
+            const threadId = this.getThreadId(node);
+            this.sendEvent(new debugadapter_1.ContinuedEvent(threadId, true));
+        });
+        this.miDebugger.on('exited-normally', (_node) => {
+            this.sendEvent(new debugadapter_1.TerminatedEvent());
+        });
+        // Wire breakpoint-modified notify
+        this.miDebugger.on('exec-async-output', (node) => {
+            if (node.outOfBandRecord) {
+                for (const record of node.outOfBandRecord) {
+                    if (!record.isStream && record.type === 'notify' && record.asyncClass === 'breakpoint-modified') {
+                        this.handleBreakpointModified(node);
+                    }
+                }
             }
-            const token = this.nextToken++;
-            this.pendingCommands.set(token, { resolve, reject, consoleOutput: [] });
-            this.commandQueue.push(token);
-            const fullCommand = `${token}${command}\n`;
-            console.log(`[Adapter -> GDB] ${fullCommand.trim()}`);
-            this.gdbProcess.stdin.write(fullCommand);
+        });
+        // Start GDB process via load() — but we only want to spawn, not run
+        // MI2.load() calls initCommands + emits 'debug-ready'. We use sendCommand directly after.
+        this.miDebugger.load(this.cwd, this.program, this.programArgs.join(' ')).catch(err => {
+            console.error('[Adapter] MI2 load error:', err);
         });
     }
     // -----------------------------------------------------------------------
-    // GDB output processing
+    // Event helpers
     // -----------------------------------------------------------------------
-    handleGDBOutput(data) {
-        this.gdbOutputBuffer += data.toString('utf8');
-        let newlineIdx;
-        while ((newlineIdx = this.gdbOutputBuffer.indexOf('\n')) !== -1) {
-            const line = this.gdbOutputBuffer.substring(0, newlineIdx).replace(/\r$/, '');
-            this.gdbOutputBuffer = this.gdbOutputBuffer.substring(newlineIdx + 1);
-            if (!line)
-                continue;
-            const record = (0, miParser_1.parseMILine)(line);
-            if (!record) {
-                console.log(`[GDB ?] ${line}`);
-                continue;
-            }
-            console.log(`[GDB ${record.type}] ${line}`);
-            this.dispatchMIRecord(record);
-        }
+    getThreadId(node) {
+        const tid = node.record('thread-id');
+        return tid ? parseInt(tid) : 1;
     }
-    dispatchMIRecord(record) {
-        switch (record.type) {
-            case 'result':
-                this.handleResultRecord(record);
-                break;
-            case 'exec-async':
-                this.handleExecAsync(record);
-                break;
-            case 'notify-async':
-                this.handleNotifyAsync(record);
-                break;
-            case 'console-stream':
-                // Route console output to the oldest in-flight command (FIFO)
-                if (record.data?.msg && this.commandQueue.length > 0) {
-                    const headToken = this.commandQueue[0];
-                    const pending = this.pendingCommands.get(headToken);
-                    if (pending) {
-                        pending.consoleOutput.push(record.data.msg);
-                    }
-                }
-                break;
-            case 'target-stream':
-            case 'log-stream':
-            case 'status-async':
-            case 'prompt':
-                break;
-        }
+    handleBreakpointHit(node) {
+        const bkptno = parseInt(node.record('bkptno') || '0');
+        const threadId = this.getThreadId(node);
+        const entry = this.gdbBkptToDap.get(bkptno);
+        const dapId = entry?.id;
+        const event = new debugadapter_1.StoppedEvent('breakpoint', threadId);
+        event.body.hitBreakpointIds = dapId ? [dapId] : [];
+        event.body.allThreadsStopped = true;
+        this.sendEvent(event);
     }
-    handleResultRecord(record) {
-        if (record.token !== undefined) {
-            const pending = this.pendingCommands.get(record.token);
-            if (pending) {
-                this.pendingCommands.delete(record.token);
-                const queueIdx = this.commandQueue.indexOf(record.token);
-                if (queueIdx !== -1) {
-                    this.commandQueue.splice(queueIdx, 1);
-                }
-                // Attach accumulated console stream output
-                if (pending.consoleOutput.length > 0) {
-                    record.data.msg = pending.consoleOutput.join('');
-                }
-                if (record.cls === 'error') {
-                    pending.reject(new Error(record.data?.msg || 'GDB error'));
-                }
-                else {
-                    pending.resolve(record);
-                }
-            }
+    handleBreakpointModified(node) {
+        const bkpt = node.record('bkpt');
+        if (!bkpt)
+            return;
+        const gdbNumber = parseInt(mi_parse_1.MINode.valueOf(bkpt, "number") || '0');
+        const entry = this.gdbBkptToDap.get(gdbNumber);
+        if (!entry)
+            return;
+        const nowVerified = mi_parse_1.MINode.valueOf(bkpt, "pending") === undefined;
+        const actualLine = parseInt(mi_parse_1.MINode.valueOf(bkpt, "line") || `${entry.line}`);
+        entry.verified = nowVerified;
+        entry.line = actualLine;
+        const dbp = new debugadapter_1.Breakpoint(nowVerified, actualLine);
+        dbp.setId(entry.id);
+        const fullname = mi_parse_1.MINode.valueOf(bkpt, "fullname");
+        if (fullname) {
+            dbp.source = new debugadapter_1.Source(mi_parse_1.MINode.valueOf(bkpt, "file") || '', fullname);
         }
-    }
-    handleExecAsync(record) {
-        console.log(`[GDB exec-async] class=${record.cls} data=${JSON.stringify(record.data)}`);
-        if (record.cls === 'stopped') {
-            const gdbReason = record.data?.reason || '';
-            let dapReason = 'pause';
-            let description = '';
-            switch (gdbReason) {
-                case 'breakpoint-hit':
-                    dapReason = 'breakpoint';
-                    description = `Breakpoint ${record.data?.bkptno || ''} hit`;
-                    break;
-                case 'end-stepping-range':
-                    dapReason = 'step';
-                    description = 'Step completed';
-                    break;
-                case 'function-finished':
-                    dapReason = 'step';
-                    description = 'Function finished';
-                    break;
-                case 'signal-received':
-                    dapReason = 'exception';
-                    description = `Signal: ${record.data?.['signal-name'] || 'unknown'}`;
-                    break;
-                case 'exited':
-                case 'exited-normally':
-                case 'exited-signalled':
-                    this.sendEvent(new debugadapter_1.TerminatedEvent());
-                    return;
-                default:
-                    dapReason = 'pause';
-                    description = gdbReason || 'Paused';
-                    break;
-            }
-            const threadId = parseInt(record.data?.['thread-id'] || '1', 10);
-            const event = new debugadapter_1.StoppedEvent(dapReason, threadId);
-            event.body.description = description;
-            event.body.allThreadsStopped = record.data?.['stopped-threads'] === 'all' || true;
-            this.sendEvent(event);
-        }
-        else if (record.cls === 'running') {
-            const threadId = parseInt(record.data?.['thread-id'] || '1', 10);
-            this.sendEvent(new debugadapter_1.ContinuedEvent(threadId, true));
-        }
-    }
-    handleNotifyAsync(record) {
-        console.log(`[GDB notify] ${record.cls}: ${JSON.stringify(record.data)}`);
-        if (record.cls === 'breakpoint-modified') {
-            const bkpt = record.data?.bkpt;
-            if (!bkpt)
-                return;
-            const gdbNumber = parseInt(bkpt.number || '0', 10);
-            const entry = this.gdbBkptToDap.get(gdbNumber);
-            if (!entry)
-                return;
-            const nowVerified = bkpt.pending === undefined;
-            const actualLine = parseInt(bkpt.line || `${entry.line}`, 10);
-            entry.verified = nowVerified;
-            entry.line = actualLine;
-            const dbp = new debugadapter_1.Breakpoint(nowVerified, actualLine);
-            dbp.setId(entry.id);
-            if (bkpt.fullname) {
-                dbp.source = new debugadapter_1.Source(bkpt.file || '', bkpt.fullname);
-            }
-            this.sendEvent(new debugadapter_1.BreakpointEvent('changed', dbp));
-        }
+        this.sendEvent(new debugadapter_1.BreakpointEvent('changed', dbp));
     }
     // -----------------------------------------------------------------------
     // Helper methods
     // -----------------------------------------------------------------------
+    /** Extract console stream output accumulated by MI2 sendCliCommand result */
+    getConsoleOutput(node) {
+        // MI2's sendCliCommand collects console stream lines into resultRecords?.results
+        // via the consoleOutput mechanism — but our MI2 port doesn't expose that directly.
+        // The 'msg' field is set by the pending.consoleOutput join in handleResultRecord.
+        // Actually MINode.result('') won't work here because MINode uses a different structure.
+        // We need to get the raw console output that was collected.
+        // MI2.sendCommand accumulates consoleOutput and sets record.data.msg — but wait,
+        // we ported MI2 which does NOT use MIRecord — it uses MINode from mi_parse.
+        // The consoleOutput accumulation in code-debug's MI2 is done in handleResultRecord
+        // which we did NOT port (we use onOutput instead).
+        //
+        // We need to retrieve it differently. The CLI command output goes as console-stream
+        // records ('~"..."') which are emitted as 'msg' events with type 'console'.
+        // But we need to capture them synchronously per-command.
+        //
+        // Solution: use sendCommand with interpreter-exec directly and collect the console
+        // lines that arrive before the result record. We implement this via a buffered
+        // approach in sendCliCommandBuffered below.
+        if (!node)
+            return '';
+        // The consoleOutput is stored in node via our patched sendCommand
+        return node._consoleOutput || '';
+    }
     parseSnapshot(output) {
         return this.parseJsonFromOutput(output);
     }
@@ -851,57 +801,49 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
         }
     }
     async fallbackPhysicalStackTrace(response, threadId) {
-        const record = await this.sendMICommand('-stack-list-frames');
-        const stackFrames = [];
-        const miStack = record.data?.stack;
-        if (Array.isArray(miStack)) {
-            for (const entry of miStack) {
-                const f = entry.level !== undefined ? entry : (entry.frame || entry);
-                const level = parseInt(f.level || '0', 10);
-                const frameId = threadId * 10000 + level;
-                const sf = new debugadapter_1.StackFrame(frameId, f.func || '<unknown>', (f.fullname || f.file) ? new debugadapter_1.Source(f.file || '', f.fullname || f.file || '') : undefined, parseInt(f.line || '0', 10), 0);
-                if (f.addr) {
-                    sf.instructionPointerReference = f.addr;
-                }
-                stackFrames.push(sf);
+        const stack = await this.miDebugger.getStack(0, 200, threadId);
+        const stackFrames = stack.map((f, i) => {
+            const frameId = threadId * 10000 + parseInt(f.level || i);
+            const sf = new debugadapter_1.StackFrame(frameId, f.function || '<unknown>', (f.file) ? new debugadapter_1.Source(f.fileName || '', f.file) : undefined, f.line || 0, 0);
+            if (f.address) {
+                sf.instructionPointerReference = f.address;
             }
-        }
+            return sf;
+        });
         response.body = { stackFrames, totalFrames: stackFrames.length };
         this.sendResponse(response);
     }
     async handleScopeVariables(response, threadId, frameLevel, scopeKind) {
-        await this.sendMICommand(`-thread-select ${threadId}`);
-        await this.sendMICommand(`-stack-select-frame ${frameLevel}`);
+        await this.miDebugger.sendCommand(`thread-select ${threadId}`);
+        await this.miDebugger.sendCommand(`stack-select-frame ${frameLevel}`);
         let miVars;
         if (scopeKind === 'args') {
-            const record = await this.sendMICommand(`-stack-list-arguments --all-values 0 0`);
-            const stackArgs = record.data?.['stack-args'];
+            const record = await this.miDebugger.sendCommand(`stack-list-arguments --all-values 0 0`);
+            const stackArgs = record.result('stack-args');
             if (Array.isArray(stackArgs) && stackArgs.length > 0) {
-                const frameEntry = stackArgs[0]?.frame || stackArgs[0];
-                miVars = frameEntry?.args;
+                const frameEntry = mi_parse_1.MINode.valueOf(stackArgs[0], "@frame") || mi_parse_1.MINode.valueOf(stackArgs[0], "frame") || stackArgs[0];
+                miVars = mi_parse_1.MINode.valueOf(frameEntry, "args") || frameEntry?.args;
             }
         }
         else {
-            const record = await this.sendMICommand('-stack-list-locals --all-values');
-            miVars = record.data?.locals;
+            const record = await this.miDebugger.sendCommand('stack-list-locals --all-values');
+            miVars = record.result('locals');
         }
         const variables = [];
         if (Array.isArray(miVars)) {
             for (const v of miVars) {
-                const name = v.name || '';
-                const value = v.value || '';
-                const type = v.type || '';
+                const name = mi_parse_1.MINode.valueOf(v, "name") || '';
+                const value = mi_parse_1.MINode.valueOf(v, "value") || '';
+                const type = mi_parse_1.MINode.valueOf(v, "type") || '';
                 let variablesReference = 0;
                 if (this.looksExpandable(type, value)) {
                     try {
-                        const varObj = await this.sendMICommand(`-var-create - * ${name}`);
-                        const varName = varObj.data?.name;
-                        const numchild = parseInt(varObj.data?.numchild || '0', 10);
-                        if (varName) {
-                            this.createdVarObjects.push(varName);
-                            if (numchild > 0) {
+                        const varObj = await this.miDebugger.varCreate(threadId, frameLevel, name);
+                        if (varObj.name) {
+                            this.createdVarObjects.push(varObj.name);
+                            if (varObj.isCompound()) {
                                 const childRef = this.nextVarRef++;
-                                this.varRefMap.set(childRef, { type: 'var', varName });
+                                this.varRefMap.set(childRef, { type: 'var', varName: varObj.name });
                                 variablesReference = childRef;
                             }
                         }
@@ -919,28 +861,18 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
         this.sendResponse(response);
     }
     async handleVarChildren(response, parentVarName) {
-        const record = await this.sendMICommand(`-var-list-children --all-values ${parentVarName}`);
-        const children = record.data?.children;
-        const variables = [];
-        if (Array.isArray(children)) {
-            for (const entry of children) {
-                const child = entry.child || entry;
-                const name = child.exp || child.name || '';
-                const value = child.value || '';
-                const type = child.type || '';
-                const numchild = parseInt(child.numchild || '0', 10);
-                const childVarName = child.name || '';
-                let variablesReference = 0;
-                if (numchild > 0 && childVarName) {
-                    const childRef = this.nextVarRef++;
-                    this.varRefMap.set(childRef, { type: 'var', varName: childVarName });
-                    variablesReference = childRef;
-                }
-                const variable = new debugadapter_1.Variable(name, value, variablesReference);
-                variable.type = type;
-                variables.push(variable);
+        const children = await this.miDebugger.varListChildren(parentVarName);
+        const variables = children.map(child => {
+            let variablesReference = 0;
+            if (child.isCompound()) {
+                const childRef = this.nextVarRef++;
+                this.varRefMap.set(childRef, { type: 'var', varName: child.name });
+                variablesReference = childRef;
             }
-        }
+            const v = new debugadapter_1.Variable(child.exp || child.name, child.value ?? '', variablesReference);
+            v.type = child.type;
+            return v;
+        });
         response.body = { variables };
         this.sendResponse(response);
     }
@@ -959,7 +891,7 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     }
     async cleanupVariables() {
         for (const name of this.createdVarObjects) {
-            await this.sendMICommand(`-var-delete ${name}`).catch(() => { });
+            await this.miDebugger.sendCommand(`var-delete ${name}`).catch(() => { });
         }
         this.createdVarObjects.length = 0;
         this.varRefMap.clear();

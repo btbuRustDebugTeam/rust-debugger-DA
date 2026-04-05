@@ -493,6 +493,30 @@ export class MI2 extends EventEmitter {
 		return names.map(name => name.toString());
 	}
 
+	async getSomeRegisterValues(register_ids: number[]): Promise<RegisterValue[]> {
+		const mi_string = "data-list-register-values x " + register_ids.join(" ");
+		const result = await this.sendCommand(mi_string);
+		const nodes = result.result('register-values');
+		if (!Array.isArray(nodes)) {
+			console.warn("[ardb] getSomeRegisterValues: no register data returned, returning []");
+			return [];
+		}
+		return nodes.map(node => ({
+			index: parseInt(MINode.valueOf(node, "number")),
+			value: MINode.valueOf(node, "value"),
+		}));
+	}
+
+	async getSomeRegisters(register_ids: number[]): Promise<Variable[]> {
+		const names = await this.getRegisterNames();
+		const values = await this.getSomeRegisterValues(register_ids);
+		return values.map(val => ({
+			name: names[val.index],
+			valueStr: val.value,
+			type: "string",
+		}));
+	}
+
 	async getRegisterValues(): Promise<RegisterValue[]> {
 		const result = await this.sendCommand("data-list-register-values --skip-unavailable N " + (this.registerLimit || ""));
 		const nodes = result.result('register-values');
@@ -586,6 +610,24 @@ export class MI2 extends EventEmitter {
 		if (threadId != 0) miCommand += `--thread ${threadId} --frame ${frameLevel} `;
 		miCommand += `console "${command.replace(/[\\"']/g, "\\$&")}"`;
 		return this.sendCommand(miCommand);
+	}
+
+	addSymbolFile(filepath: string): Promise<any> {
+		return new Promise((resolve, reject) => {
+			this.sendCliCommand("add-symbol-file " + filepath).then((result) => {
+				if (result.resultRecords?.resultClass == "done") resolve(true);
+				else resolve(false);
+			}, reject);
+		});
+	}
+
+	removeSymbolFile(filepath: string): Promise<any> {
+		return new Promise((resolve, reject) => {
+			this.sendCliCommand("remove-symbol-file " + filepath).then((result) => {
+				if (result.resultRecords?.resultClass == "done") resolve(true);
+				else resolve(false);
+			}, reject);
+		});
 	}
 
 	sendCommand(command: string, suppressFailure: boolean = false): Promise<MINode> {
