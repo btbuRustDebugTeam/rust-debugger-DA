@@ -144,7 +144,13 @@ CALL_MNEMONIC_RE = re.compile(r"^\s*call\w*\b", re.IGNORECASE)
 HEX_ADDR_RE = re.compile(r"(0x[0-9a-fA-F]+)")
 
 def _ptr_size() -> int:
-    return gdb.lookup_type("void").pointer().sizeof
+    try:
+        return gdb.lookup_type("char").pointer().sizeof
+    except gdb.error:
+        try:
+            return gdb.lookup_type("unsigned char").pointer().sizeof
+        except gdb.error:
+            return 8
 
 def _read_ptr(addr: int) -> int:
     inf = gdb.selected_inferior()
@@ -164,8 +170,32 @@ def _current_function_name() -> str:
     f = gdb.selected_frame()
     return f.name() or "<unknown>"
 
-def _info_symbol_raw(addr: int) -> str:
-    return gdb.execute(f"info symbol {addr:#x}", to_string=True).strip()
+def _normalize_addr(addr):
+    try:
+        a = int(addr)
+    except Exception:
+        try:
+            a = int(str(addr), 0)
+        except Exception:
+            return None
+
+    try:
+        ptr_bits = _ptr_size() * 8
+        mask = (1 << ptr_bits) - 1
+        a &= mask
+    except Exception:
+        pass
+
+    return a
+
+def _info_symbol_raw(addr):
+    a = _normalize_addr(addr)
+    if a is None:
+        return ""
+    try:
+        return gdb.execute(f"info symbol 0x{a:x}", to_string=True).strip()
+    except gdb.error:
+        return ""
 
 def _info_symbol_name(addr: int) -> str:
     s = _info_symbol_raw(addr)
@@ -239,14 +269,6 @@ def _resolve_call_target_from_asm(asm: str) -> int | None:
     if m:
         return _reg_u64(m.group(1))
 
-    # call *disp(%reg)
-    m = re.search(r"call\w*\s+\*([\-0-9a-fx]+)\(\%([a-z0-9]+)\)", s)
-    if m:
-        disp_s, base = m.group(1), m.group(2)
-        disp = int(disp_s, 16) if disp_s.startswith(("0x", "-0x")) else int(disp_s, 10)
-        slot = _reg_u64(base) + disp
-        return _read_ptr(slot)
-
     # call *disp(%rip)  (x86_64: ff 15 disp32 ; instruction length is 6 bytes)
     m = re.search(r"call\w*\s+\*([\-0-9a-fx]+)\(\%rip\)", s)
     if m:
@@ -254,6 +276,14 @@ def _resolve_call_target_from_asm(asm: str) -> int | None:
         disp = int(disp_s, 16) if disp_s.startswith(("0x", "-0x")) else int(disp_s, 10)
         pc = _current_pc()
         slot = pc + 6 + disp  # RIP-relative base = next instruction
+        return _read_ptr(slot)
+
+    # call *disp(%reg)
+    m = re.search(r"call\w*\s+\*([\-0-9a-fx]+)\(\%([a-z0-9]+)\)", s)
+    if m:
+        disp_s, base = m.group(1), m.group(2)
+        disp = int(disp_s, 16) if disp_s.startswith(("0x", "-0x")) else int(disp_s, 10)
+        slot = _reg_u64(base) + disp
         return _read_ptr(slot)
 
     return None
@@ -412,8 +442,8 @@ def _try_addr_by_lookup_global_symbol(name: str) -> int | None:
         if sym is None:
             return None
         v = sym.value()
-        voidp = gdb.lookup_type("void").pointer()
-        return int(v.cast(voidp))
+        voidp = gdb.lookup_type("char").pointer()
+        return int(v.cast(charp))
     except Exception:
         return None
 
