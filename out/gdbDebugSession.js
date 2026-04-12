@@ -211,16 +211,57 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     // DAP: setBreakpoints
     // -----------------------------------------------------------------------
     async setBreakPointsRequest(response, args) {
-        if (!this.miDebugger) {
-            response.body = { breakpoints: [] };
-            this.sendResponse(response);
-            return;
-        }
         const source = args.source;
         const filePath = source.path || '';
         const requestedLines = args.breakpoints || [];
         if (!filePath) {
             response.body = { breakpoints: [] };
+            this.sendResponse(response);
+            return;
+        }
+        // In OS debug mode: cache breakpoints into the appropriate breakpoint group.
+        // Only actually set them in GDB if this file belongs to the current active group.
+        if (this.breakpointGroups) {
+            // Determine which group(s) this file belongs to
+            let groupNames = [];
+            try {
+                groupNames = eval(this.breakpointGroups['session'].filePathToBreakpointGroupNames)(filePath);
+            }
+            catch {
+                groupNames = [this.breakpointGroups.getCurrentBreakpointGroupName()];
+            }
+            // Save into each matching group (for future group switches)
+            for (const groupName of groupNames) {
+                this.breakpointGroups.saveBreakpointsToBreakpointGroup(args, groupName);
+            }
+            const currentGroup = this.breakpointGroups.getCurrentBreakpointGroupName();
+            const belongsToCurrent = groupNames.includes(currentGroup);
+            // If this file doesn't belong to the current group, return pending placeholders.
+            // The breakpoints will be set for real when the group switches.
+            if (!belongsToCurrent) {
+                const dapBreakpoints = requestedLines.map(bp => {
+                    const dbp = new debugadapter_1.Breakpoint(false, bp.line);
+                    dbp.setId(this.nextDapBreakpointId++);
+                    dbp.source = new debugadapter_1.Source(source.name || '', filePath);
+                    dbp.message = 'Pending: will be set when this breakpoint group becomes active';
+                    return dbp;
+                });
+                response.body = { breakpoints: dapBreakpoints };
+                this.sendResponse(response);
+                return;
+            }
+            // else: belongs to current group — fall through to set in GDB immediately
+        }
+        if (!this.miDebugger) {
+            // GDB not ready yet — return pending placeholders, they'll be set after connect
+            const dapBreakpoints = requestedLines.map(bp => {
+                const dbp = new debugadapter_1.Breakpoint(false, bp.line);
+                dbp.setId(this.nextDapBreakpointId++);
+                dbp.source = new debugadapter_1.Source(source.name || '', filePath);
+                dbp.message = 'Pending: GDB not connected yet';
+                return dbp;
+            });
+            response.body = { breakpoints: dapBreakpoints };
             this.sendResponse(response);
             return;
         }
@@ -872,6 +913,9 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
                 this.osDebugReady = true;
                 this.inferiorStarted = true;
             }
+            // Tell VS Code "we're ready" — it will re-issue all setBreakPointsRequest calls,
+            // which will now reach GDB correctly. This is the same pattern as code-debug.
+            this.sendEvent(new debugadapter_1.InitializedEvent());
         });
         this.miDebugger.on('breakpoint', (node) => {
             const threadId = this.getThreadId(node);

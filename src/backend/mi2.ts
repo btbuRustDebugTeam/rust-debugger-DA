@@ -99,13 +99,23 @@ export class MI2 extends EventEmitter {
 			this.process.stderr?.on("data", this.stderr.bind(this));
 			this.process.on("exit", () => this.emit("quit"));
 			this.process.on("error", err => this.emit("launcherror", err));
-			const promises = this.initCommands(target, cwd, true);
-			promises.push(this.sendCommand("target-select remote " + target));
-			promises.push(...autorun.map(value => this.sendUserInput(value)));
-			Promise.all(promises).then(() => {
+			// First run init commands (gdb-set, list-features, extraCommands) in parallel,
+			// then load symbols, then connect to the remote stub, then run autorun commands.
+			// This order is required: symbols must be loaded before "target remote" so GDB
+			// knows the architecture and can resolve breakpoint locations immediately.
+			Promise.all(this.initCommands(target, cwd, true)).then(() => {
+				const seq: Promise<any>[] = [];
+				if (executable)
+					seq.push(this.sendCommand('file-exec-and-symbols "' + escape(executable) + '"'));
+				return seq.reduce((p, cmd) => p.then(() => cmd), Promise.resolve() as Promise<any>);
+			}).then(() => {
+				return this.sendCommand("target-select remote " + target);
+			}).then(() => {
+				return Promise.all(autorun.map(value => this.sendUserInput(value)));
+			}).then(() => {
 				this.emit("debug-ready");
 				resolve(undefined);
-			}, reject);
+			}).catch(reject);
 		});
 	}
 
