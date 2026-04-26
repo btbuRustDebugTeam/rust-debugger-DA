@@ -1011,7 +1011,7 @@ export class GDBDebugSession extends DebugSession {
                     };
                     this.breakpointGroups.updateHookBreakpoint(normalized);
                     if (this.miDebugger && normalized.breakpoint.file && normalized.breakpoint.line) {
-                        const hookLocation = `"${escape(normalized.breakpoint.file)}:${normalized.breakpoint.line}"`;
+                        const hookLocation = `"${escape(path.basename(normalized.breakpoint.file))}:${normalized.breakpoint.line}"`;
                         this.miDebugger.sendCommand(`break-insert -f ${hookLocation}`).then(result => {
                             if (result.resultRecords?.resultClass === 'done') {
                                 const bkptNum = parseInt(result.result('bkpt.number'));
@@ -1282,7 +1282,7 @@ export class GDBDebugSession extends DebugSession {
                             const hookKey = `${hook.breakpoint.file}:${hook.breakpoint.line}`;
                             if (insertedHooks.has(hookKey)) continue;
                             insertedHooks.add(hookKey);
-                            const hookLocation = `"${escape(hook.breakpoint.file)}:${hook.breakpoint.line}"`;
+                            const hookLocation = `"${escape(path.basename(hook.breakpoint.file))}:${hook.breakpoint.line}"`;
                             hookPromises.push(
                                 this.miDebugger!.sendCommand(`break-insert -f ${hookLocation}`).then(result => {
                                     if (result.resultRecords?.resultClass === 'done') {
@@ -1603,8 +1603,12 @@ export class GDBDebugSession extends DebugSession {
                     if (!currentGroup) return;
 
                     for (const hook of currentGroup.hooks) {
-                        if (topFrame.file && path.normalize(topFrame.file) === path.normalize(hook.breakpoint.file ?? '')
-                            && topFrame.line === hook.breakpoint.line) {
+                        const hookFileAbs = hook.breakpoint.file ?? '';
+                        const fileMatches = topFrame.file && (
+                            path.normalize(topFrame.file) === path.normalize(hookFileAbs) ||
+                            path.basename(topFrame.file) === path.basename(hookFileAbs)
+                        );
+                        if (fileMatches && topFrame.line === hook.breakpoint.line) {
                             this.currentHook = hook;
                             try {
                                 const vars = await this.miDebugger!.getStackVariables(this.recentStopThreadId, 0);
