@@ -193,8 +193,8 @@ export class BreakpointGroups {
 		const toTextAddr = (e: SymbolFileEntry) => typeof e === 'string' ? undefined : e.textAddr;
 
 		Promise.all(clearOldPromises)
-			.then(() => Promise.all(oldSymbolFiles.map(f => this.session.miDebugger.removeSymbolFile(toPath(f)).catch(() => {}))))
-			.then(() => Promise.all(newSymbolFiles.map(f => this.session.miDebugger.addSymbolFile(toPath(f), toTextAddr(f)).catch(() => {}))))
+			.then(() => Promise.all(oldSymbolFiles.map(f => this.session.miDebugger.removeSymbolFile(toPath(f)).catch(err => { console.error('[ardb] removeSymbolFile failed:', err); }))))
+			.then(() => Promise.all(newSymbolFiles.map(f => this.session.miDebugger.addSymbolFile(toPath(f), toTextAddr(f)).catch(err => { console.error('[ardb] addSymbolFile failed:', err); }))))
 			.then(() => {
 				// 3. Re-insert new group's breakpoints
 				const breakpointPromises = this.groups[newIndex].setBreakpointsArguments.map((args) => {
@@ -343,7 +343,6 @@ export class BreakpointGroups {
 				if (existingGroup.name === groupName) {
 					groupExists = true;
 					existingGroup.hooks.set(toHookBreakpoint(hook));
-					this.session.showInformationMessage('hooks set ' + JSON.stringify(existingGroup.hooks));
 				}
 			}
 			if (groupExists === false) {

@@ -146,6 +146,13 @@ export class GDBDebugSession extends DebugSession {
     // (not set in GDB yet because they belong to an inactive breakpoint group).
     // Used by onBreakpointsRestored to send BreakpointEvent with the original id.
     private pendingDapIds: Map<string, number> = new Map();
+    // Compiled version of filePathToBreakpointGroupNames — cached once at attach time
+    // so setBreakPointsRequest doesn't re-eval the function string on every call.
+    private cachedFilePathToGroupNames: ((filePath: string) => string[]) | undefined;
+    // Set by try_get_next_breakpoint_group_name's async body to signal whether the
+    // current stop matched a hook. If true, .finally() auto-continues instead of
+    // sending StoppedEvent — hook breakpoints should be transparent to the user.
+    private hookMatchedInTryGetNext = false;
 
     // Variable / scope state
     private nextVarRef = 1;
@@ -169,6 +176,10 @@ export class GDBDebugSession extends DebugSession {
     // GDB breakpoint numbers that are border breakpoints (kernel↔user boundary).
     // Populated after GDB connects; checked synchronously in the breakpoint event handler.
     private borderGdbNumbers: Set<number> = new Set();
+    // GDB breakpoint numbers that are hook breakpoints (permanent, survive group switches).
+    // Hook breakpoints are inserted once at connect time via sendCommand, bypassing
+    // addBreakPoint, so clearBreakPoints never removes them during group switches.
+    private hookGdbNumbers: Map<number, HookBreakpoint> = new Map();
 
     constructor(opts: GDBDebugSessionOptions) {
         super();
@@ -262,6 +273,10 @@ export class GDBDebugSession extends DebugSession {
         const groupNameToFilePaths = config.breakpointGroupNameToDebugFilePaths
             ? toFunctionString({ body: config.breakpointGroupNameToDebugFilePaths.functionBody, args: [config.breakpointGroupNameToDebugFilePaths.functionArguments] })
             : '(function(groupName) { return []; })';
+
+        // Compile once — setBreakPointsRequest is called on every user breakpoint action
+        // and re-evaling the function string each time is unnecessary overhead.
+        this.cachedFilePathToGroupNames = eval(filePathToGroupNames) as (filePath: string) => string[];
 
         const self = this;
         const bpgSession: IBreakpointGroupsSession = {
@@ -404,7 +419,7 @@ export class GDBDebugSession extends DebugSession {
             // Determine which group(s) this file belongs to
             let groupNames: string[] = [];
             try {
-                groupNames = eval(this.breakpointGroups['session'].filePathToBreakpointGroupNames)(filePath);
+                groupNames = this.cachedFilePathToGroupNames!(filePath);
             } catch {
                 groupNames = [this.breakpointGroups.getCurrentBreakpointGroupName()];
             }
@@ -420,6 +435,15 @@ export class GDBDebugSession extends DebugSession {
             // If this file doesn't belong to the current group, return pending placeholders.
             // The breakpoints will be set for real when the group switches.
             if (!belongsToCurrent) {
+                // Purge stale entries for this file before inserting new ones.
+                // VS Code always sends the full current list for a file, so any key we
+                // had from a previous request is now obsolete and must be removed to
+                // prevent pendingDapIds from growing unboundedly across group switches.
+                for (const key of this.pendingDapIds.keys()) {
+                    if (key.startsWith(`${filePath}:`)) {
+                        this.pendingDapIds.delete(key);
+                    }
+                }
                 const dapBreakpoints = requestedLines.map(bp => {
                     const dapId = this.nextDapBreakpointId++;
                     // Remember this id so onBreakpointsRestored can use it to send
@@ -456,7 +480,7 @@ export class GDBDebugSession extends DebugSession {
             // Delete old breakpoints for this file
             const oldNumbers = this.fileBreakpoints.get(filePath) || [];
             for (const num of oldNumbers) {
-                await this.miDebugger!.sendCommand(`break-delete ${num}`).catch(() => {});
+                await this.miDebugger!.sendCommand(`break-delete ${num}`).catch(() => { });
                 this.gdbBkptToDap.delete(num);
             }
             this.fileBreakpoints.delete(filePath);
@@ -474,7 +498,7 @@ export class GDBDebugSession extends DebugSession {
                     const verified = MINode.valueOf(bkpt, "pending") === undefined;
 
                     if (bp.condition && gdbNumber > 0) {
-                        await this.miDebugger!.sendCommand(`break-condition ${gdbNumber} ${bp.condition}`).catch(() => {});
+                        await this.miDebugger!.sendCommand(`break-condition ${gdbNumber} ${bp.condition}`).catch(() => { });
                     }
 
                     const dapId = this.nextDapBreakpointId++;
@@ -520,7 +544,7 @@ export class GDBDebugSession extends DebugSession {
 
         try {
             for (const num of this.functionBreakpointNumbers) {
-                await this.miDebugger!.sendCommand(`break-delete ${num}`).catch(() => {});
+                await this.miDebugger!.sendCommand(`break-delete ${num}`).catch(() => { });
                 this.gdbBkptToDap.delete(num);
             }
             this.functionBreakpointNumbers = [];
@@ -536,7 +560,7 @@ export class GDBDebugSession extends DebugSession {
                     const verified = MINode.valueOf(bkpt, "pending") === undefined;
 
                     if (fbp.condition && gdbNumber > 0) {
-                        await this.miDebugger!.sendCommand(`break-condition ${gdbNumber} ${fbp.condition}`).catch(() => {});
+                        await this.miDebugger!.sendCommand(`break-condition ${gdbNumber} ${fbp.condition}`).catch(() => { });
                     }
 
                     const dapId = this.nextDapBreakpointId++;
@@ -986,6 +1010,22 @@ export class GDBDebugSession extends DebugSession {
                         },
                     };
                     this.breakpointGroups.updateHookBreakpoint(normalized);
+                    if (this.miDebugger && normalized.breakpoint.file && normalized.breakpoint.line) {
+                        const hookLocation = `"${escape(normalized.breakpoint.file)}:${normalized.breakpoint.line}"`;
+                        this.miDebugger.sendCommand(`break-insert -f ${hookLocation}`).then(result => {
+                            if (result.resultRecords?.resultClass === 'done') {
+                                const bkptNum = parseInt(result.result('bkpt.number'));
+                                if (!isNaN(bkptNum)) {
+                                    this.hookGdbNumbers.set(bkptNum,normalized as any);
+                                }
+                            }
+                        }).catch(err => {
+                            console.error('[ardb] failed to insert dynamic hook breakpoint:', err);
+                        });
+                    }
+                    const f = args.breakpoint?.file ? path.basename(args.breakpoint.file) : '?';
+                    const l = args.breakpoint?.line ?? '?';
+                    this.showInfo(`hook breakpoint set: ${f}:${l}`);
                 }
                 this.sendResponse(response);
                 break;
@@ -1012,7 +1052,16 @@ export class GDBDebugSession extends DebugSession {
                     this.breakpointGroups.removeAllBreakpoints();
                 }
                 if (this.miDebugger) {
-                    this.miDebugger.sendCommand('break-delete').catch(() => {});
+                    // Delete only tracked breakpoints individually — break-delete without args
+                    // would also wipe border/hook breakpoints inserted via sendCommand (which
+                    // bypass fileBreakpoints), permanently breaking border detection.
+                    const toDelete: number[] = [...this.functionBreakpointNumbers];
+                    for (const nums of this.fileBreakpoints.values()) {
+                        toDelete.push(...nums);
+                    }
+                    for (const num of toDelete) {
+                        this.miDebugger.sendCommand(`break-delete ${num}`).catch(() => { });
+                    }
                 }
                 this.fileBreakpoints.clear();
                 this.gdbBkptToDap.clear();
@@ -1186,26 +1235,78 @@ export class GDBDebugSession extends DebugSession {
                 // Deduplicate by filepath:line — the same border may appear in multiple
                 // groups (e.g. syscall.rs is a border for every user-process group).
                 if (this.breakpointGroups) {
+                    // Collect unique border locations to deduplicate and build a label set.
                     const insertedBorders = new Set<string>();
+                    const borderPromises: Promise<void>[] = [];
                     for (const group of this.breakpointGroups.getAllBreakpointGroups()) {
                         for (const border of (group.borders ?? [])) {
                             const key = `${border.filepath}:${border.line}`;
                             if (insertedBorders.has(key)) continue;
                             insertedBorders.add(key);
-                            this.miDebugger!.addBreakPoint({
-                                file: border.filepath,
-                                line: border.line,
-                                condition: '',
-                            }).then(([ok, brk]) => {
-                                if (ok && brk.id !== undefined) {
-                                    this.borderGdbNumbers.add(brk.id);
-                                    console.log(`[ardb] border breakpoint inserted: gdb#${brk.id} at ${border.filepath}:${border.line}`);
-                                }
-                            }).catch(err => {
-                                console.error('[ardb] failed to insert border breakpoint:', err);
-                            });
+                            // 用 sendCommand 直接插入，绕开 addBreakPoint 的 this.breakpoints 注册，
+                            // 防止 clearBreakPoints 在组切换时误删边界断点导致 borderGdbNumbers 失效。
+                            const location = `"${escape(border.filepath)}:${border.line}"`;
+                            borderPromises.push(
+                                this.miDebugger!.sendCommand(`break-insert -f ${location}`).then(result => {
+                                    if (result.resultRecords?.resultClass === 'done') {
+                                        const bkptNum = parseInt(result.result('bkpt.number'));
+                                        if (!isNaN(bkptNum)) {
+                                            this.borderGdbNumbers.add(bkptNum);
+                                        }
+                                    }
+                                }).catch(err => {
+                                    console.error('[ardb] failed to insert border breakpoint:', err);
+                                })
+                            );
                         }
                     }
+                    // Notify once after all border BPs are inserted so the user knows they're active.
+                    Promise.all(borderPromises).then(() => {
+                        if (this.borderGdbNumbers.size > 0) {
+                            const labels = Array.from(insertedBorders).map(k => {
+                                const sep = k.lastIndexOf(':');
+                                return `${path.basename(k.substring(0, sep))}:${k.substring(sep + 1)}`;
+                            }).join(', ');
+                            this.showInfo(`border breakpoints active (${this.borderGdbNumbers.size}): ${labels}`);
+                        }
+                    });
+
+                    // Insert hook breakpoints permanently — same approach as borders:
+                    // use sendCommand directly so clearBreakPoints never removes them
+                    // during group switches (they are not registered in this.breakpoints).
+                    const insertedHooks = new Set<string>();
+                    const hookPromises: Promise<void>[] = [];
+                    for (const group of this.breakpointGroups.getAllBreakpointGroups()) {
+                        for (const hook of group.hooks) {
+                            if (!hook.breakpoint.file || !hook.breakpoint.line) continue;
+                            const hookKey = `${hook.breakpoint.file}:${hook.breakpoint.line}`;
+                            if (insertedHooks.has(hookKey)) continue;
+                            insertedHooks.add(hookKey);
+                            const hookLocation = `"${escape(hook.breakpoint.file)}:${hook.breakpoint.line}"`;
+                            hookPromises.push(
+                                this.miDebugger!.sendCommand(`break-insert -f ${hookLocation}`).then(result => {
+                                    if (result.resultRecords?.resultClass === 'done') {
+                                        const bkptNum = parseInt(result.result('bkpt.number'));
+                                        if (!isNaN(bkptNum)) {
+                                            this.hookGdbNumbers.set(bkptNum, hook);
+                                        }
+                                    }
+                                }).catch(err => {
+                                    console.error('[ardb] failed to insert hook breakpoint:', err);
+                                })
+                            );
+                        }
+                    }
+                    // Notify once after all hook BPs are inserted.
+                    Promise.all(hookPromises).then(() => {
+                        if (this.hookGdbNumbers.size > 0) {
+                            const labels = Array.from(insertedHooks).map(k => {
+                                const sep = k.lastIndexOf(':');
+                                return `${path.basename(k.substring(0, sep))}:${k.substring(sep + 1)}`;
+                            }).join(', ');
+                            this.showInfo(`hook breakpoints active (${this.hookGdbNumbers.size}): ${labels}`);
+                        }
+                    });
                 }
             }
             // Tell VS Code "we're ready" — it will re-issue all setBreakPointsRequest calls,
@@ -1350,11 +1451,13 @@ export class GDBDebugSession extends DebugSession {
      * Feed an OS event into the state machine and execute all resulting actions.
      * Called from stop event handlers when osDebugReady is true.
      *
-     * The in-flight guard stays raised until the action has either:
-     *   - dispatched a GDB command that will produce a new STOPPED event (step, continue), or
-     *   - called osStateTransition again synchronously (AT_* events from async callbacks).
-     * This prevents a burst of STOPPED events during single-stepping from double-firing
-     * a group switch or sending duplicate notifications.
+     * Lock (osTransitionInFlight) discipline:
+     *   - willAutorun=true: an autorun action (low/high_level_switch, single_step) releases
+     *     the lock synchronously in doAction before dispatching the next GDB command.
+     *   - willAutorun=false && hasTryGetNext: the lock is kept raised; try_get_next's .finally()
+     *     releases it and sends StoppedEvent after nextBreakpointGroup is fully resolved.
+     *     This prevents a border event from reading a stale nextBreakpointGroup.
+     *   - willAutorun=false && !hasTryGetNext: the lock is released here and StoppedEvent sent.
      */
     private osStateTransition(event: OSEvent): void {
         if (this.osTransitionInFlight) return;
@@ -1370,6 +1473,12 @@ export class GDBDebugSession extends DebugSession {
             DebuggerActions.high_level_switch_breakpoint_group_to_low_level,
         ]);
         const willAutorun = actions.some(a => autorunActions.has(a.type));
+        // try_get_next is async — it must complete before we surface the stop, otherwise
+        // a border crossing that arrives before getStack returns would use a stale
+        // nextBreakpointGroup value (race condition in multi-hart / fast-event environments).
+        const hasTryGetNext = actions.some(
+            a => a.type === DebuggerActions.try_get_next_breakpoint_group_name,
+        );
 
         for (const action of actions) {
             this.doAction(action);
@@ -1378,10 +1487,15 @@ export class GDBDebugSession extends DebugSession {
         // If the state machine doesn't intend to auto-continue, surface the stop to the UI
         // and release the lock — the user will manually continue.
         if (!willAutorun) {
-            this.osTransitionInFlight = false;
-            const event2 = new StoppedEvent('breakpoint', this.recentStopThreadId);
-            (event2.body as any).allThreadsStopped = true;
-            this.sendEvent(event2);
+            if (!hasTryGetNext) {
+                // No async action is pending — safe to surface the stop immediately.
+                this.osTransitionInFlight = false;
+                const event2 = new StoppedEvent('breakpoint', this.recentStopThreadId);
+                (event2.body as any).allThreadsStopped = true;
+                this.sendEvent(event2);
+            }
+            // hasTryGetNext=true: lock stays raised until try_get_next's .finally() releases
+            // it and sends StoppedEvent, ensuring nextBreakpointGroup is set first.
         }
         // If willAutorun: lock stays raised. It will be released by releaseOsTransitionLock()
         // which is called from doAction's async callbacks just before issuing the next
@@ -1392,6 +1506,11 @@ export class GDBDebugSession extends DebugSession {
     /** Release the OS transition in-flight guard. Called by doAction async paths. */
     private releaseOsTransitionLock(): void {
         this.osTransitionInFlight = false;
+    }
+
+    /** Send an information notification visible in VS Code's notification area. */
+    private showInfo(msg: string): void {
+        this.sendEvent({ event: 'showInformationMessage', type: 'event', body: msg, seq: 0 } as any);
     }
 
     /**
@@ -1448,11 +1567,15 @@ export class GDBDebugSession extends DebugSession {
             // ------------------------------------------------------------------
             // check_if_kernel_to_user_border_yet / check_if_user_to_kernel_border_yet:
             // Border detection is now done synchronously in the breakpoint event handler
-            // by checking borderGdbNumbers. These actions are no-ops — just release the lock.
+            // by checking borderGdbNumbers. These actions are pure no-ops — they do NOT
+            // release the lock. Lock ownership belongs to:
+            //   • osStateTransition's !willAutorun path (when try_get_next is absent), or
+            //   • try_get_next's .finally() callback (when try_get_next is co-dispatched).
+            // Releasing the lock here would expose a race where a border event fires and
+            // low_level_switch reads a stale nextBreakpointGroup before try_get_next finishes.
             // ------------------------------------------------------------------
             case DebuggerActions.check_if_kernel_to_user_border_yet:
             case DebuggerActions.check_if_user_to_kernel_border_yet: {
-                this.releaseOsTransitionLock();
                 break;
             }
 
@@ -1472,6 +1595,7 @@ export class GDBDebugSession extends DebugSession {
             // if matched, run the hook behavior function to get the next process name.
             // ------------------------------------------------------------------
             case DebuggerActions.try_get_next_breakpoint_group_name: {
+                this.hookMatchedInTryGetNext = false;
                 this.miDebugger.getStack(0, 1, this.recentStopThreadId).then(async stack => {
                     if (stack.length === 0 || !this.breakpointGroups) return;
                     const topFrame = stack[0];
@@ -1483,13 +1607,11 @@ export class GDBDebugSession extends DebugSession {
                             && topFrame.line === hook.breakpoint.line) {
                             this.currentHook = hook;
                             try {
-                                // Get variables to pass to hook function
                                 const vars = await this.miDebugger!.getStackVariables(this.recentStopThreadId, 0);
                                 const varMap: Record<string, string> = {};
                                 for (const v of vars) {
                                     varMap[v.name] = v.valueStr ?? '';
                                 }
-                                // Execute hook behavior to get next breakpoint group name
                                 const fn = eval(hook.behavior) as (vars: Record<string, string>) => string;
                                 const nextGroupName = fn(varMap);
                                 if (nextGroupName) {
@@ -1498,14 +1620,31 @@ export class GDBDebugSession extends DebugSession {
                             } catch (err) {
                                 console.error('[ardb] hook behavior execution failed:', err);
                             }
+                            // Hook matched — mark for auto-continue so the user never sees
+                            // a pause at hook locations (they are transparent, like borders).
+                            this.hookMatchedInTryGetNext = true;
                             return;
                         }
                     }
-                    // try_get_next_breakpoint_group_name does not call osStateTransition —
-                    // it runs alongside check_if_*_border_yet in the same STOPPED dispatch.
-                    // The lock is released by the border check's callback, not here.
+                    // No hook matched — this is a genuine user breakpoint; let it pause.
+                    this.hookMatchedInTryGetNext = false;
                 }).catch(err => {
                     console.error('[ardb] try_get_next_breakpoint_group_name failed:', err);
+                    this.hookMatchedInTryGetNext = false;
+                }).finally(() => {
+                    if (!this.osTransitionInFlight) return;
+                    this.osTransitionInFlight = false;
+                    if (this.hookMatchedInTryGetNext) {
+                        // Hook was processed — continue transparently without pausing.
+                        this.miDebugger!.continue().catch(err => {
+                            console.error('[ardb] hook auto-continue failed:', err);
+                        });
+                    } else {
+                        // Regular user breakpoint — surface the stop to VS Code.
+                        const stoppedEvent = new StoppedEvent('breakpoint', this.recentStopThreadId);
+                        (stoppedEvent.body as any).allThreadsStopped = true;
+                        this.sendEvent(stoppedEvent);
+                    }
                 });
                 break;
             }
@@ -1754,7 +1893,7 @@ export class GDBDebugSession extends DebugSession {
 
     private async cleanupVariables(): Promise<void> {
         for (const name of this.createdVarObjects) {
-            await this.miDebugger!.sendCommand(`var-delete ${name}`).catch(() => {});
+            await this.miDebugger!.sendCommand(`var-delete ${name}`).catch(() => { });
         }
         this.createdVarObjects.length = 0;
         this.varRefMap.clear();
