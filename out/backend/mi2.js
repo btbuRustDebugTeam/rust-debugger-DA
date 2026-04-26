@@ -42,9 +42,85 @@ const backend_1 = require("./backend");
 const ChildProcess = __importStar(require("child_process"));
 const events_1 = require("events");
 const mi_parse_1 = require("./mi_parse");
+const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 function escape(str) {
     return str.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+/**
+ * Read the virtual address of the .text section from an ELF file on disk.
+ * Returns undefined if the file can't be read or has no .text section.
+ *
+ * ELF layout (64-bit little-endian, which covers all RISC-V 64 binaries):
+ *   Offset 0x10 (2 bytes): e_type
+ *   Offset 0x20 (8 bytes): e_shoff — file offset of section header table
+ *   Offset 0x3A (2 bytes): e_shentsize — size of each section header entry
+ *   Offset 0x3C (2 bytes): e_shnum    — number of section header entries
+ *   Offset 0x3E (2 bytes): e_shstrndx — index of section name string table
+ * Each 64-bit section header entry (64 bytes):
+ *   +0x00 (4): sh_name   — byte offset into shstrtab
+ *   +0x18 (8): sh_addr   — virtual address
+ */
+function readElfTextAddr(filepath) {
+    try {
+        // Read enough of the file to access the header and all section headers.
+        // We read up to 1 MiB which is far more than enough for any OS ELF header.
+        const fd = fs.openSync(filepath, 'r');
+        const headerBuf = Buffer.alloc(64);
+        fs.readSync(fd, headerBuf, 0, 64, 0);
+        // Check ELF magic
+        if (headerBuf[0] !== 0x7F || headerBuf[1] !== 0x45 ||
+            headerBuf[2] !== 0x4C || headerBuf[3] !== 0x46) {
+            fs.closeSync(fd);
+            return undefined;
+        }
+        const is64bit = headerBuf[4] === 2;
+        const isLittleEndian = headerBuf[5] === 1;
+        if (!is64bit || !isLittleEndian) {
+            // Only handle 64-bit LE (RISC-V 64)
+            fs.closeSync(fd);
+            return undefined;
+        }
+        const shoff = Number(headerBuf.readBigUInt64LE(0x28));
+        const shentsize = headerBuf.readUInt16LE(0x3A);
+        const shnum = headerBuf.readUInt16LE(0x3C);
+        const shstrndx = headerBuf.readUInt16LE(0x3E);
+        if (shoff === 0 || shnum === 0) {
+            fs.closeSync(fd);
+            return undefined;
+        }
+        // Read all section headers
+        const shBuf = Buffer.alloc(shentsize * shnum);
+        fs.readSync(fd, shBuf, 0, shBuf.length, shoff);
+        // Find shstrtab section to resolve names
+        const shstrOffset = shoff + shstrndx * shentsize;
+        const shstrBuf = Buffer.alloc(shentsize);
+        fs.readSync(fd, shstrBuf, 0, shentsize, shstrOffset);
+        const shstrFileOffset = Number(shstrBuf.readBigUInt64LE(0x18));
+        const shstrSize = Number(shstrBuf.readBigUInt64LE(0x20));
+        const shstrData = Buffer.alloc(shstrSize);
+        fs.readSync(fd, shstrData, 0, shstrSize, shstrFileOffset);
+        fs.closeSync(fd);
+        // Find section named ".text"
+        for (let i = 0; i < shnum; i++) {
+            const base = i * shentsize;
+            const nameIdx = shBuf.readUInt32LE(base);
+            // Read null-terminated string from shstrData
+            let name = '';
+            for (let j = nameIdx; j < shstrData.length && shstrData[j] !== 0; j++) {
+                name += String.fromCharCode(shstrData[j]);
+            }
+            if (name === '.text') {
+                // sh_addr is at offset 0x10 within each Elf64_Shdr entry
+                const vaddr = shBuf.readBigUInt64LE(base + 0x10);
+                return '0x' + vaddr.toString(16);
+            }
+        }
+        return undefined;
+    }
+    catch {
+        return undefined;
+    }
 }
 const nonOutput = /^(?:\d*|undefined)[\*\+\=]|[\~\@\&\^]/;
 const gdbMatch = /(?:\d*|undefined)\(gdb\)/;
@@ -139,13 +215,23 @@ class MI2 extends events_1.EventEmitter {
             this.process.stderr?.on("data", this.stderr.bind(this));
             this.process.on("exit", () => this.emit("quit"));
             this.process.on("error", err => this.emit("launcherror", err));
-            const promises = this.initCommands(target, cwd, true);
-            promises.push(this.sendCommand("target-select remote " + target));
-            promises.push(...autorun.map(value => this.sendUserInput(value)));
-            Promise.all(promises).then(() => {
+            // First run init commands (gdb-set, list-features, extraCommands) in parallel,
+            // then load symbols, then connect to the remote stub, then run autorun commands.
+            // This order is required: symbols must be loaded before "target remote" so GDB
+            // knows the architecture and can resolve breakpoint locations immediately.
+            Promise.all(this.initCommands(target, cwd, true)).then(() => {
+                const seq = [];
+                if (executable)
+                    seq.push(this.sendCommand('file-exec-and-symbols "' + escape(executable) + '"'));
+                return seq.reduce((p, cmd) => p.then(() => cmd), Promise.resolve());
+            }).then(() => {
+                return this.sendCommand("target-select remote " + target);
+            }).then(() => {
+                return Promise.all(autorun.map(value => this.sendUserInput(value)));
+            }).then(() => {
                 this.emit("debug-ready");
                 resolve(undefined);
-            }, reject);
+            }).catch(reject);
         });
     }
     initCommands(target, cwd, attach = false) {
@@ -154,6 +240,9 @@ class MI2 extends events_1.EventEmitter {
             target = debuggerPath.join(cwd, target);
         const cmds = [
             this.sendCommand("gdb-set target-async on", true),
+            // Disable GDB's interactive confirmation prompts so that commands like
+            // "add-symbol-file" don't block waiting for user input in MI mode.
+            this.sendCommand("gdb-set confirm off", true),
             new Promise((resolve) => {
                 this.sendCommand("list-features").then((done) => {
                     this.features = done.result("features");
@@ -682,9 +771,19 @@ class MI2 extends events_1.EventEmitter {
         miCommand += `console "${command.replace(/[\\"']/g, "\\$&")}"`;
         return this.sendCommand(miCommand);
     }
-    addSymbolFile(filepath) {
+    addSymbolFile(filepath, textAddr) {
         return new Promise((resolve, reject) => {
-            this.sendCliCommand("add-symbol-file " + filepath).then((result) => {
+            // GDB requires a .text load address for add-symbol-file.
+            // Use the caller-supplied address, or auto-detect it from the ELF header.
+            // If neither is available, skip silently — the kernel ELF is already loaded
+            // via file-exec-and-symbols, and a user-space ELF with an unknown address
+            // would only corrupt symbol resolution.
+            const addr = textAddr ?? readElfTextAddr(filepath);
+            if (!addr) {
+                resolve(false);
+                return;
+            }
+            this.sendCliCommand(`add-symbol-file ${filepath} ${addr}`).then((result) => {
                 if (result.resultRecords?.resultClass == "done")
                     resolve(true);
                 else

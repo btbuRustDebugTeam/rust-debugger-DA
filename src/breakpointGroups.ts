@@ -11,10 +11,15 @@ export type FunctionString = string;
 export interface IDebuggerBackend {
 	clearBreakPoints(source?: string): Promise<any>;
 	addBreakPoint(breakpoint: Breakpoint): Promise<[boolean, Breakpoint]>;
-	addSymbolFile(filepath: string): Promise<any>;
+	// textAddr: optional load address for the .text section (required by GDB for user-space ELFs)
+	addSymbolFile(filepath: string, textAddr?: string): Promise<any>;
 	removeSymbolFile(filepath: string): Promise<any>;
 	continue(reverse?: boolean): Promise<boolean>;
 }
+
+// Entry returned by breakpointGroupNameToDebugFilePaths.
+// Accepts either a plain path string (backward compat) or an object with an optional textAddr.
+export type SymbolFileEntry = string | { path: string; textAddr?: string };
 
 export interface IBreakpointGroupsSession {
 	miDebugger: IDebuggerBackend;
@@ -181,12 +186,15 @@ export class BreakpointGroups {
 
 		// 2. Unload old symbol files, load new symbol files — must complete before
 		//    re-inserting breakpoints so GDB can resolve source locations correctly.
-		const oldSymbolFiles: string[] = eval(this.session.breakpointGroupNameToDebugFilePaths)(this.groups[oldIndex].name);
-		const newSymbolFiles: string[] = eval(this.session.breakpointGroupNameToDebugFilePaths)(this.groups[newIndex].name);
+		const oldSymbolFiles: SymbolFileEntry[] = eval(this.session.breakpointGroupNameToDebugFilePaths)(this.groups[oldIndex].name);
+		const newSymbolFiles: SymbolFileEntry[] = eval(this.session.breakpointGroupNameToDebugFilePaths)(this.groups[newIndex].name);
+
+		const toPath = (e: SymbolFileEntry) => typeof e === 'string' ? e : e.path;
+		const toTextAddr = (e: SymbolFileEntry) => typeof e === 'string' ? undefined : e.textAddr;
 
 		Promise.all(clearOldPromises)
-			.then(() => Promise.all(oldSymbolFiles.map(f => this.session.miDebugger.removeSymbolFile(f).catch(() => {}))))
-			.then(() => Promise.all(newSymbolFiles.map(f => this.session.miDebugger.addSymbolFile(f).catch(() => {}))))
+			.then(() => Promise.all(oldSymbolFiles.map(f => this.session.miDebugger.removeSymbolFile(toPath(f)).catch(() => {}))))
+			.then(() => Promise.all(newSymbolFiles.map(f => this.session.miDebugger.addSymbolFile(toPath(f), toTextAddr(f)).catch(() => {}))))
 			.then(() => {
 				// 3. Re-insert new group's breakpoints
 				const breakpointPromises = this.groups[newIndex].setBreakpointsArguments.map((args) => {
@@ -263,6 +271,15 @@ export class BreakpointGroups {
 
 	public getAllBreakpointGroups(): readonly BreakpointGroup[] {
 		return this.groups;
+	}
+
+	/** Returns true if the named group has at least one user-set breakpoint. */
+	public groupHasBreakpoints(groupName: string): boolean {
+		const group = this.getBreakpointGroupByName(groupName);
+		if (!group) return false;
+		return group.setBreakpointsArguments.some(
+			args => (args.breakpoints ?? []).length > 0
+		);
 	}
 
 	// save breakpoint information into a breakpoint group, but NOT let GDB set those breakpoints yet

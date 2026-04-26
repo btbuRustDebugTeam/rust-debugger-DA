@@ -46,13 +46,17 @@ exports.OSStateMachine = {
                     target: OSStates.kernel,
                     actions: [
                         { type: DebuggerActions.try_get_next_breakpoint_group_name }, // if got, save it to a variable. if not, stay the same. initial is "initproc"
-                        { type: DebuggerActions.check_if_kernel_to_user_border_yet }, // if yes, event `AT_KERNEL_TO_USER_BORDER` happens
+                        { type: DebuggerActions.check_if_kernel_to_user_border_yet }, // no-op now; border detection happens in breakpoint event handler
                     ]
                 },
+                // On RISC-V, GDB cannot single-step across sret (the hardware step flag is
+                // lost on privilege-level change). Skip the single-step phase entirely:
+                // switch the breakpoint group immediately and continue — the user-space
+                // breakpoints will catch the inferior when it lands in user code.
                 [OSEvents.AT_KERNEL_TO_USER_BORDER]: {
-                    target: OSStates.kernel_single_step_to_user,
+                    target: OSStates.user,
                     actions: [
-                        { type: DebuggerActions.start_consecutive_single_steps }
+                        { type: DebuggerActions.low_level_switch_breakpoint_group_to_high_level }
                     ]
                 }
             }
@@ -81,13 +85,15 @@ exports.OSStateMachine = {
                 [OSEvents.STOPPED]: {
                     target: OSStates.user,
                     actions: [
-                        { type: DebuggerActions.check_if_user_to_kernel_border_yet }, // if yes, event `AT_USER_TO_KERNEL_BORDER` happens
+                        { type: DebuggerActions.check_if_user_to_kernel_border_yet }, // no-op now; border detection happens in breakpoint event handler
                     ]
                 },
+                // Same rationale as kernel→user: skip single-step across ecall/sret,
+                // switch group immediately and continue.
                 [OSEvents.AT_USER_TO_KERNEL_BORDER]: {
-                    target: OSStates.user_single_step_to_kernel,
+                    target: OSStates.kernel,
                     actions: [
-                        { type: DebuggerActions.start_consecutive_single_steps } // no need to `get_next_breakpoint_group_name` because the breakpoint group is already set when kernel changed to user breakpoint group
+                        { type: DebuggerActions.high_level_switch_breakpoint_group_to_low_level }
                     ]
                 }
             }

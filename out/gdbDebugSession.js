@@ -60,6 +60,10 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
         this.gdbBkptToDap = new Map();
         this.nextDapBreakpointId = 1;
         this.functionBreakpointNumbers = [];
+        // Maps "filePath:line" → DAP breakpoint id for breakpoints that are pending
+        // (not set in GDB yet because they belong to an inactive breakpoint group).
+        // Used by onBreakpointsRestored to send BreakpointEvent with the original id.
+        this.pendingDapIds = new Map();
         // Variable / scope state
         this.nextVarRef = 1;
         this.varRefMap = new Map();
@@ -71,6 +75,10 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
         this.kernelMemoryRanges = [];
         this.userMemoryRanges = [];
         this.programCounterId = 32; // RISC-V PC register id
+        this.osTransitionInFlight = false; // re-entry guard for osStateTransition
+        // GDB breakpoint numbers that are border breakpoints (kernel↔user boundary).
+        // Populated after GDB connects; checked synchronously in the breakpoint event handler.
+        this.borderGdbNumbers = new Set();
         this.pythonPath = opts.pythonPath;
         this.tempDir = opts.tempDir;
         this.logPath = path.join(opts.tempDir, 'ardb.log');
@@ -147,6 +155,36 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
             breakpointGroupNameToDebugFilePaths: groupNameToFilePaths,
             showInformationMessage(msg) {
                 self.sendEvent({ event: 'showInformationMessage', type: 'event', body: msg, seq: 0 });
+            },
+            onBreakpointsRestored(results) {
+                // After a breakpoint group switch, GDB has re-inserted the new group's
+                // breakpoints under new GDB numbers.  We need to:
+                //   1. Register each new GDB number in gdbBkptToDap
+                //   2. Send BreakpointEvent('changed', verified=true) with the ORIGINAL DAP id
+                //      that VS Code assigned when the breakpoint was first set (stored in
+                //      pendingDapIds). Using the original id is what makes VS Code turn the
+                //      dot from grey/unverified to green.
+                for (const [ok, brk] of results) {
+                    if (!ok || !brk)
+                        continue;
+                    const gdbNumber = brk.id ?? 0;
+                    const line = brk.line ?? 0;
+                    const file = brk.file ?? '';
+                    // Look up the original DAP id assigned when this breakpoint was pending.
+                    const pendingKey = `${file}:${line}`;
+                    const existingDapId = self.pendingDapIds.get(pendingKey);
+                    const dapId = existingDapId ?? self.nextDapBreakpointId++;
+                    if (existingDapId !== undefined) {
+                        self.pendingDapIds.delete(pendingKey);
+                    }
+                    self.gdbBkptToDap.set(gdbNumber, { id: dapId, line, verified: true });
+                    const dbp = new debugadapter_1.Breakpoint(true, line);
+                    dbp.setId(dapId);
+                    if (file) {
+                        dbp.source = new debugadapter_1.Source(path.basename(file), file);
+                    }
+                    self.sendEvent(new debugadapter_1.BreakpointEvent('changed', dbp));
+                }
             },
         };
         this.breakpointGroups = new breakpointGroups_1.BreakpointGroups(firstGroup, bpgSession, secondGroup);
@@ -240,8 +278,12 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
             // The breakpoints will be set for real when the group switches.
             if (!belongsToCurrent) {
                 const dapBreakpoints = requestedLines.map(bp => {
+                    const dapId = this.nextDapBreakpointId++;
+                    // Remember this id so onBreakpointsRestored can use it to send
+                    // BreakpointEvent('changed') with the same id, making VS Code turn it green.
+                    this.pendingDapIds.set(`${filePath}:${bp.line}`, dapId);
                     const dbp = new debugadapter_1.Breakpoint(false, bp.line);
-                    dbp.setId(this.nextDapBreakpointId++);
+                    dbp.setId(dapId);
                     dbp.source = new debugadapter_1.Source(source.name || '', filePath);
                     dbp.message = 'Pending: will be set when this breakpoint group becomes active';
                     return dbp;
@@ -912,6 +954,34 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
                 // Attach mode: GDB connected to remote — OS debug is now active
                 this.osDebugReady = true;
                 this.inferiorStarted = true;
+                // Insert border breakpoints into GDB and record their numbers.
+                // These are used to detect kernel↔user boundary crossings synchronously
+                // in the breakpoint event handler, without needing async getStack() calls.
+                // Deduplicate by filepath:line — the same border may appear in multiple
+                // groups (e.g. syscall.rs is a border for every user-process group).
+                if (this.breakpointGroups) {
+                    const insertedBorders = new Set();
+                    for (const group of this.breakpointGroups.getAllBreakpointGroups()) {
+                        for (const border of (group.borders ?? [])) {
+                            const key = `${border.filepath}:${border.line}`;
+                            if (insertedBorders.has(key))
+                                continue;
+                            insertedBorders.add(key);
+                            this.miDebugger.addBreakPoint({
+                                file: border.filepath,
+                                line: border.line,
+                                condition: '',
+                            }).then(([ok, brk]) => {
+                                if (ok && brk.id !== undefined) {
+                                    this.borderGdbNumbers.add(brk.id);
+                                    console.log(`[ardb] border breakpoint inserted: gdb#${brk.id} at ${border.filepath}:${border.line}`);
+                                }
+                            }).catch(err => {
+                                console.error('[ardb] failed to insert border breakpoint:', err);
+                            });
+                        }
+                    }
+                }
             }
             // Tell VS Code "we're ready" — it will re-issue all setBreakPointsRequest calls,
             // which will now reach GDB correctly. This is the same pattern as code-debug.
@@ -921,9 +991,36 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
             const threadId = this.getThreadId(node);
             this.recentStopThreadId = threadId;
             if (this.osDebugReady) {
-                // In OS debug mode, the state machine decides whether to stop or continue.
-                // Don't send StoppedEvent here — osStateTransition may call continue() instead.
-                this.osStateTransition(new OSStateMachine_1.OSEvent(OSStateMachine_1.OSEvents.STOPPED));
+                const bkptno = parseInt(node.record('bkptno') || '0');
+                if (this.borderGdbNumbers.has(bkptno)) {
+                    // Hit a border breakpoint — dispatch the appropriate border event
+                    // directly based on current state, no async getStack needed.
+                    const isBorderKernelToUser = this.osState.status === OSStateMachine_1.OSStates.kernel ||
+                        this.osState.status === OSStateMachine_1.OSStates.kernel_single_step_to_user;
+                    const borderEvent = isBorderKernelToUser
+                        ? OSStateMachine_1.OSEvents.AT_KERNEL_TO_USER_BORDER
+                        : OSStateMachine_1.OSEvents.AT_USER_TO_KERNEL_BORDER;
+                    // Only switch groups if the target group actually has user breakpoints.
+                    // If not, silently continue — no need to stop or switch symbol files.
+                    const targetGroup = isBorderKernelToUser
+                        ? this.breakpointGroups?.getNextBreakpointGroup()
+                        : 'kernel';
+                    const targetHasBreakpoints = targetGroup
+                        ? (this.breakpointGroups?.groupHasBreakpoints(targetGroup) ?? false)
+                        : false;
+                    if (targetHasBreakpoints) {
+                        this.osStateTransition(new OSStateMachine_1.OSEvent(borderEvent));
+                    }
+                    else {
+                        this.miDebugger.continue().catch(err => {
+                            console.error('[ardb] border skip continue failed:', err);
+                        });
+                    }
+                }
+                else {
+                    // Regular breakpoint — let the state machine decide via STOPPED
+                    this.osStateTransition(new OSStateMachine_1.OSEvent(OSStateMachine_1.OSEvents.STOPPED));
+                }
             }
             else {
                 this.handleBreakpointHit(node);
@@ -1016,8 +1113,17 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     /**
      * Feed an OS event into the state machine and execute all resulting actions.
      * Called from stop event handlers when osDebugReady is true.
+     *
+     * The in-flight guard stays raised until the action has either:
+     *   - dispatched a GDB command that will produce a new STOPPED event (step, continue), or
+     *   - called osStateTransition again synchronously (AT_* events from async callbacks).
+     * This prevents a burst of STOPPED events during single-stepping from double-firing
+     * a group switch or sending duplicate notifications.
      */
     osStateTransition(event) {
+        if (this.osTransitionInFlight)
+            return;
+        this.osTransitionInFlight = true;
         const [nextState, actions] = (0, OSStateMachine_1.stateTransition)(OSStateMachine_1.OSStateMachine, this.osState, event);
         this.osState = nextState;
         // Actions that cause automatic continuation — don't send StoppedEvent in these cases
@@ -1031,11 +1137,21 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
             this.doAction(action);
         }
         // If the state machine doesn't intend to auto-continue, surface the stop to the UI
+        // and release the lock — the user will manually continue.
         if (!willAutorun) {
+            this.osTransitionInFlight = false;
             const event2 = new debugadapter_1.StoppedEvent('breakpoint', this.recentStopThreadId);
             event2.body.allThreadsStopped = true;
             this.sendEvent(event2);
         }
+        // If willAutorun: lock stays raised. It will be released by releaseOsTransitionLock()
+        // which is called from doAction's async callbacks just before issuing the next
+        // GDB command (stepInstruction / continue), so the next STOPPED event that arrives
+        // will find the lock free and be processed normally.
+    }
+    /** Release the OS transition in-flight guard. Called by doAction async paths. */
+    releaseOsTransitionLock() {
+        this.osTransitionInFlight = false;
     }
     /**
      * Execute a single DebuggerAction.  All async paths are fire-and-forget
@@ -1052,14 +1168,17 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
                 this.miDebugger.getSomeRegisterValues([this.programCounterId]).then(regs => {
                     const pc = (0, addrSpace_1.parseAddr)(regs[0]?.value ?? '');
                     if (pc !== undefined && (0, addrSpace_1.isKernelAddr)(pc, this.kernelMemoryRanges)) {
+                        this.releaseOsTransitionLock();
                         this.osStateTransition(new OSStateMachine_1.OSEvent(OSStateMachine_1.OSEvents.AT_KERNEL));
                     }
                     else {
                         // still in user space — keep stepping
+                        this.releaseOsTransitionLock();
                         this.miDebugger.stepInstruction();
                     }
                 }).catch(err => {
                     console.error('[ardb] check_if_kernel_yet failed:', err);
+                    this.releaseOsTransitionLock();
                 });
                 break;
             }
@@ -1070,67 +1189,35 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
                 this.miDebugger.getSomeRegisterValues([this.programCounterId]).then(regs => {
                     const pc = (0, addrSpace_1.parseAddr)(regs[0]?.value ?? '');
                     if (pc !== undefined && (0, addrSpace_1.isUserAddr)(pc, this.userMemoryRanges)) {
+                        this.releaseOsTransitionLock();
                         this.osStateTransition(new OSStateMachine_1.OSEvent(OSStateMachine_1.OSEvents.AT_USER));
                     }
                     else {
                         // still in kernel — keep stepping
+                        this.releaseOsTransitionLock();
                         this.miDebugger.stepInstruction();
                     }
                 }).catch(err => {
                     console.error('[ardb] check_if_user_yet failed:', err);
+                    this.releaseOsTransitionLock();
                 });
                 break;
             }
             // ------------------------------------------------------------------
-            // check_if_kernel_to_user_border_yet: are we at a border BP in kernel→user direction?
+            // check_if_kernel_to_user_border_yet / check_if_user_to_kernel_border_yet:
+            // Border detection is now done synchronously in the breakpoint event handler
+            // by checking borderGdbNumbers. These actions are no-ops — just release the lock.
             // ------------------------------------------------------------------
-            case OSStateMachine_1.DebuggerActions.check_if_kernel_to_user_border_yet: {
-                this.miDebugger.getStack(0, 1, this.recentStopThreadId).then(stack => {
-                    if (stack.length === 0)
-                        return;
-                    const topFrame = stack[0];
-                    const currentGroup = this.breakpointGroups?.getCurrentBreakpointGroup();
-                    if (!currentGroup?.borders)
-                        return;
-                    for (const border of currentGroup.borders) {
-                        if (topFrame.file && path.normalize(topFrame.file) === path.normalize(border.filepath)
-                            && topFrame.line === border.line) {
-                            this.osStateTransition(new OSStateMachine_1.OSEvent(OSStateMachine_1.OSEvents.AT_KERNEL_TO_USER_BORDER));
-                            return;
-                        }
-                    }
-                }).catch(err => {
-                    console.error('[ardb] check_if_kernel_to_user_border_yet failed:', err);
-                });
-                break;
-            }
-            // ------------------------------------------------------------------
-            // check_if_user_to_kernel_border_yet: are we at a border BP in user→kernel direction?
-            // ------------------------------------------------------------------
+            case OSStateMachine_1.DebuggerActions.check_if_kernel_to_user_border_yet:
             case OSStateMachine_1.DebuggerActions.check_if_user_to_kernel_border_yet: {
-                this.miDebugger.getStack(0, 1, this.recentStopThreadId).then(stack => {
-                    if (stack.length === 0)
-                        return;
-                    const topFrame = stack[0];
-                    const currentGroup = this.breakpointGroups?.getCurrentBreakpointGroup();
-                    if (!currentGroup?.borders)
-                        return;
-                    for (const border of currentGroup.borders) {
-                        if (topFrame.file && path.normalize(topFrame.file) === path.normalize(border.filepath)
-                            && topFrame.line === border.line) {
-                            this.osStateTransition(new OSStateMachine_1.OSEvent(OSStateMachine_1.OSEvents.AT_USER_TO_KERNEL_BORDER));
-                            return;
-                        }
-                    }
-                }).catch(err => {
-                    console.error('[ardb] check_if_user_to_kernel_border_yet failed:', err);
-                });
+                this.releaseOsTransitionLock();
                 break;
             }
             // ------------------------------------------------------------------
             // start_consecutive_single_steps: step one instruction (more will follow via STOPPED)
             // ------------------------------------------------------------------
             case OSStateMachine_1.DebuggerActions.start_consecutive_single_steps: {
+                this.releaseOsTransitionLock();
                 this.miDebugger.stepInstruction().catch(err => {
                     console.error('[ardb] stepInstruction failed:', err);
                 });
@@ -1172,6 +1259,9 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
                             return;
                         }
                     }
+                    // try_get_next_breakpoint_group_name does not call osStateTransition —
+                    // it runs alongside check_if_*_border_yet in the same STOPPED dispatch.
+                    // The lock is released by the border check's callback, not here.
                 }).catch(err => {
                     console.error('[ardb] try_get_next_breakpoint_group_name failed:', err);
                 });
@@ -1182,11 +1272,14 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
             //   kernel → user: switch to the previously determined user process group
             // ------------------------------------------------------------------
             case OSStateMachine_1.DebuggerActions.low_level_switch_breakpoint_group_to_high_level: {
-                if (!this.breakpointGroups)
+                if (!this.breakpointGroups) {
+                    this.releaseOsTransitionLock();
                     break;
+                }
                 const nextGroup = this.breakpointGroups.getNextBreakpointGroup();
                 // After switching to user, the "next" group becomes kernel (default fallback)
                 const kernelGroup = this.breakpointGroups.getCurrentBreakpointGroupName();
+                this.releaseOsTransitionLock();
                 this.breakpointGroups.updateCurrentBreakpointGroup(nextGroup, /* continueAfterUpdate */ true);
                 this.breakpointGroups.setNextBreakpointGroup(kernelGroup);
                 break;
@@ -1196,16 +1289,20 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
             //   user → kernel: switch back to kernel breakpoint group
             // ------------------------------------------------------------------
             case OSStateMachine_1.DebuggerActions.high_level_switch_breakpoint_group_to_low_level: {
-                if (!this.breakpointGroups)
+                if (!this.breakpointGroups) {
+                    this.releaseOsTransitionLock();
                     break;
+                }
                 const nextGroup = this.breakpointGroups.getNextBreakpointGroup();
                 // After switching to kernel, default next group is the user process we just left
                 const userGroup = this.breakpointGroups.getCurrentBreakpointGroupName();
+                this.releaseOsTransitionLock();
                 this.breakpointGroups.updateCurrentBreakpointGroup(nextGroup, /* continueAfterUpdate */ true);
                 this.breakpointGroups.setNextBreakpointGroup(userGroup);
                 break;
             }
             default:
+                this.releaseOsTransitionLock();
                 console.warn('[ardb] unknown action type:', action.type);
         }
     }

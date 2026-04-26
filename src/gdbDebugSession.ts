@@ -142,6 +142,10 @@ export class GDBDebugSession extends DebugSession {
     private gdbBkptToDap: Map<number, { id: number; line: number; verified: boolean }> = new Map();
     private nextDapBreakpointId = 1;
     private functionBreakpointNumbers: number[] = [];
+    // Maps "filePath:line" → DAP breakpoint id for breakpoints that are pending
+    // (not set in GDB yet because they belong to an inactive breakpoint group).
+    // Used by onBreakpointsRestored to send BreakpointEvent with the original id.
+    private pendingDapIds: Map<string, number> = new Map();
 
     // Variable / scope state
     private nextVarRef = 1;
@@ -272,19 +276,31 @@ export class GDBDebugSession extends DebugSession {
             onBreakpointsRestored(results: Array<[boolean, import('./backend/backend').Breakpoint]>) {
                 // After a breakpoint group switch, GDB has re-inserted the new group's
                 // breakpoints under new GDB numbers.  We need to:
-                //   1. Register each new GDB number in gdbBkptToDap (with a fresh DAP id)
-                //   2. Send BreakpointEvent('changed') so VS Code turns the dot green.
+                //   1. Register each new GDB number in gdbBkptToDap
+                //   2. Send BreakpointEvent('changed', verified=true) with the ORIGINAL DAP id
+                //      that VS Code assigned when the breakpoint was first set (stored in
+                //      pendingDapIds). Using the original id is what makes VS Code turn the
+                //      dot from grey/unverified to green.
                 for (const [ok, brk] of results) {
                     if (!ok || !brk) continue;
                     const gdbNumber = brk.id ?? 0;
-                    const dapId = self.nextDapBreakpointId++;
                     const line = brk.line ?? 0;
+                    const file = brk.file ?? '';
+
+                    // Look up the original DAP id assigned when this breakpoint was pending.
+                    const pendingKey = `${file}:${line}`;
+                    const existingDapId = self.pendingDapIds.get(pendingKey);
+                    const dapId = existingDapId ?? self.nextDapBreakpointId++;
+                    if (existingDapId !== undefined) {
+                        self.pendingDapIds.delete(pendingKey);
+                    }
+
                     self.gdbBkptToDap.set(gdbNumber, { id: dapId, line, verified: true });
 
                     const dbp = new Breakpoint(true, line);
                     dbp.setId(dapId);
-                    if (brk.file) {
-                        (dbp as any).source = new Source(path.basename(brk.file), brk.file);
+                    if (file) {
+                        (dbp as any).source = new Source(path.basename(file), file);
                     }
                     self.sendEvent(new BreakpointEvent('changed', dbp));
                 }
@@ -405,8 +421,12 @@ export class GDBDebugSession extends DebugSession {
             // The breakpoints will be set for real when the group switches.
             if (!belongsToCurrent) {
                 const dapBreakpoints = requestedLines.map(bp => {
+                    const dapId = this.nextDapBreakpointId++;
+                    // Remember this id so onBreakpointsRestored can use it to send
+                    // BreakpointEvent('changed') with the same id, making VS Code turn it green.
+                    this.pendingDapIds.set(`${filePath}:${bp.line}`, dapId);
                     const dbp = new Breakpoint(false, bp.line);
-                    dbp.setId(this.nextDapBreakpointId++);
+                    dbp.setId(dapId);
                     (dbp as any).source = new Source(source.name || '', filePath);
                     (dbp as any).message = 'Pending: will be set when this breakpoint group becomes active';
                     return dbp;
@@ -1163,9 +1183,15 @@ export class GDBDebugSession extends DebugSession {
                 // Insert border breakpoints into GDB and record their numbers.
                 // These are used to detect kernel↔user boundary crossings synchronously
                 // in the breakpoint event handler, without needing async getStack() calls.
+                // Deduplicate by filepath:line — the same border may appear in multiple
+                // groups (e.g. syscall.rs is a border for every user-process group).
                 if (this.breakpointGroups) {
+                    const insertedBorders = new Set<string>();
                     for (const group of this.breakpointGroups.getAllBreakpointGroups()) {
                         for (const border of (group.borders ?? [])) {
+                            const key = `${border.filepath}:${border.line}`;
+                            if (insertedBorders.has(key)) continue;
+                            insertedBorders.add(key);
                             this.miDebugger!.addBreakPoint({
                                 file: border.filepath,
                                 line: border.line,
@@ -1201,7 +1227,23 @@ export class GDBDebugSession extends DebugSession {
                     const borderEvent = isBorderKernelToUser
                         ? OSEvents.AT_KERNEL_TO_USER_BORDER
                         : OSEvents.AT_USER_TO_KERNEL_BORDER;
-                    this.osStateTransition(new OSEvent(borderEvent));
+
+                    // Only switch groups if the target group actually has user breakpoints.
+                    // If not, silently continue — no need to stop or switch symbol files.
+                    const targetGroup = isBorderKernelToUser
+                        ? this.breakpointGroups?.getNextBreakpointGroup()
+                        : 'kernel';
+                    const targetHasBreakpoints = targetGroup
+                        ? (this.breakpointGroups?.groupHasBreakpoints(targetGroup) ?? false)
+                        : false;
+
+                    if (targetHasBreakpoints) {
+                        this.osStateTransition(new OSEvent(borderEvent));
+                    } else {
+                        this.miDebugger!.continue().catch(err => {
+                            console.error('[ardb] border skip continue failed:', err);
+                        });
+                    }
                 } else {
                     // Regular breakpoint — let the state machine decide via STOPPED
                     this.osStateTransition(new OSEvent(OSEvents.STOPPED));
