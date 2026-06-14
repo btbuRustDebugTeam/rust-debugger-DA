@@ -1,5 +1,6 @@
 # ignore all target dirs anywhere
 target/
+/out
 
 # ignore all python cache folders
 __pycache__/
@@ -10,10 +11,3 @@ __pycache__/
 # ignore temp folder
 /temp
 
-# Hugo build output
-website/public/
-website/.hugo_build.lock
-.claude/
-docs/
-/out
-CLAUDE.md
