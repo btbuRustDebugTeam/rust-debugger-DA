@@ -55,7 +55,29 @@ _CO_NEXT_ID = 1
 _CO_BY_KEY = {}        # (poll_sym, this_ptr) -> coro_id
 _CO_META = {}          # coro_id -> (poll_sym, this_ptr)
 _CO_POLL_SEQ = {}      # coro_id -> poll_count
+# Snapshot still uses this coroutine stack to reconstruct the current path.
+# It is intentionally not used by the runtime History Tree.
 _TLS_STACK = {}        # thread_num -> [coro_id, ...]
+
+# Runtime History Tree: cumulative call graph for whitelist-admitted runtime
+# events. Each thread owns an independent dynamic call stack; the graph itself
+# merges repeated calls by function symbol and never removes historical nodes/edges.
+_CALL_GRAPH_NODES = {}
+_CALL_GRAPH_ROOTS = []
+_STABLE_CALL_ROOTS = {}  # node key -> first entry event; never removed by edges
+_CALL_GRAPH_EDGES = set()
+_CALL_GRAPH_EVENTS = []
+_CALL_GRAPH_NEXT_EVENT_ID = 1
+_CALL_GRAPH_MAX_EVENTS = 5000
+# DISPATCH HOOK SOFT DISABLED FOR GRAPH STABILITY - DO NOT REMOVE
+DISPATCH_HOOK_ENABLED = False
+_CALL_STACK = {}       # thread_num -> [{key, func, cid}, ...]
+_RECENT_CALL_ROOT_BY_THREAD = {}  # thread_num -> {key, cid, event_id}
+_RECENT_CALL_ROOT_GLOBAL = None
+_RECENT_CALL_ROOT_MAX_EVENT_GAP = 64
+_RECENT_CALL_PARENT_BY_THREAD = {}  # thread_num -> most recent non-root admitted function
+_RECENT_CALL_PARENT_GLOBAL = None
+_RECENT_CALL_PARENT_MAX_EVENT_GAP = 64
 # parent poll symbol -> last observed direct child poll hit
 _LAST_CHILD_HIT_BY_PARENT = {}
 _LAST_CHILD_HIT_BY_CALLER_FRAME = {}
@@ -102,9 +124,1047 @@ _TRANSITION_CANDIDATE_KEYWORDS = (
     "sret",
 )
 
+_TRANSITION_DRAFT_KEYWORD_PRIORITY = (
+    "user_to_kernel",
+    "kernel_to_user",
+    "syscall",
+    "handle_syscall",
+    "decode_invocation",
+    "decode",
+    "invocation",
+    "async_syscall",
+    "async_syscall_handler",
+    "trap",
+    "entry",
+    "restore",
+    "interrupt",
+    "exception",
+)
+_TRANSITION_DRAFT_CONFIDENCE = ("high", "medium-high")
+_TRANSITION_DRAFT_MAX_PROBES = 20
+
 def _thread_id() -> int:
     t = gdb.selected_thread()
     return t.num if t is not None else 0
+
+
+def _call_graph_now():
+    try:
+        return datetime.now(timezone.utc).isoformat()
+    except Exception:
+        return ""
+
+
+def _json_safe(value):
+    try:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, (list, tuple, set)):
+            return [_json_safe(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): _json_safe(v) for k, v in value.items()}
+        return str(value)
+    except Exception:
+        return "<unserializable>"
+
+
+_DISPATCH_QUEUE_STATE_NAMES = {
+    0: "queue_empty",
+    1: "item_found",
+    2: "decode_error",
+}
+_DISPATCH_BRANCH_NAMES = {
+    0: "queue_empty",
+    1: "Unknown",
+    2: "UntypedRetype",
+    3: "PageTableMap",
+    4: "PageMap",
+    5: "PageUnmap",
+    6: "PageGetAddress",
+    7: "CNode",
+    8: "TCBBindNotification",
+    9: "TCBUnbindNotification",
+    10: "PutChar",
+    11: "PutString",
+    12: "PageTableUnmap",
+}
+_DISPATCH_RAW_LABEL_NONE = (1 << 64) - 1
+
+
+def _is_async_dispatch_observe_symbol(func):
+    return "ardb_async_dispatch_observe" in str(func or "")
+
+
+def _dispatch_queue_state_name(value):
+    return _DISPATCH_QUEUE_STATE_NAMES.get(value, f"queue_state_{value}")
+
+
+def _dispatch_branch_name(value):
+    return _DISPATCH_BRANCH_NAMES.get(value, f"branch_{value}")
+
+
+def _read_async_dispatch_observe_args():
+    """Best-effort RISC-V ABI read for ardb_async_dispatch_observe(a0..a3)."""
+    fields = {
+        "dispatch_observe": True,
+        "dispatch_read_status": "error",
+        "dispatch_read_error": "",
+        "dispatch_queue_state": None,
+        "dispatch_queue_state_name": "unknown",
+        "dispatch_raw_label": None,
+        "dispatch_branch_id": None,
+        "dispatch_branch_name": "unknown",
+        "dispatch_sender": None,
+        # The hook currently passes the kernel handler process_id here because
+        # IPCItem does not carry the original user-side sender id.
+        "dispatch_sender_kind": "process_id",
+    }
+    try:
+        arch = _arch_name_or_empty()
+        if arch and "riscv" not in arch:
+            fields["dispatch_read_status"] = "unsupported_arch"
+            fields["dispatch_read_error"] = arch
+            return fields
+
+        values = []
+        for reg in ("a0", "a1", "a2", "a3"):
+            value = _normalize_addr(gdb.parse_and_eval(f"${reg}"))
+            if value is None:
+                raise ValueError(f"cannot normalize ${reg}")
+            values.append(value)
+
+        queue_state, raw_label, branch_id, sender = values
+        fields.update({
+            "dispatch_read_status": "ok",
+            "dispatch_queue_state": queue_state,
+            "dispatch_queue_state_name": _dispatch_queue_state_name(queue_state),
+            "dispatch_raw_label": raw_label,
+            "dispatch_branch_id": branch_id,
+            "dispatch_branch_name": _dispatch_branch_name(branch_id),
+            "dispatch_sender": sender,
+        })
+        return fields
+    except Exception as e:
+        fields["dispatch_read_error"] = _short_error(e)
+        return fields
+
+
+def _refresh_call_graph_display_label(key, node):
+    try:
+        if node.get("dispatch_observe"):
+            queue_name = node.get("dispatch_queue_state_name", "unknown")
+            branch_name = node.get("dispatch_branch_name", "unknown")
+            raw_label = node.get("dispatch_raw_label")
+            raw_text = "none" if raw_label == _DISPATCH_RAW_LABEL_NONE else str(raw_label)
+            node["displayLabel"] = (
+                f"{key} [dispatch={branch_name} label={raw_text} queue={queue_name}]"
+            )
+        else:
+            latest = "yes" if node.get("active") else "no"
+            node["displayLabel"] = f"{key} [calls={node.get('enter_count', 0)} active={latest}]"
+    except Exception:
+        pass
+
+
+def _record_call_dispatch_observe(func, tid, cid, fields):
+    """Attach dispatch ABI data to the graph node and append a timeline event."""
+    if not DISPATCH_HOOK_ENABLED:
+        return
+    try:
+        key = _call_graph_node_key(func)
+        node = _CALL_GRAPH_NODES.get(key)
+        if node:
+            for field, value in fields.items():
+                node[field] = _json_safe(value)
+            _refresh_call_graph_display_label(key, node)
+        _record_call_event(
+            "call_dispatch_observe",
+            thread_id=tid,
+            cid=cid if cid else None,
+            func=key,
+            parent_func=node.get("parent_func") if node else None,
+            parent_cid=node.get("parent_cid") if node else None,
+            queue_state=fields.get("dispatch_queue_state"),
+            queue_state_name=fields.get("dispatch_queue_state_name"),
+            raw_label=fields.get("dispatch_raw_label"),
+            branch_id=fields.get("dispatch_branch_id"),
+            branch_name=fields.get("dispatch_branch_name"),
+            sender=fields.get("dispatch_sender"),
+            sender_kind=fields.get("dispatch_sender_kind"),
+            read_status=fields.get("dispatch_read_status"),
+            read_error=fields.get("dispatch_read_error"),
+        )
+    except Exception as e:
+        _record_call_event(
+            "call_graph_error",
+            where="_record_call_dispatch_observe",
+            error=_short_error(e),
+        )
+
+
+def _record_call_event(event, **fields):
+    global _CALL_GRAPH_NEXT_EVENT_ID
+    try:
+        rec = {
+            "event_id": _CALL_GRAPH_NEXT_EVENT_ID,
+            "event": str(event),
+            "timestamp": _call_graph_now(),
+        }
+        _CALL_GRAPH_NEXT_EVENT_ID += 1
+        for k, v in fields.items():
+            rec[str(k)] = _json_safe(v)
+        _CALL_GRAPH_EVENTS.append(rec)
+        overflow = len(_CALL_GRAPH_EVENTS) - _CALL_GRAPH_MAX_EVENTS
+        if overflow > 0:
+            del _CALL_GRAPH_EVENTS[:overflow]
+    except Exception:
+        pass
+
+
+def _call_graph_node_key(func):
+    try:
+        value = str(func or "").strip()
+        return value or "<unknown>"
+    except Exception:
+        return "<unknown>"
+
+
+def _mark_stable_call_root(key, first_enter_event=None):
+    """Remember a session entry point independently from later graph edges."""
+    try:
+        if key not in _CALL_GRAPH_NODES:
+            return False
+        node = _CALL_GRAPH_NODES[key]
+        event_id = first_enter_event or node.get("first_enter_event") or _CALL_GRAPH_NEXT_EVENT_ID
+        existing = _STABLE_CALL_ROOTS.get(key)
+        if existing is None or event_id < existing:
+            _STABLE_CALL_ROOTS[key] = event_id
+        if key not in _CALL_GRAPH_ROOTS:
+            _CALL_GRAPH_ROOTS.append(key)
+        return True
+    except Exception as e:
+        _record_call_event("call_graph_error", where="_mark_stable_call_root", error=_short_error(e))
+        return False
+
+
+def _remember_recent_call_root(tid, key, cid=None):
+    global _RECENT_CALL_ROOT_GLOBAL
+    try:
+        if key not in _STABLE_CALL_ROOTS or key not in _CALL_GRAPH_NODES:
+            return
+        record = {
+            "key": key,
+            "cid": cid,
+            "event_id": _CALL_GRAPH_NEXT_EVENT_ID,
+            "func": key,
+            "thread_id": tid,
+        }
+        _RECENT_CALL_ROOT_BY_THREAD[tid] = record
+        _RECENT_CALL_ROOT_GLOBAL = record
+    except Exception as e:
+        _record_call_event("call_graph_error", where="_remember_recent_call_root", error=_short_error(e))
+
+
+def _remember_recent_call_parent(tid, key, cid=None):
+    global _RECENT_CALL_PARENT_GLOBAL
+    try:
+        if key in _STABLE_CALL_ROOTS or key not in _CALL_GRAPH_NODES:
+            return
+        record = {
+            "key": key,
+            "cid": cid,
+            "event_id": _CALL_GRAPH_NEXT_EVENT_ID,
+            "func": key,
+            "thread_id": tid,
+        }
+        _RECENT_CALL_PARENT_BY_THREAD[tid] = record
+        _RECENT_CALL_PARENT_GLOBAL = record
+    except Exception as e:
+        _record_call_event("call_graph_error", where="_remember_recent_call_parent", error=_short_error(e))
+
+
+def _recent_parent_candidates(tid, child_key):
+    """Return ordered, validated fallback parent candidates for an empty call stack."""
+    try:
+        if child_key in _STABLE_CALL_ROOTS:
+            return []
+
+        candidates = []
+        seen = set()
+
+        def add_candidate(source, record, order, require_stable, max_gap):
+            if not record:
+                return
+            key = record.get("key")
+            if not key or key == child_key or key in seen:
+                return
+            if key not in _CALL_GRAPH_NODES:
+                return
+            is_stable = key in _STABLE_CALL_ROOTS
+            if is_stable != require_stable:
+                return
+            event_id = int(record.get("event_id") or 0)
+            event_gap = _CALL_GRAPH_NEXT_EVENT_ID - event_id if event_id else 0
+            if event_id and event_gap > max_gap:
+                return
+            seen.add(key)
+            candidates.append({
+                "key": key,
+                "cid": record.get("cid"),
+                "source": source,
+                "order": order,
+                "func": record.get("func") or key,
+                "thread_id": record.get("thread_id"),
+                "event_gap": event_gap,
+            })
+
+        add_candidate(
+            "recent_parent_thread",
+            _RECENT_CALL_PARENT_BY_THREAD.get(tid),
+            1,
+            False,
+            _RECENT_CALL_PARENT_MAX_EVENT_GAP,
+        )
+        add_candidate(
+            "recent_parent_global",
+            _RECENT_CALL_PARENT_GLOBAL,
+            2,
+            False,
+            _RECENT_CALL_PARENT_MAX_EVENT_GAP,
+        )
+
+        stable_keys = [key for key in _STABLE_CALL_ROOTS if key in _CALL_GRAPH_NODES]
+        if len(stable_keys) == 1:
+            stable_key = stable_keys[0]
+            root_thread = _RECENT_CALL_ROOT_BY_THREAD.get(tid)
+            if root_thread and root_thread.get("key") != stable_key:
+                root_thread = None
+            root_global = _RECENT_CALL_ROOT_GLOBAL
+            if root_global and root_global.get("key") != stable_key:
+                root_global = None
+            add_candidate(
+                "recent_root_thread",
+                root_thread,
+                3,
+                True,
+                _RECENT_CALL_ROOT_MAX_EVENT_GAP,
+            )
+            add_candidate(
+                "recent_root_global",
+                root_global,
+                4,
+                True,
+                _RECENT_CALL_ROOT_MAX_EVENT_GAP,
+            )
+        return candidates
+    except Exception as e:
+        _record_call_event("call_graph_error", where="_recent_parent_candidates", error=_short_error(e))
+        return []
+
+
+def _ensure_call_graph_node(func, cid=None, **meta):
+    try:
+        key = _call_graph_node_key(func)
+        node = _CALL_GRAPH_NODES.get(key)
+        if node is None:
+            node = {
+                "type": "async",
+                "cid": cid if cid else None,
+                "func": key,
+                "displayLabel": key,
+                "addr": meta.get("addr", ""),
+                "state": meta.get("state", "N/A"),
+                "origin": meta.get("origin", "runtime-call-graph"),
+                "historyKind": "call-graph",
+                "thread_id": meta.get("thread_id"),
+                # Parent metadata is only written after an edge is accepted.
+                "parent_cid": None,
+                "enter_count": 0,
+                "exit_count": 0,
+                "active_count": 0,
+                "active": False,
+                "first_enter_event": None,
+                "last_enter_event": None,
+                "last_exit_event": None,
+                "children": [],
+            }
+            _CALL_GRAPH_NODES[key] = node
+        for field in (
+            "addr", "state", "state_read_status", "state_read_error",
+            "origin", "privilege", "transition_event", "thread_id",
+            "depth", "depth_before", "depth_after", "parent_func",
+            "matched_top", "error", "last_seen",
+            "semantic_kind", "node_kind", "edge_kind",
+            "admission_action", "admission_reason",
+            "dispatch_observe", "dispatch_queue_state",
+            "dispatch_queue_state_name", "dispatch_raw_label",
+            "dispatch_branch_id", "dispatch_branch_name", "dispatch_sender",
+            "dispatch_sender_kind", "dispatch_read_status",
+            "dispatch_read_error",
+        ):
+            if field in meta:
+                node[field] = _json_safe(meta.get(field))
+        if cid:
+            node["cid"] = cid
+        _refresh_call_graph_display_label(key, node)
+        return key, node
+    except Exception as e:
+        _record_call_event("call_graph_error", where="_ensure_call_graph_node", error=_short_error(e))
+        return None, None
+
+
+def _call_graph_has_path(start_key, target_key):
+    try:
+        if start_key == target_key:
+            return True
+        visited = set()
+        stack = [start_key]
+        while stack:
+            key = stack.pop()
+            if key in visited:
+                continue
+            visited.add(key)
+            node = _CALL_GRAPH_NODES.get(key)
+            children = list(node.get("children", [])) if node else []
+            children.extend(child for parent, child in _CALL_GRAPH_EDGES if parent == key)
+            for child_key in children:
+                if child_key == target_key:
+                    return True
+                if child_key not in visited:
+                    stack.append(child_key)
+        return False
+    except Exception as e:
+        _record_call_event("call_graph_error", where="_call_graph_has_path", error=_short_error(e))
+        return False
+
+
+def _call_graph_find_parents(child_key):
+    """Return every currently recorded parent for a call graph node."""
+    try:
+        parents = set()
+        for parent_key, edge_child_key in _CALL_GRAPH_EDGES:
+            if edge_child_key == child_key and parent_key in _CALL_GRAPH_NODES:
+                parents.add(parent_key)
+        # Keep the graph repair tolerant of a stale children list from an older
+        # session or an interrupted edge update.
+        for parent_key, node in _CALL_GRAPH_NODES.items():
+            if child_key in node.get("children", []):
+                parents.add(parent_key)
+        return sorted(
+            parents,
+            key=lambda key: (
+                _CALL_GRAPH_NODES.get(key, {}).get("first_enter_event") or 0,
+                key,
+            ),
+        )
+    except Exception as e:
+        _record_call_event("call_graph_error", where="_call_graph_find_parents", error=_short_error(e))
+        return []
+
+
+def _call_graph_remove_edge(parent_key, child_key, reason="", **meta):
+    """Remove one historical edge when a more precise parent supersedes it."""
+    try:
+        edge = (parent_key, child_key)
+        parent = _CALL_GRAPH_NODES.get(parent_key)
+        had_edge = edge in _CALL_GRAPH_EDGES
+        had_child = bool(parent and child_key in parent.get("children", []))
+        if not had_edge and not had_child:
+            return False
+
+        _CALL_GRAPH_EDGES.discard(edge)
+        if parent:
+            parent["children"] = [
+                key for key in parent.get("children", []) if key != child_key
+            ]
+
+        child = _CALL_GRAPH_NODES.get(child_key)
+        if child and child.get("parent_func") == parent_key and not _call_graph_find_parents(child_key):
+            child["parent_func"] = None
+            child["parent_cid"] = None
+
+        _record_call_event(
+            "call_edge_removed",
+            reason=reason or "edge_removed",
+            parent_key=parent_key,
+            child_key=child_key,
+            new_parent_key=meta.get("new_parent_key"),
+            parent_source=meta.get("parent_source", "call_stack"),
+            candidate_order=meta.get("candidate_order"),
+            candidate_func=meta.get("candidate_func"),
+            candidate_thread_id=meta.get("candidate_thread_id"),
+            event_gap=meta.get("event_gap"),
+        )
+        return True
+    except Exception as e:
+        _record_call_event("call_graph_error", where="_call_graph_remove_edge", error=_short_error(e))
+        return False
+
+
+def _record_call_edge(parent_key, child_key, parent_cid=None, child_cid=None, **meta):
+    try:
+        if child_key not in _CALL_GRAPH_NODES:
+            return "missing_child"
+        if not parent_key or parent_key not in _CALL_GRAPH_NODES:
+            _mark_stable_call_root(child_key)
+            return "root"
+        if parent_key == child_key:
+            _record_call_event(
+                "call_edge_skipped",
+                reason="self_edge",
+                parent_cid=parent_cid,
+                child_cid=child_cid,
+                parent_key=parent_key,
+                child_key=child_key,
+                parent_source=meta.get("parent_source", "call_stack"),
+                candidate_order=meta.get("candidate_order"),
+                candidate_func=meta.get("candidate_func", parent_key),
+                candidate_thread_id=meta.get("candidate_thread_id"),
+                event_gap=meta.get("event_gap"),
+            )
+            return "self_edge"
+        if _call_graph_has_path(child_key, parent_key):
+            _record_call_event(
+                "call_edge_skipped",
+                reason="would_form_cycle",
+                parent_cid=parent_cid,
+                child_cid=child_cid,
+                parent_key=parent_key,
+                child_key=child_key,
+                parent_source=meta.get("parent_source", "call_stack"),
+                candidate_order=meta.get("candidate_order"),
+                candidate_func=meta.get("candidate_func", parent_key),
+                candidate_thread_id=meta.get("candidate_thread_id"),
+                event_gap=meta.get("event_gap"),
+            )
+            return "would_form_cycle"
+        if child_key in _STABLE_CALL_ROOTS and parent_key not in _STABLE_CALL_ROOTS:
+            child_first = _CALL_GRAPH_NODES[child_key].get("first_enter_event") or _CALL_GRAPH_NODES[child_key].get("last_enter_event") or 0
+            parent_first = _CALL_GRAPH_NODES[parent_key].get("first_enter_event") or _CALL_GRAPH_NODES[parent_key].get("last_enter_event") or 0
+            if child_first and parent_first and child_first <= parent_first:
+                _record_call_event(
+                    "call_edge_skipped",
+                    reason="root_parent_protected",
+                    parent_cid=parent_cid,
+                    child_cid=child_cid,
+                    parent_key=parent_key,
+                    child_key=child_key,
+                    parent_source=meta.get("parent_source", "call_stack"),
+                    candidate_order=meta.get("candidate_order"),
+                    candidate_func=meta.get("candidate_func", parent_key),
+                    candidate_thread_id=meta.get("candidate_thread_id"),
+                    event_gap=meta.get("event_gap"),
+                )
+                return "root_parent_protected"
+
+        existing_parents = [
+            key for key in _call_graph_find_parents(child_key) if key != parent_key
+        ]
+        coarse_parents = []
+        for old_parent_key in existing_parents:
+            if _call_graph_has_path(old_parent_key, parent_key):
+                # old_parent -> ... -> parent -> child is less precise than the
+                # newly observed parent -> child edge.
+                coarse_parents.append(old_parent_key)
+                continue
+            if _call_graph_has_path(parent_key, old_parent_key):
+                _record_call_event(
+                    "call_edge_skipped",
+                    reason="less_precise_parent_existing",
+                    parent_cid=parent_cid,
+                    child_cid=child_cid,
+                    parent_key=parent_key,
+                    child_key=child_key,
+                    existing_parent_key=old_parent_key,
+                    parent_source=meta.get("parent_source", "call_stack"),
+                    candidate_order=meta.get("candidate_order"),
+                    candidate_func=meta.get("candidate_func", parent_key),
+                    candidate_thread_id=meta.get("candidate_thread_id"),
+                    event_gap=meta.get("event_gap"),
+                )
+                return "less_precise_parent_existing"
+            # A call graph node is rendered under one best-known parent. When
+            # neither relation proves that the new parent is more precise,
+            # retain the existing edge rather than inventing a duplicate path.
+            _record_call_event(
+                "call_edge_skipped",
+                reason="unrelated_parent_existing",
+                parent_cid=parent_cid,
+                child_cid=child_cid,
+                parent_key=parent_key,
+                child_key=child_key,
+                existing_parent_key=old_parent_key,
+                parent_source=meta.get("parent_source", "call_stack"),
+                candidate_order=meta.get("candidate_order"),
+                candidate_func=meta.get("candidate_func", parent_key),
+                candidate_thread_id=meta.get("candidate_thread_id"),
+                event_gap=meta.get("event_gap"),
+            )
+            return "unrelated_parent_existing"
+
+        for old_parent_key in coarse_parents:
+            _call_graph_remove_edge(
+                old_parent_key,
+                child_key,
+                reason="reparent_to_more_precise_parent",
+                new_parent_key=parent_key,
+                **meta,
+            )
+
+        edge = (parent_key, child_key)
+        if edge not in _CALL_GRAPH_EDGES:
+            _CALL_GRAPH_EDGES.add(edge)
+            children = _CALL_GRAPH_NODES[parent_key].setdefault("children", [])
+            if child_key not in children:
+                children.append(child_key)
+        if child_key not in _STABLE_CALL_ROOTS:
+            child = _CALL_GRAPH_NODES[child_key]
+            child["parent_cid"] = parent_cid
+            child["parent_func"] = parent_key
+        # Stable roots remain stable even if a later observation has a parent.
+        _record_call_event(
+            "call_edge_accepted",
+            parent_key=parent_key,
+            child_key=child_key,
+            parent_cid=parent_cid,
+            child_cid=child_cid,
+            parent_source=meta.get("parent_source", "call_stack"),
+            candidate_order=meta.get("candidate_order"),
+            candidate_func=meta.get("candidate_func", parent_key),
+            candidate_thread_id=meta.get("candidate_thread_id"),
+            event_gap=meta.get("event_gap"),
+        )
+        return "accepted"
+    except Exception as e:
+        _record_call_event("call_graph_error", where="_record_call_edge", error=_short_error(e))
+        return "error"
+
+
+def _record_call_enter(func, cid=None, parent_cid=None, **meta):
+    # Hard graph boundary: RuntimeEventBP supplies this admission marker only
+    # after a real execution hit passes the loaded whitelist. Do not add a
+    # trace-root or breakpoint bypass here.
+    if (
+        meta.get("admission_action") != "ALLOW"
+        or meta.get("admission_reason") != "whitelist_runtime_execution_hit"
+    ):
+        _log_diag(
+            f"[NODE_ADMISSION] action=REJECT reason=missing_runtime_whitelist_admission "
+            f"symbol={func}"
+        )
+        return None
+    try:
+        tid = meta.get("thread_id")
+        if tid is None:
+            tid = _thread_id()
+        stack = _CALL_STACK.setdefault(tid, [])
+        parent_frame = stack[-1] if stack else None
+        parent_key = parent_frame.get("key") if parent_frame else None
+        parent_source = "call_stack" if parent_frame else "none"
+        candidate_order = 0
+        candidate_func = parent_key or ""
+        candidate_thread_id = tid if parent_frame else None
+        candidate_event_gap = 0 if parent_frame else None
+        if parent_cid is None and parent_frame:
+            parent_cid = parent_frame.get("cid")
+        key, node = _ensure_call_graph_node(func, cid, **meta)
+        if not node:
+            return None
+        is_first_enter = node.get("first_enter_event") is None
+        node["enter_count"] = int(node.get("enter_count", 0)) + 1
+        node["seenCount"] = node["enter_count"]
+        node["active_count"] = int(node.get("active_count", 0)) + 1
+        node["active"] = node["active_count"] > 0
+        node["currentlyInLatestSnapshot"] = True
+        node["last_seen"] = _call_graph_now()
+        node["last_enter_event"] = _CALL_GRAPH_NEXT_EVENT_ID
+        if is_first_enter:
+            node["first_enter_event"] = _CALL_GRAPH_NEXT_EVENT_ID
+        _refresh_call_graph_display_label(key, node)
+        edge_status = None
+        if parent_key:
+            edge_status = _record_call_edge(
+                parent_key,
+                key,
+                parent_cid=parent_cid,
+                child_cid=cid,
+                thread_id=tid,
+                parent_source=parent_source,
+                candidate_order=candidate_order,
+                candidate_func=candidate_func,
+                candidate_thread_id=candidate_thread_id,
+                event_gap=candidate_event_gap,
+            )
+        else:
+            for candidate in _recent_parent_candidates(tid, key):
+                candidate_order = candidate["order"]
+                candidate_func = candidate["func"]
+                candidate_thread_id = candidate["thread_id"]
+                candidate_event_gap = candidate["event_gap"]
+                candidate_status = _record_call_edge(
+                    candidate["key"],
+                    key,
+                    parent_cid=candidate["cid"],
+                    child_cid=cid,
+                    thread_id=tid,
+                    parent_source=candidate["source"],
+                    candidate_order=candidate_order,
+                    candidate_func=candidate_func,
+                    candidate_thread_id=candidate_thread_id,
+                    event_gap=candidate_event_gap,
+                )
+                if candidate_status == "accepted":
+                    parent_key = candidate["key"]
+                    parent_cid = candidate["cid"]
+                    parent_source = candidate["source"]
+                    edge_status = candidate_status
+                    break
+                if candidate_status in (
+                    "less_precise_parent_existing",
+                    "unrelated_parent_existing",
+                ):
+                    # The candidate was rejected because the child already has
+                    # a better parent. Retain that relationship; do not turn a
+                    # known child into a new stable root merely because this
+                    # empty-stack fallback was less precise.
+                    parent_key = node.get("parent_func")
+                    parent_cid = node.get("parent_cid")
+                    parent_source = "existing_parent"
+                    edge_status = candidate_status
+                    break
+            if edge_status not in (
+                "accepted",
+                "less_precise_parent_existing",
+                "unrelated_parent_existing",
+            ):
+                parent_key = None
+                parent_cid = None
+                parent_source = "none"
+                candidate_func = ""
+                candidate_thread_id = None
+                candidate_event_gap = None
+                _mark_stable_call_root(key, node.get("first_enter_event"))
+                edge_status = _record_call_edge(None, key, child_cid=cid, thread_id=tid)
+        if edge_status == "accepted" and key not in _STABLE_CALL_ROOTS:
+            node["parent_cid"] = parent_cid
+            node["parent_func"] = parent_key
+        event_fields = dict(meta)
+        event_fields.update({
+            "cid": cid,
+            "parent_cid": parent_cid,
+            "func": key,
+            "parent_func": parent_key,
+            "parent_source": parent_source,
+            "candidate_order": candidate_order,
+            "candidate_func": candidate_func,
+            "candidate_thread_id": candidate_thread_id,
+            "event_gap": candidate_event_gap,
+            "edge_status": edge_status,
+        })
+        _record_call_event("call_enter", **event_fields)
+        if key in _STABLE_CALL_ROOTS:
+            _remember_recent_call_root(tid, key, cid)
+        elif edge_status == "accepted":
+            _remember_recent_call_parent(tid, key, cid)
+        frame = {"key": key, "func": key, "cid": cid, "thread_id": tid}
+        stack.append(frame)
+        return frame
+    except Exception as e:
+        _record_call_event("call_graph_error", where="_record_call_enter", error=_short_error(e))
+        return None
+
+
+def _record_call_exit(func, cid=None, **meta):
+    try:
+        tid = meta.get("thread_id")
+        if tid is None:
+            tid = _thread_id()
+        key = _call_graph_node_key(meta.get("call_key") or func)
+        stack = _CALL_STACK.setdefault(tid, [])
+        depth_before = len(stack)
+        matched_top = bool(stack and stack[-1].get("key") == key)
+        if matched_top:
+            stack.pop()
+        else:
+            for index in range(len(stack) - 1, -1, -1):
+                if stack[index].get("key") == key:
+                    del stack[index]
+                    break
+        node = _CALL_GRAPH_NODES.get(key)
+        if node:
+            node["exit_count"] = int(node.get("exit_count", 0)) + 1
+            node["active_count"] = max(0, int(node.get("active_count", 0)) - 1)
+            node["active"] = node["active_count"] > 0
+            node["currentlyInLatestSnapshot"] = node["active"]
+            node["last_seen"] = _call_graph_now()
+            node["last_exit_event"] = _CALL_GRAPH_NEXT_EVENT_ID
+            _refresh_call_graph_display_label(key, node)
+        event_fields = dict(meta)
+        event_fields.update({
+            "cid": cid,
+            "func": key,
+            "depth_before": depth_before,
+            "depth_after": len(stack),
+            "matched_top": matched_top,
+        })
+        _record_call_event("call_exit", **event_fields)
+    except Exception as e:
+        _record_call_event("call_graph_error", where="_record_call_exit", cid=cid, error=_short_error(e))
+
+
+def _export_call_graph():
+    try:
+        exported_keys = set()
+
+        def clone_node(key, path_seen=None):
+            if path_seen is None:
+                path_seen = set()
+            if key in path_seen or key in exported_keys:
+                return None
+            src = _CALL_GRAPH_NODES.get(key)
+            if not src:
+                return None
+            exported_keys.add(key)
+            path_seen = set(path_seen)
+            path_seen.add(key)
+            out = {}
+            for k, v in src.items():
+                if k == "children":
+                    continue
+                out[k] = _json_safe(v)
+            out["children"] = []
+            for child_key in src.get("children", []):
+                child = clone_node(child_key, path_seen)
+                if child is not None:
+                    out["children"].append(child)
+            return out
+
+        roots = []
+        root_keys = [
+            key for key, _event_id in sorted(
+                _STABLE_CALL_ROOTS.items(), key=lambda item: item[1]
+            )
+            if key in _CALL_GRAPH_NODES
+        ]
+        if not root_keys and _CALL_GRAPH_NODES:
+            root_keys = [min(
+                _CALL_GRAPH_NODES.keys(),
+                key=lambda k: _CALL_GRAPH_NODES[k].get("first_enter_event") or _CALL_GRAPH_NODES[k].get("last_enter_event") or 0,
+            )]
+            _mark_stable_call_root(root_keys[0])
+        for key in root_keys:
+            root = clone_node(key)
+            if root is not None:
+                roots.append(root)
+        if not roots and _CALL_GRAPH_NODES:
+            first_key = min(
+                _CALL_GRAPH_NODES.keys(),
+                key=lambda k: _CALL_GRAPH_NODES[k].get("first_enter_event") or _CALL_GRAPH_NODES[k].get("last_enter_event") or 0,
+            )
+            root = clone_node(first_key)
+            if root is not None:
+                roots.append(root)
+                _mark_stable_call_root(first_key)
+        return {
+            "type": "history_tree",
+            "roots": roots,
+            "events_count": len(_CALL_GRAPH_EVENTS),
+            "nodes_count": len(_CALL_GRAPH_NODES),
+            "roots_count": len(roots),
+            "stable_roots_count": len(root_keys),
+            "edges_count": len(_CALL_GRAPH_EDGES),
+            "graph_kind": "call_graph",
+        }
+    except Exception as e:
+        return {
+            "type": "history_tree",
+            "roots": [],
+            "events_count": len(_CALL_GRAPH_EVENTS),
+            "nodes_count": len(_CALL_GRAPH_NODES),
+            "roots_count": 0,
+            "stable_roots_count": 0,
+            "edges_count": len(_CALL_GRAPH_EDGES),
+            "graph_kind": "call_graph",
+            "error": _short_error(e),
+        }
+
+
+def _validate_call_graph():
+    """Validate the filtered execution graph without changing runtime state.
+
+    This intentionally only inspects the graph built from whitelist-admitted
+    runtime execution hits.  Raw runtime events (including rejected and
+    redirected dispatch observations) are not validation targets.
+    """
+    errors = []
+    warnings = []
+
+    def add_error(kind, detail):
+        errors.append(f"{kind}: {detail}")
+
+    def add_warning(kind, detail):
+        warnings.append(f"{kind}: {detail}")
+
+    try:
+        nodes = _CALL_GRAPH_NODES
+        node_keys = set(nodes.keys())
+        # _CALL_GRAPH_EDGES is the authoritative edge registry, while each
+        # node's children list is the representation exported to History Tree.
+        # Validate both views without treating their normal overlap as a
+        # duplicate semantic edge.
+        adjacency = {key: set() for key in node_keys}
+        incoming = {key: set() for key in node_keys}
+        seen_registry_edges = set()
+
+        try:
+            registry_edges = list(_CALL_GRAPH_EDGES)
+        except Exception as e:
+            registry_edges = []
+            add_error("invalid_edge_registry", _short_error(e))
+
+        for raw_edge in registry_edges:
+            try:
+                parent_key, child_key = raw_edge
+                edge = (parent_key, child_key)
+            except Exception:
+                add_error("invalid_edge", repr(raw_edge))
+                continue
+            if edge in seen_registry_edges:
+                add_warning("duplicate_edge", f"{parent_key} -> {child_key}")
+            seen_registry_edges.add(edge)
+            if parent_key not in node_keys:
+                add_error("missing_node_reference", f"parent {parent_key}")
+            if child_key not in node_keys:
+                add_error("missing_node_reference", f"child {child_key}")
+            if parent_key == child_key:
+                add_error("self_loop", f"{parent_key} -> {child_key}")
+            if parent_key in node_keys and child_key in node_keys:
+                adjacency[parent_key].add(child_key)
+                incoming[child_key].add(parent_key)
+
+        for parent_key, node in nodes.items():
+            try:
+                children = node.get("children", [])
+                if children is None:
+                    children = []
+                child_items = list(children)
+            except Exception as e:
+                add_warning("invalid_children", f"{parent_key}: {_short_error(e)}")
+                continue
+            seen_children = set()
+            for child_key in child_items:
+                if child_key in seen_children:
+                    add_warning("duplicate_edge", f"{parent_key} -> {child_key}")
+                seen_children.add(child_key)
+                if child_key not in node_keys:
+                    add_error("missing_node_reference", f"child {child_key}")
+                    continue
+                if parent_key == child_key:
+                    add_error("self_loop", f"{parent_key} -> {child_key}")
+                adjacency[parent_key].add(child_key)
+                incoming[child_key].add(parent_key)
+
+        root_keys = set(_CALL_GRAPH_ROOTS)
+        root_keys.update(_STABLE_CALL_ROOTS.keys())
+        for root_key in root_keys:
+            if root_key not in node_keys:
+                add_error("missing_root_node", str(root_key))
+
+        for node_key in node_keys:
+            if node_key not in root_keys and not incoming[node_key]:
+                add_warning("orphan_node", str(node_key))
+
+        # A DFS colour map (0=unseen, 1=on stack, 2=done) exposes every
+        # back-edge while leaving the graph entirely untouched.
+        colour = {key: 0 for key in node_keys}
+        reported_cycles = set()
+
+        def visit(node_key, path):
+            colour[node_key] = 1
+            for child_key in adjacency.get(node_key, ()):
+                if colour[child_key] == 1:
+                    try:
+                        start = path.index(child_key)
+                        cycle = tuple(path[start:] + [child_key])
+                    except ValueError:
+                        cycle = (node_key, child_key)
+                    if cycle not in reported_cycles:
+                        reported_cycles.add(cycle)
+                        add_error("cycle", " -> ".join(str(key) for key in cycle))
+                elif colour[child_key] == 0:
+                    visit(child_key, path + [child_key])
+            colour[node_key] = 2
+
+        for node_key in node_keys:
+            if colour[node_key] == 0:
+                visit(node_key, [node_key])
+
+        for node_key, node in nodes.items():
+            admission_action = node.get("admission_action")
+            admission_reason = node.get("admission_reason")
+            if admission_action is None:
+                add_warning("missing_admission_action", str(node_key))
+            elif admission_action != "ALLOW":
+                add_error(
+                    "invalid_admission_action",
+                    f"{node_key} action={admission_action}",
+                )
+            if admission_reason is None:
+                add_warning("missing_admission_reason", str(node_key))
+            elif admission_reason != "whitelist_runtime_execution_hit":
+                add_error(
+                    "invalid_admission_reason",
+                    f"{node_key} reason={admission_reason}",
+                )
+
+            symbol = str(node.get("func") or node_key)
+            dispatch_observe = node.get("dispatch_observe")
+            is_dispatch = (
+                _is_async_dispatch_observe_symbol(symbol)
+                or dispatch_observe is True
+                or str(dispatch_observe).lower() == "true"
+                or node.get("semantic_kind") == "dispatch_observation"
+                or node.get("node_kind") == "dispatch_observation"
+            )
+            if is_dispatch:
+                add_error("dispatch_node", symbol)
+    except Exception as e:
+        add_error("validator_failure", _short_error(e))
+
+    result = {
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "stats": {
+            "nodes_count": len(_CALL_GRAPH_NODES),
+            "edges_count": len(_CALL_GRAPH_EDGES),
+            "roots_count": len(set(_CALL_GRAPH_ROOTS) | set(_STABLE_CALL_ROOTS)),
+            "events_count": len(_CALL_GRAPH_EVENTS),
+        },
+    }
+    _log_diag(
+        f"[GRAPH_VALIDATOR] ok={str(result['ok']).lower()} "
+        f"errors={len(errors)} warnings={len(warnings)}"
+    )
+    return result
+
+
+def _clear_call_graph():
+    global _CALL_GRAPH_NEXT_EVENT_ID, _RECENT_CALL_ROOT_GLOBAL, _RECENT_CALL_PARENT_GLOBAL
+    try:
+        _CALL_GRAPH_NODES.clear()
+        _CALL_GRAPH_ROOTS.clear()
+        _STABLE_CALL_ROOTS.clear()
+        _CALL_GRAPH_EDGES.clear()
+        _CALL_GRAPH_EVENTS.clear()
+        _CALL_STACK.clear()
+        _RECENT_CALL_ROOT_BY_THREAD.clear()
+        _RECENT_CALL_ROOT_GLOBAL = None
+        _RECENT_CALL_PARENT_BY_THREAD.clear()
+        _RECENT_CALL_PARENT_GLOBAL = None
+        _CALL_GRAPH_NEXT_EVENT_ID = 1
+    except Exception:
+        pass
 
 def _get_or_make_coro_id(poll_sym: str, this_ptr: int):
     """
@@ -705,29 +1765,48 @@ def _merge_state_info_from_observed(base_info: dict, observed: dict) -> dict:
         )
     return base_info
 
-class _PopOnReturnBP(gdb.FinishBreakpoint):
-    """Pop coroutine stack when current function returns."""
-    def __init__(self, tid: int, cid: int):
+class _TraceReturnBP(gdb.FinishBreakpoint):
+    """Record an admitted runtime call exit, then clean up the snapshot stack."""
+    def __init__(self, tid: int, cid: int, func: str):
         super().__init__(gdb.selected_frame(), internal=True)
         self.silent = True
         self.tid = tid
         self.cid = cid
+        self.func = func
         _RUN_SCOPED_BPS.append(self)
 
     def stop(self):
-        st = _TLS_STACK.get(self.tid, [])
-        if not st:
-            return False
+        try:
+            _record_call_exit(
+                self.func,
+                self.cid if self.cid else None,
+                thread_id=self.tid,
+            )
 
-        if st[-1] == self.cid:
-            st.pop()
-            return False
+            # _TLS_STACK remains a snapshot-only current-path aid. It is not
+            # used to determine call graph parents or edges.
+            if not self.cid:
+                return False
+            st = _TLS_STACK.get(self.tid, [])
+            if not st:
+                return False
 
-        # fallback: remove from back if mismatch
-        for i in range(len(st) - 1, -1, -1):
-            if st[i] == self.cid:
-                del st[i]
-                break
+            if st[-1] == self.cid:
+                st.pop()
+            else:
+                # Best-effort snapshot cleanup when GDB returns out of order.
+                for i in range(len(st) - 1, -1, -1):
+                    if st[i] == self.cid:
+                        del st[i]
+                        break
+        except Exception as e:
+            _record_call_event(
+                "call_exit_error",
+                thread_id=self.tid,
+                cid=self.cid,
+                func=self.func,
+                error=_short_error(e),
+            )
         return False
 
 
@@ -737,9 +1816,11 @@ class _PopOnReturnBP(gdb.FinishBreakpoint):
 
 _CREATED_BPS = []
 _RUN_SCOPED_BPS = []
+_RUNTIME_EVENT_BPS = []  # Whitelist-installed runtime event instrumentation only.
 
 _CALLSITE_INSTALLED_FOR_FN = set()   # per-run: avoid re-installing callsite BPs
-_ACTIVE_ROOTS = set()                # poll symbols we installed PollEntryBP for
+_ACTIVE_RUNTIME_EVENT_SYMBOLS = set()  # Symbols with RuntimeEventBP instrumentation.
+ACTIVE_TRACE_ROOT = None               # Single user-selected observation/view root.
 
 # whitelist: exact + prefix(*)
 _WHITELIST_EXACT = None   # set[str] | None
@@ -1534,7 +2615,9 @@ def _load_whitelist_file(path: str):
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
-            parts = line.split()
+            # The optional numeric index occupies only the first field. Keep
+            # the remainder intact because Rust generic symbols contain spaces.
+            parts = line.split(maxsplit=1)
             sym = parts[1] if (len(parts) >= 2 and parts[0].isdigit()) else line
 
             if sym.endswith("*"):
@@ -1782,6 +2865,288 @@ def _write_transition_candidates(output_path: str):
     return path, scanned_count, len(candidates)
 
 
+def _default_transition_probe_draft_path() -> str:
+    temp_dir = (os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR") or "").strip()
+    if temp_dir:
+        out_dir = os.path.abspath(os.path.expanduser(temp_dir))
+    else:
+        out_dir = os.path.join(os.getcwd(), "temp")
+    return os.path.join(out_dir, "transition-probe.draft.json")
+
+
+def _load_transition_candidates(path: str):
+    resolved_path, _ = _resolve_transition_probe_config_path(path)
+    try:
+        with open(resolved_path, "r", encoding="utf-8") as fp:
+            payload = json.load(fp)
+    except Exception as e:
+        raise ValueError(
+            f"failed to read candidates {resolved_path}: {_short_error(e)}"
+        )
+
+    if not isinstance(payload, dict):
+        raise ValueError("transition candidates JSON must be an object")
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list):
+        raise ValueError("transition candidates field 'candidates' must be an array")
+    for index, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict):
+            raise ValueError(f"candidates[{index}] must be an object")
+    return resolved_path, candidates
+
+
+def _transition_draft_location(candidate: dict) -> str:
+    location = str(candidate.get("location") or "").strip()
+    if not location:
+        location = str(candidate.get("addr") or "").strip()
+    if location and not location.startswith("*"):
+        location = f"*{location}"
+    if not re.fullmatch(r"\*0x[0-9a-fA-F]+", location):
+        return ""
+    return location.lower()
+
+
+def _transition_draft_keyword_hits(candidate: dict):
+    raw_hits = candidate.get("keyword_hits")
+    if not isinstance(raw_hits, list):
+        return []
+    present = {
+        str(keyword).strip().lower()
+        for keyword in raw_hits
+        if isinstance(keyword, str) and keyword.strip()
+    }
+    return [
+        keyword for keyword in _TRANSITION_DRAFT_KEYWORD_PRIORITY
+        if keyword in present
+    ]
+
+
+def _transition_draft_completeness(candidate: dict) -> int:
+    score = 0
+    for field in ("label", "func", "symbol", "location", "file", "fullname"):
+        if str(candidate.get(field) or "").strip():
+            score += 1
+    try:
+        if int(candidate.get("line") or 0) > 0:
+            score += 1
+    except Exception:
+        pass
+    if isinstance(candidate.get("reason"), list) and candidate["reason"]:
+        score += 1
+    return score
+
+
+def _transition_draft_semantic_rank(candidate: dict, keyword_hits):
+    symbol = str(candidate.get("symbol") or candidate.get("func") or "").lower()
+    compact_symbol = re.sub(r"[^a-z0-9]+", "", symbol)
+    hits = set(keyword_hits)
+
+    if hits.intersection({"user_to_kernel", "kernel_to_user"}):
+        return 0
+    if "handlesyscall" in compact_symbol or "handle_syscall" in hits:
+        return 1
+    if "decode_invocation" in symbol or "decode_invocation" in hits:
+        return 2
+    if symbol.count("async_syscall_handler") >= 2:
+        return 3
+    if "syscall" in hits:
+        return 4
+    if hits.intersection({"decode", "invocation"}):
+        return 5
+    if "async_syscall_handler" in hits:
+        return 6
+    return 7
+
+
+def _transition_draft_sort_key(item: dict):
+    confidence_rank = {"high": 0, "medium-high": 1}
+    keyword_hits = item["_draft_keyword_hits"]
+    keyword_rank = min(
+        (
+            _TRANSITION_DRAFT_KEYWORD_PRIORITY.index(keyword)
+            for keyword in keyword_hits
+        ),
+        default=len(_TRANSITION_DRAFT_KEYWORD_PRIORITY),
+    )
+    return (
+        confidence_rank.get(item["_draft_confidence"], 9),
+        _transition_draft_semantic_rank(item, keyword_hits),
+        keyword_rank,
+        -item["_draft_completeness"],
+        item["_draft_symbol"].lower(),
+        item["_draft_location"],
+        item["_draft_index"],
+    )
+
+
+def _select_transition_probe_draft_candidates(candidates):
+    eligible = []
+    for index, raw_candidate in enumerate(candidates):
+        confidence = str(raw_candidate.get("confidence") or "").strip().lower()
+        if confidence not in _TRANSITION_DRAFT_CONFIDENCE:
+            continue
+        keyword_hits = _transition_draft_keyword_hits(raw_candidate)
+        if not keyword_hits:
+            continue
+        location = _transition_draft_location(raw_candidate)
+        symbol = str(
+            raw_candidate.get("symbol")
+            or raw_candidate.get("func")
+            or raw_candidate.get("label")
+            or ""
+        ).strip()
+        if not symbol or not location:
+            continue
+
+        candidate = dict(raw_candidate)
+        candidate["_draft_index"] = index
+        candidate["_draft_confidence"] = confidence
+        candidate["_draft_keyword_hits"] = keyword_hits
+        candidate["_draft_location"] = location
+        candidate["_draft_symbol"] = symbol
+        candidate["_draft_completeness"] = _transition_draft_completeness(candidate)
+        eligible.append(candidate)
+
+    # Prefer the most complete duplicate before applying the final semantic ordering.
+    dedupe_order = sorted(
+        eligible,
+        key=lambda item: (
+            -item["_draft_completeness"],
+            item["_draft_index"],
+        ),
+    )
+    deduped = []
+    seen_symbols = set()
+    seen_locations = set()
+    for candidate in dedupe_order:
+        symbol_key = candidate["_draft_symbol"].lower()
+        location_key = candidate["_draft_location"]
+        if symbol_key in seen_symbols or location_key in seen_locations:
+            continue
+        seen_symbols.add(symbol_key)
+        seen_locations.add(location_key)
+        deduped.append(candidate)
+
+    ordered = sorted(deduped, key=_transition_draft_sort_key)
+    selected = []
+    selected_ids = set()
+
+    # Preserve semantic diversity before filling the remaining slots by global rank.
+    seed_rules = (
+        (lambda item: set(item["_draft_keyword_hits"]).intersection(
+            {"user_to_kernel", "kernel_to_user"}
+        ), 2),
+        (lambda item: _transition_draft_semantic_rank(
+            item, item["_draft_keyword_hits"]
+        ) == 1, 3),
+        (lambda item: _transition_draft_semantic_rank(
+            item, item["_draft_keyword_hits"]
+        ) == 2, 3),
+        (lambda item: _transition_draft_semantic_rank(
+            item, item["_draft_keyword_hits"]
+        ) == 3, 2),
+    )
+    for predicate, limit in seed_rules:
+        added = 0
+        for candidate in ordered:
+            candidate_id = candidate["_draft_index"]
+            if candidate_id in selected_ids or not predicate(candidate):
+                continue
+            selected.append(candidate)
+            selected_ids.add(candidate_id)
+            added += 1
+            if added >= limit:
+                break
+
+    for candidate in ordered:
+        if len(selected) >= _TRANSITION_DRAFT_MAX_PROBES:
+            break
+        candidate_id = candidate["_draft_index"]
+        if candidate_id in selected_ids:
+            continue
+        selected.append(candidate)
+        selected_ids.add(candidate_id)
+
+    return sorted(selected, key=_transition_draft_sort_key)
+
+
+def _transition_probe_draft_spec(candidate: dict) -> dict:
+    keyword_hits = candidate["_draft_keyword_hits"]
+    event = ""
+    if "user_to_kernel" in keyword_hits:
+        event = "user_to_kernel"
+    elif "kernel_to_user" in keyword_hits:
+        event = "kernel_to_user"
+
+    privilege = str(candidate.get("privilege_guess") or "unknown").strip().lower()
+    if privilege not in ("user", "kernel", "unknown"):
+        privilege = "unknown"
+    try:
+        line = int(candidate.get("line") or 0)
+    except Exception:
+        line = 0
+    reason = candidate.get("reason")
+    if not isinstance(reason, list):
+        reason = []
+
+    spec = {
+        "label": str(candidate.get("label") or candidate["_draft_symbol"]).strip(),
+        "type": "transition" if event else "sync",
+        "privilege": privilege,
+        "location": candidate["_draft_location"],
+        "func": str(candidate.get("func") or candidate["_draft_symbol"]).strip(),
+        "file": str(candidate.get("file") or "").strip(),
+        "fullname": str(candidate.get("fullname") or "").strip(),
+        "line": line,
+        "confidence": candidate["_draft_confidence"],
+        "reason": [str(item) for item in reason],
+        "draft_note": "review required before enabling",
+    }
+    if event:
+        spec["event"] = event
+    return spec
+
+
+def _write_transition_probe_draft(candidates_path: str, output_path: str):
+    resolved_candidates_path, candidates = _load_transition_candidates(candidates_path)
+    path = os.path.abspath(os.path.expanduser(output_path))
+    formal_path = os.path.abspath(
+        os.path.join(_transition_probe_project_root(), _REL4_TRANSITION_PROBE_CONFIG)
+    )
+    if os.path.normcase(os.path.realpath(path)) == os.path.normcase(
+        os.path.realpath(formal_path)
+    ):
+        raise ValueError("refusing to overwrite the formal rel4 transition-probe.json")
+    if os.path.basename(path).lower() == "transition-probe.json":
+        raise ValueError("draft output must not be named transition-probe.json")
+    if os.path.normcase(os.path.realpath(path)) == os.path.normcase(
+        os.path.realpath(resolved_candidates_path)
+    ):
+        raise ValueError("draft output must differ from the candidates input")
+
+    selected = _select_transition_probe_draft_candidates(candidates)
+    probes = [_transition_probe_draft_spec(candidate) for candidate in selected]
+    payload = {
+        "version": 1,
+        "name": "draft-from-candidates",
+        "source": "transition-candidates",
+        "generated_from": resolved_candidates_path,
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "candidate_count": len(candidates),
+        "selected_count": len(probes),
+        "selection_policy": (
+            "high and medium-high transition-related candidates; "
+            "semantic diversity; maximum 20 probes"
+        ),
+        "probes": probes,
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fp:
+        json.dump(payload, fp, indent=2, ensure_ascii=False)
+        fp.write("\n")
+    return path, len(candidates), len(probes)
+
+
 def _whitelist_enabled() -> bool:
     return (_WHITELIST_EXACT is not None) or (_WHITELIST_PREFIX is not None)
 
@@ -1804,6 +3169,78 @@ def _whitelist_allows_by_name(sym: str) -> str | None:
                 return sym
 
     return None
+
+
+def _make_runtime_event(event_kind, symbol, addr, thread_id, source, metadata=None):
+    """Build an ENTRY_SEED event without mutating the runtime call graph."""
+    raw_event = {
+        "event_kind": str(event_kind or "runtime_hit"),
+        "symbol": str(symbol or ""),
+        "addr": addr or "",
+        "thread_id": thread_id,
+        "source": str(source or "runtime"),
+        "timestamp": _call_graph_now(),
+        "metadata": dict(metadata or {}),
+    }
+    _log_diag(
+        f"[ENTRY_SEED] kind={raw_event['event_kind']} symbol={raw_event['symbol']} "
+        f"source={raw_event['source']} thread={thread_id}"
+    )
+    return raw_event
+
+
+def _classify_runtime_event(raw_event):
+    """Classify a runtime event before the whitelist admission gate."""
+    symbol = str(raw_event.get("symbol") or "")
+    metadata = dict(raw_event.get("metadata") or {})
+    is_dispatch = _is_async_dispatch_observe_symbol(symbol)
+    whitelist_enabled = _whitelist_enabled()
+    whitelist_match = (
+        _whitelist_allows_by_name(symbol) if whitelist_enabled else None
+    )
+    metadata.update({
+        "whitelist_allowed": bool(whitelist_enabled and whitelist_match),
+        "whitelist_reason": (
+            "whitelist_match" if whitelist_match
+            else "whitelist_rejected" if whitelist_enabled else "whitelist_not_loaded"
+        ),
+        "dispatch_observe": is_dispatch,
+    })
+    candidate = {
+        "semantic_kind": "dispatch_observation" if is_dispatch else "runtime_call",
+        "node_kind": "dispatch_observation" if is_dispatch else "call",
+        "edge_kind": "observation" if is_dispatch else "call",
+        "symbol": symbol,
+        "addr": raw_event.get("addr", ""),
+        "thread_id": raw_event.get("thread_id"),
+        "source": raw_event.get("source", "runtime"),
+        "timestamp": raw_event.get("timestamp", ""),
+        "metadata": metadata,
+    }
+    _log_diag(
+        f"[RUNTIME_EVENT] semantic={candidate['semantic_kind']} "
+        f"symbol={symbol} whitelist={metadata['whitelist_allowed']}"
+    )
+    return candidate
+
+
+def _admit_trace_candidate(candidate):
+    """Admit graph writes only for whitelist-approved runtime events."""
+    symbol = str(candidate.get("symbol") or "")
+    if not symbol:
+        decision = {"action": "REJECT", "reason": "missing_symbol"}
+    elif candidate.get("semantic_kind") == "dispatch_observation":
+        # DISPATCH HOOK SOFT DISABLED FOR GRAPH STABILITY - DO NOT REMOVE
+        decision = {"action": "REDIRECT", "reason": "dispatch_hook_soft_disabled"}
+    elif not candidate.get("metadata", {}).get("whitelist_allowed"):
+        decision = {"action": "REJECT", "reason": "whitelist_not_allowed"}
+    else:
+        decision = {"action": "ALLOW", "reason": "whitelist_runtime_execution_hit"}
+    _log_diag(
+        f"[NODE_ADMISSION] action={decision['action']} reason={decision['reason']} "
+        f"symbol={symbol}"
+    )
+    return decision
 
 def _build_whitelist_addr_map_if_needed(caller_is_user_visible: bool):
     global _WHITELIST_ADDR_READY, _WHITELIST_ADDR_MAP
@@ -2056,10 +3493,8 @@ def _pick_interesting_callee(target_addr: int) -> str | None:
                 return n2
         return None
 
-    # no whitelist: heuristic (only poll-ish)
-    for n in _callee_candidates(target_addr):
-        if _is_pollish_name(n):
-            return n
+    # Runtime event instrumentation is whitelist-owned. Without a whitelist,
+    # no dynamic callee may become an event source or a graph node.
     return None
 
 
@@ -2068,6 +3503,7 @@ def _pick_interesting_callee(target_addr: int) -> str | None:
 # -------------------------
 
 def _cleanup_run_scoped():
+    global _RECENT_CALL_ROOT_GLOBAL, _RECENT_CALL_PARENT_GLOBAL
     for bp in list(_RUN_SCOPED_BPS):
         try:
             bp.delete()
@@ -2080,6 +3516,11 @@ def _cleanup_run_scoped():
     _invalidate_whitelist_addrs()
 
     _TLS_STACK.clear()
+    _CALL_STACK.clear()
+    _RECENT_CALL_ROOT_BY_THREAD.clear()
+    _RECENT_CALL_ROOT_GLOBAL = None
+    _RECENT_CALL_PARENT_BY_THREAD.clear()
+    _RECENT_CALL_PARENT_GLOBAL = None
     _CO_BY_KEY.clear()
     _CO_META.clear()
     _CO_POLL_SEQ.clear()
@@ -2097,17 +3538,68 @@ def _on_exited(event):
 def _on_new_objfile(event):
     _cleanup_run_scoped()
 
+
+def _remove_runtime_event_breakpoints():
+    """Remove whitelist-installed event instrumentation without touching probes."""
+    for bp in list(_RUNTIME_EVENT_BPS):
+        try:
+            bp.delete()
+        except Exception:
+            pass
+        try:
+            _CREATED_BPS.remove(bp)
+        except ValueError:
+            pass
+        try:
+            _RUN_SCOPED_BPS.remove(bp)
+        except ValueError:
+            pass
+    _RUNTIME_EVENT_BPS.clear()
+    _ACTIVE_RUNTIME_EVENT_SYMBOLS.clear()
+
+
+def _install_whitelist_runtime_event_breakpoints():
+    """Install runtime event probes for exact whitelist symbols.
+
+    These breakpoints are instrumentation, not trace roots: their callbacks
+    capture execution hits, pass the whitelist admission gate, and only then
+    write the execution graph.
+    """
+    _remove_runtime_event_breakpoints()
+    if not _whitelist_enabled():
+        return
+
+    for symbol in sorted(_WHITELIST_EXACT or ()):
+        try:
+            RuntimeEventBP(symbol, func_name=symbol, internal=True)
+            _ACTIVE_RUNTIME_EVENT_SYMBOLS.add(symbol)
+        except Exception as e:
+            _log_ard(
+                f"[ARD] whitelist runtime event probe install failed {symbol}: "
+                f"{_short_error(e)}"
+            )
+
 # -------------------------
 # Breakpoints
 # -------------------------
 
-class PollEntryBP(gdb.Breakpoint):
-    def __init__(self, location: str, poll_sym: str | None, internal: bool, temporary: bool = False):
-        super().__init__(location, type=gdb.BP_BREAKPOINT, internal=internal, temporary=temporary)
+class RuntimeEventBP(gdb.Breakpoint):
+    """Whitelist-owned runtime execution event source for the call graph."""
+    def __init__(self, location: str, func_name: str | None, internal: bool, temporary: bool = False):
+        # Rust generic symbols may contain commas and spaces. Quote symbolic
+        # locations so every exact whitelist entry is instrumented as written.
+        location_text = str(location)
+        gdb_location = (
+            location_text
+            if location_text.strip().startswith("*")
+            else _quote_gdb_break_location(location_text)
+        )
+        super().__init__(gdb_location, type=gdb.BP_BREAKPOINT, internal=internal, temporary=temporary)
         self.silent = True
-        self.poll_sym = poll_sym or ""
+        self.func_name = func_name or ""
         self.internal = internal
         _CREATED_BPS.append(self)
+        _RUNTIME_EVENT_BPS.append(self)
 
         # addr breakpoints / finish breakpoints are run-scoped
         if isinstance(location, str) and location.strip().startswith("*"):
@@ -2116,7 +3608,7 @@ class PollEntryBP(gdb.Breakpoint):
     def stop(self) -> bool:
         fn = _current_function_name()
         _log_diag(
-            f"[ARD][diag] PollEntryBP.stop enter fn={fn!r} poll_sym={self.poll_sym!r} internal={self.internal!r}"
+            f"[ARD][diag] RuntimeEventBP.stop enter fn={fn!r} func_name={self.func_name!r} internal={self.internal!r}"
         )
         try:
             frame = gdb.selected_frame()
@@ -2153,6 +3645,11 @@ class PollEntryBP(gdb.Breakpoint):
             )
         except Exception as e:
             _log_diag(f"[ARD][diag] TLS_STACK read failed: {e!r}")
+        poll_sym = self.func_name or fn
+        is_dispatch_observe = _is_async_dispatch_observe_symbol(poll_sym)
+        dispatch_fields = (
+            _read_async_dispatch_observe_args() if is_dispatch_observe else None
+        )
         self_ptr = 0
         this_arg_ptr = 0
         if frame is not None:
@@ -2169,28 +3666,36 @@ class PollEntryBP(gdb.Breakpoint):
                     )
                 except Exception as e:
                     _log_diag(f"[ARD][diag] arg {arg_name} read failed: {e!r}")
+        # Dispatch observe uses a0..a3 as ABI metadata, not a Future self pointer.
+        # Keep the shared call-graph path pointer-safe for that ordinary hook.
+        this_ptr = None
         a0_ptr = 0
-        try:
-            first_arg = _first_arg_reg()
-            raw_reg_val = gdb.parse_and_eval(f"${first_arg}")
-            a0_ptr = _normalize_addr(raw_reg_val) or 0
-            this_ptr = self_ptr or this_arg_ptr or a0_ptr
-            _log_ard(
-                f"[ARD] ptr-selected self=0x{self_ptr:x} this=0x{this_arg_ptr:x} {first_arg}=0x{a0_ptr:x} selected=0x{this_ptr:x}"
-            )
-            if this_ptr <= 0x10000:
-                _log_diag(f"[ARD][diag] this_ptr rejected by low-address filter: 0x{this_ptr:x}")
+        if not is_dispatch_observe:
+            try:
+                first_arg = _first_arg_reg()
+                raw_reg_val = gdb.parse_and_eval(f"${first_arg}")
+                a0_ptr = _normalize_addr(raw_reg_val) or 0
+                this_ptr = self_ptr or this_arg_ptr or a0_ptr
+                _log_ard(
+                    f"[ARD] ptr-selected self=0x{self_ptr:x} this=0x{this_arg_ptr:x} {first_arg}=0x{a0_ptr:x} selected=0x{this_ptr:x}"
+                )
+                if this_ptr <= 0x10000:
+                    _log_diag(f"[ARD][diag] this_ptr rejected by low-address filter: 0x{this_ptr:x}")
+                    this_ptr = 0
+            except Exception as e:
+                _log_diag(f"[ARD][diag] first arg read failed: {e!r}")
                 this_ptr = 0
-        except Exception as e:
-            _log_diag(f"[ARD][diag] first arg read failed: {e!r}")
-            this_ptr = 0
-        _log_diag(f"[ARD][diag] final this_ptr=0x{this_ptr:x}")
+        else:
+            _log_diag("[ARD][diag] dispatch observe: a0 is ABI data, not a future pointer")
+        _log_diag(f"[ARD][diag] final this_ptr=0x{(this_ptr or 0):x}")
 
-        poll_sym = self.poll_sym or fn
         cid = 0
         is_new = False
         depth = -1
-        _log_diag(f"[ARD][diag] before node create: poll_sym={poll_sym!r} this_ptr=0x{this_ptr:x}")
+        _log_diag(
+            f"[ARD][diag] before node create: poll_sym={poll_sym!r} "
+            f"this_ptr=0x{(this_ptr or 0):x}"
+        )
 
         if poll_sym and this_ptr:
             cid, is_new = _get_or_make_coro_id(poll_sym, this_ptr)
@@ -2198,14 +3703,6 @@ class PollEntryBP(gdb.Breakpoint):
             depth = _push_coro(cid)
             _log_diag(
                 f"[ARD][diag] TLS_STACK after push tid={tid} depth={depth} stack={_TLS_STACK.get(tid, [])!r} all={_TLS_STACK!r}"
-            )
-            try:
-                _PopOnReturnBP(tid, cid)
-            except Exception as e:
-                _log_ard(f"[ARD] warning: PopOnReturnBP disabled for cid={cid}: {e!r}")
-        else:
-            _log_ard(
-                f"[ARD] warning: no node created: poll_sym_present={bool(poll_sym)} this_ptr_present={bool(this_ptr)}"
             )
 
         indent = "  " * max(depth, 0)
@@ -2222,6 +3719,72 @@ class PollEntryBP(gdb.Breakpoint):
             else _state_info("N/A", "unsupported", "missing future pointer")
         )
         _record_async_privilege_hit(poll_sym)
+        runtime_metadata = {
+            "cid": cid if cid else None,
+            "depth": depth,
+            **_state_fields(state_info),
+        }
+        if dispatch_fields:
+            runtime_metadata.update(dispatch_fields)
+        raw_event = _make_runtime_event(
+            "dispatch_hook_hit" if is_dispatch_observe else "call_entry_hit",
+            poll_sym,
+            hex(this_ptr) if this_ptr else "",
+            tid,
+            "dispatch-hook" if is_dispatch_observe else "whitelist-runtime-event",
+            runtime_metadata,
+        )
+        candidate = _classify_runtime_event(raw_event)
+        decision = _admit_trace_candidate(candidate)
+        graph_write_enabled = (
+            decision["action"] == "ALLOW"
+            and (not is_dispatch_observe or DISPATCH_HOOK_ENABLED)
+        )
+        if is_dispatch_observe and not DISPATCH_HOOK_ENABLED:
+            _log_ard(
+                "[ARD] dispatch observe hit: graph write soft-disabled "
+                f"queue={dispatch_fields.get('dispatch_queue_state_name', 'unknown')} "
+                f"branch={dispatch_fields.get('dispatch_branch_name', 'unknown')}"
+            )
+        if graph_write_enabled:
+            call_frame = None
+            try:
+                call_fields = {
+                    "thread_id": tid,
+                    "addr": hex(this_ptr) if this_ptr else "",
+                    "depth": depth,
+                    "origin": "runtime-dispatch-observe" if is_dispatch_observe else "runtime-call",
+                    "privilege": _PRIVILEGE_STATE,
+                    "transition_event": _PRIVILEGE_TRANSITION_EVENT,
+                    "semantic_kind": candidate.get("semantic_kind"),
+                    "node_kind": candidate.get("node_kind"),
+                    "edge_kind": candidate.get("edge_kind"),
+                    "admission_action": decision.get("action"),
+                    "admission_reason": decision.get("reason"),
+                    **_state_fields(state_info),
+                }
+                if dispatch_fields:
+                    call_fields.update(dispatch_fields)
+                call_frame = _record_call_enter(
+                    poll_sym,
+                    cid if cid else None,
+                    **call_fields,
+                )
+                _TraceReturnBP(tid, cid, poll_sym)
+                if dispatch_fields:
+                    _record_call_dispatch_observe(poll_sym, tid, cid, dispatch_fields)
+            except Exception as e:
+                if call_frame is not None:
+                    _record_call_exit(poll_sym, cid if cid else None, thread_id=tid)
+                _record_call_event(
+                    "call_enter_error",
+                    thread_id=tid,
+                    cid=cid if cid else None,
+                    func=poll_sym,
+                    error=_short_error(e),
+                )
+        if is_dispatch_observe:
+            return False
         if cid and this_ptr:
             addr_hex = hex(this_ptr)
             _LAST_CHILD_HIT_BY_FUNC_ADDR[(poll_sym, addr_hex)] = {
@@ -2322,19 +3885,27 @@ class PollEntryBP(gdb.Breakpoint):
             _log_ard(f"[ARD]{indent} poll[coro#{cid} poll#{seq}] {fn}") # 使用默认的 False
 
         # awaitee line (no output dedup)
-        if self.poll_sym:
-            awa = _try_read_awaitee_from_current_poll(self.poll_sym)
+        if self.func_name:
+            awa = _try_read_awaitee_from_current_poll(self.func_name)
             if awa is not None:
                 awa_ty, _awa_val = awa
                 _log_ard(f"[ARD]{indent} awa[coro#{cid} poll#{seq}] {fn} -> {awa_ty}") # 使用默认的 False
 
-                # auto-trace child async fn/block by symbol (install once)
+                # Discover a new whitelist-approved runtime event source.
                 child_poll = _child_poll_symbol_from_awaitee_type(awa_ty)
-                if child_poll and (child_poll not in _ACTIVE_ROOTS):
-                    # whitelist enabled => only install if allowed
-                    if (not _whitelist_enabled()) or _whitelist_allows_by_name(child_poll):
-                        _ACTIVE_ROOTS.add(child_poll)
-                        PollEntryBP(child_poll, poll_sym=child_poll, internal=True, temporary=False)
+                if (
+                    child_poll
+                    and child_poll not in _ACTIVE_RUNTIME_EVENT_SYMBOLS
+                    and _whitelist_enabled()
+                    and _whitelist_allows_by_name(child_poll)
+                ):
+                    RuntimeEventBP(
+                        child_poll,
+                        func_name=child_poll,
+                        internal=True,
+                        temporary=False,
+                    )
+                    _ACTIVE_RUNTIME_EVENT_SYMBOLS.add(child_poll)
 
         # Install call-site breakpoints once per function (per run)
         if fn not in _CALLSITE_INSTALLED_FOR_FN:
@@ -2383,9 +3954,9 @@ class CallSiteBP(gdb.Breakpoint):
         # call line (no output dedup)
         _log_ard(f"[ARD]{indent} call[coro#{cid} poll#{seq}] {caller} -> {callee}") # 使用默认的 False
 
-        if _is_pollish_name(callee) and callee not in _ACTIVE_ROOTS:
-            _ACTIVE_ROOTS.add(callee)
-            PollEntryBP(callee, poll_sym=callee, internal=True, temporary=False)
+        if callee not in _ACTIVE_RUNTIME_EVENT_SYMBOLS:
+            RuntimeEventBP(callee, func_name=callee, internal=True, temporary=False)
+            _ACTIVE_RUNTIME_EVENT_SYMBOLS.add(callee)
 
         return False
 
@@ -2474,6 +4045,25 @@ def _enable_transition_probe(config_path: str) -> bool:
     except Exception as e:
         gdb.write(f"[ARD][transition-probe] failed to load config: {_short_error(e)}\n")
         return False
+
+    # Re-enabling the same live configuration used to delete every probe and
+    # clear the accumulated transition path.  The Inspector can request a
+    # refresh while a user also enables the probe manually, so make this exact
+    # already-enabled case idempotent.  Use ardb-disable-transition-probe
+    # before enabling again when a changed config must be reloaded.
+    if (
+        _TRANSITION_PROBE_CONFIG_PATH == resolved_path
+        and len(_TRANSITION_PROBE_BPS) == len(specs)
+        and all(
+            getattr(bp, "is_valid", lambda: False)()
+            for bp in _TRANSITION_PROBE_BPS
+        )
+    ):
+        gdb.write(
+            "[ARD][transition-probe] already enabled, skip reinstall "
+            f"(path_nodes={len(_TRANSITION_PATH)})\n"
+        )
+        return True
 
     _delete_transition_probe_bps()
     _reset_transition_path()
@@ -2571,31 +4161,71 @@ def _transition_probe_status():
 # Commands
 # -------------------------
 
+def _parse_trace_symbol(arg):
+    sym = (arg or "").strip()
+    if len(sym) >= 2 and sym[0] == sym[-1] and sym[0] in ("'", '"'):
+        sym = sym[1:-1]
+    return sym
+
+
+def _trace_symbol(sym):
+    """Select one observation root without changing runtime instrumentation."""
+    global ACTIVE_TRACE_ROOT
+    if not sym:
+        return False
+
+    try:
+        gdb.execute("set pagination off", to_string=True)
+        gdb.execute("set debuginfod enabled off", to_string=True)
+
+        # Observation roots are view/snapshot context only. They must never
+        # create a node, edge, graph event, or runtime breakpoint.
+        ACTIVE_TRACE_ROOT = sym
+        gdb.write(f"[ARD] trace root 已切换到 {sym}\n")
+        return True
+    except Exception as e:
+        gdb.write(f"[ARD] warning: trace failed for {sym}: {_short_error(e)}\n")
+        return False
+
+
+def _quote_gdb_break_location(sym):
+    # Single quotes preserve Rust symbols containing braces, #, and ::.
+    return "'" + sym.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
 class ARDTraceCommand(gdb.Command):
     def __init__(self):
         super().__init__("ardb-trace", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
-        sym = arg.strip()
-        if len(sym) >= 2 and sym[0] == sym[-1] and sym[0] in ("'", '"'):
-            sym = sym[1:-1]
+        sym = _parse_trace_symbol(arg)
         if not sym:
-            gdb.write("Usage: ardb-trace <poll-symbol>\n")
+            gdb.write("Usage: ardb-trace <function-symbol>\n")
+            return
+        _trace_symbol(sym)
+
+
+class ARDTraceBreakCommand(gdb.Command):
+    """Combine ardb-trace with a visible ordinary GDB breakpoint."""
+    def __init__(self, command_name="ardb-trace-break"):
+        super().__init__(command_name, gdb.COMMAND_USER)
+        self.command_name = command_name
+
+    def invoke(self, arg, from_tty):
+        sym = _parse_trace_symbol(arg)
+        if not sym:
+            gdb.write(f"Usage: {self.command_name} <symbol>\n")
             return
 
-        gdb.execute("set pagination off", to_string=True)
-        gdb.execute("set debuginfod enabled off", to_string=True)
+        trace_ok = _trace_symbol(sym)
+        if not trace_ok:
+            gdb.write(f"[ARD] warning: continuing with ordinary break after trace failure: {sym}\n")
 
-        if sym in _ACTIVE_ROOTS:
-            gdb.write(f"[ARD] root already traced: {sym}\n")
-            return
-
-        if _whitelist_enabled() and (not _whitelist_allows_by_name(sym)):
-            gdb.write(f"[ARD] warning: root not in whitelist: {sym}\n")
-
-        _ACTIVE_ROOTS.add(sym)
-        PollEntryBP(sym, poll_sym=sym, internal=False, temporary=False)
-        gdb.write(f"[ARD] trace root: {sym}\n")
+        try:
+            gdb.execute(f"break {_quote_gdb_break_location(sym)}", to_string=False)
+            gdb.write(f"[ARD] trace+break root: {sym}\n")
+        except Exception as e:
+            gdb.write(f"[ARD] warning: break failed for {sym}: {_short_error(e)}\n")
 
 
 class ARDPrivAddCommand(gdb.Command):
@@ -2876,11 +4506,51 @@ class ARDScanTransitionCandidatesCommand(gdb.Command):
         gdb.write(f"[ARD][transition-candidates] output: {path}\n")
 
 
+class ARDGenerateTransitionProbeDraftCommand(gdb.Command):
+    """
+    Generate a review-only transition probe draft from candidate scan JSON.
+    Usage: ardb-generate-transition-probe-draft <candidates_json> [output_json]
+    """
+    def __init__(self):
+        super().__init__("ardb-generate-transition-probe-draft", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        try:
+            parts = gdb.string_to_argv(arg)
+        except Exception:
+            parts = (arg or "").split()
+        if len(parts) not in (1, 2):
+            gdb.write(
+                "Usage: ardb-generate-transition-probe-draft "
+                "<candidates_json> [output_json]\n"
+            )
+            return
+
+        output_path = (
+            parts[1] if len(parts) == 2 else _default_transition_probe_draft_path()
+        )
+        try:
+            path, candidate_count, selected_count = _write_transition_probe_draft(
+                parts[0], output_path
+            )
+        except Exception as e:
+            gdb.write(
+                f"[ARD][transition-draft] generation failed: {_short_error(e)}\n"
+            )
+            return
+
+        gdb.write(f"[ARD][transition-draft] loaded candidates: {candidate_count}\n")
+        gdb.write(f"[ARD][transition-draft] selected probes: {selected_count}\n")
+        gdb.write(f"[ARD][transition-draft] output: {path}\n")
+        gdb.write("[ARD][transition-draft] review required before enabling\n")
+
+
 class ARDResetCommand(gdb.Command):
     def __init__(self):
         super().__init__("ardb-reset", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
+        global ACTIVE_TRACE_ROOT
         for bp in list(_CREATED_BPS):
             try:
                 bp.delete()
@@ -2888,9 +4558,11 @@ class ARDResetCommand(gdb.Command):
                 pass
         _CREATED_BPS.clear()
         _RUN_SCOPED_BPS.clear()
+        _RUNTIME_EVENT_BPS.clear()
+        _ACTIVE_RUNTIME_EVENT_SYMBOLS.clear()
 
         _CALLSITE_INSTALLED_FOR_FN.clear()
-        _ACTIVE_ROOTS.clear()
+        ACTIVE_TRACE_ROOT = None
 
         _invalidate_whitelist_addrs()
 
@@ -2912,8 +4584,13 @@ class ARDResetCommand(gdb.Command):
         _PRIVILEGE_ACTIVE_GROUP = "user"
         _set_privilege_state("unknown", "none")
         _reset_transition_path()
+        _clear_call_graph()
         global _CO_NEXT_ID
         _CO_NEXT_ID = 1
+
+        # Preserve the loaded whitelist, then restore only its runtime event
+        # instrumentation. ardb-reset does not create a trace root.
+        _install_whitelist_runtime_event_breakpoints()
 
         # Clear log file if exists
         path = _default_log_path()
@@ -2947,6 +4624,8 @@ class ARDLoadWhitelistCommand(gdb.Command):
         _WHITELIST_PREFIX = wl_prefix
         _WHITELIST_PATH = path
         _invalidate_whitelist_addrs()
+
+        _install_whitelist_runtime_event_breakpoints()
 
         gdb.write(f"[ARD] whitelist loaded: exact={len(wl_exact)} prefix={len(wl_prefix)} from {path}\n")
 
@@ -2985,7 +4664,9 @@ class ARDGetSnapshotCommand(gdb.Command):
                 f"[ARD][diag] snapshot enter thread={tid} stack={stack!r} all_tls={_TLS_STACK!r}"
             )
             _log_diag(
-                f"[ARD][diag] snapshot roots={sorted(_ACTIVE_ROOTS)!r} co_by_key={list(_CO_BY_KEY.keys())[:20]!r}"
+                f"[ARD][diag] snapshot observation_root={ACTIVE_TRACE_ROOT!r} "
+                f"runtime_event_symbols={sorted(_ACTIVE_RUNTIME_EVENT_SYMBOLS)!r} "
+                f"co_by_key={list(_CO_BY_KEY.keys())[:20]!r}"
             )
             _log_diag(
                 f"[ARD][diag] snapshot co_meta={dict(list(_CO_META.items())[:20])!r} poll_seq={dict(list(_CO_POLL_SEQ.items())[:20])!r}"
@@ -3420,6 +5101,77 @@ class ARDGetTransitionChainCommand(gdb.Command):
             gdb.write(f"[ARD] failed to get transition chain: {_short_error(e)}\n")
 
 
+class ARDGetHistoryTreeCommand(gdb.Command):
+    """
+    Get the cumulative runtime function call graph.
+    Usage: ardb-get-history-tree
+    """
+    def __init__(self):
+        super().__init__("ardb-get-history-tree", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        try:
+            result = _export_call_graph()
+            result["validation"] = _validate_call_graph()
+            gdb.write(json.dumps(result) + "\n")
+        except Exception as e:
+            gdb.write(json.dumps({
+                "type": "history_tree",
+                "roots": [],
+                "events_count": len(_CALL_GRAPH_EVENTS),
+                "nodes_count": len(_CALL_GRAPH_NODES),
+                "roots_count": 0,
+                "stable_roots_count": 0,
+                "edges_count": len(_CALL_GRAPH_EDGES),
+                "graph_kind": "call_graph",
+                "error": _short_error(e),
+                "validation": _validate_call_graph(),
+            }) + "\n")
+
+
+class ARDValidateHistoryTreeCommand(gdb.Command):
+    """Validate the filtered runtime History Tree without changing it."""
+    def __init__(self):
+        super().__init__("ardb-validate-history-tree", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        result = _validate_call_graph()
+        stats = result["stats"]
+        gdb.write(
+            "[ARD][GRAPH VALIDATOR] "
+            f"ok={str(result['ok']).lower()} "
+            f"nodes={stats['nodes_count']} edges={stats['edges_count']} "
+            f"roots={stats['roots_count']} events={stats['events_count']}\n"
+        )
+        for message in result["errors"]:
+            gdb.write(f"[ARD][GRAPH VALIDATOR][ERROR] {message}\n")
+        for message in result["warnings"]:
+            gdb.write(f"[ARD][GRAPH VALIDATOR][WARNING] {message}\n")
+
+
+class ARDClearHistoryTreeCommand(gdb.Command):
+    """
+    Clear the runtime event history tree.
+    Usage: ardb-clear-history-tree
+    """
+    def __init__(self):
+        super().__init__("ardb-clear-history-tree", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        _clear_call_graph()
+        gdb.write(json.dumps({
+            "type": "history_tree",
+            "roots": [],
+            "events_count": 0,
+            "nodes_count": 0,
+            "roots_count": 0,
+            "stable_roots_count": 0,
+            "edges_count": 0,
+            "graph_kind": "call_graph",
+            "cleared": True,
+        }) + "\n")
+
+
 class ARDGetGroupedWhitelistCommand(gdb.Command):
     """
     Return the grouped whitelist JSON (crate-level grouping with user-crate detection).
@@ -3519,6 +5271,7 @@ class ARDUpdateWhitelistCommand(gdb.Command):
             _WHITELIST_PREFIX = wl_prefix
             _WHITELIST_PATH = flat_path
             _invalidate_whitelist_addrs()
+            _install_whitelist_runtime_event_breakpoints()
         except Exception as e:
             gdb.write(f'[ARD] failed to reload whitelist: {e}\n')
             return
@@ -3579,6 +5332,8 @@ def install():
     gdb.execute("set debuginfod enabled off", to_string=True)
 
     ARDTraceCommand()
+    ARDTraceBreakCommand()
+    ARDTraceBreakCommand("ardb-tb")
     ARDPrivAddCommand()
     ARDPrivEnableCommand()
     ARDPrivResetCommand()
@@ -3594,12 +5349,16 @@ def install():
     ARDRel4DisableTransitionProbeCommand()
     ARDRel4TransitionProbeStatusCommand()
     ARDScanTransitionCandidatesCommand()
+    ARDGenerateTransitionProbeDraftCommand()
     ARDResetCommand()
     ARDLoadWhitelistCommand()
     ARDGenWhitelistCommand()
     ARDGetSnapshotCommand()
     ARDGetSnapshotPathCommand()
     ARDGetTransitionChainCommand()
+    ARDGetHistoryTreeCommand()
+    ARDValidateHistoryTreeCommand()
+    ARDClearHistoryTreeCommand()
     ARDGetGroupedWhitelistCommand()
     ARDUpdateWhitelistCommand()
     ARDInferTraceRootCommand()
@@ -3615,4 +5374,4 @@ def install():
             pass
         _EVENTS_INSTALLED = True
 
-    gdb.write("[ARD] installed. Commands: ardb-gen-whitelist, ardb-load-whitelist, ardb-trace, ardb-get-snapshot, ardb-get-snapshot-path, ardb-get-transition-chain, ardb-reset, ardb-get-whitelist-grouped, ardb-update-whitelist, ardb-infer-trace-root, ardb-priv-add, ardb-priv-enable, ardb-priv-reset, ardb-priv-status, ardb-transition-reset, ardb-transition-add, ardb-transition-event, ardb-transition-status, ardb-enable-transition-probe, ardb-disable-transition-probe, ardb-transition-probe-status, ardb-rel4-enable-transition-probe, ardb-rel4-disable-transition-probe, ardb-rel4-transition-probe-status, ardb-scan-transition-candidates\n")
+    gdb.write("[ARD] installed. Commands: ardb-gen-whitelist, ardb-load-whitelist, ardb-trace, ardb-trace-break, ardb-tb, ardb-get-snapshot, ardb-get-snapshot-path, ardb-get-transition-chain, ardb-get-history-tree, ardb-validate-history-tree, ardb-clear-history-tree, ardb-reset, ardb-get-whitelist-grouped, ardb-update-whitelist, ardb-infer-trace-root, ardb-priv-add, ardb-priv-enable, ardb-priv-reset, ardb-priv-status, ardb-transition-reset, ardb-transition-add, ardb-transition-event, ardb-transition-status, ardb-enable-transition-probe, ardb-disable-transition-probe, ardb-transition-probe-status, ardb-rel4-enable-transition-probe, ardb-rel4-disable-transition-probe, ardb-rel4-transition-probe-status, ardb-scan-transition-candidates, ardb-generate-transition-probe-draft\n")

@@ -3,6 +3,8 @@ import { ARDDebugAdapterFactory } from '../debugAdapter';
 import {
     SnapshotData,
     SnapshotPathData,
+    HistoryTreeData,
+    HistoryTreeNode,
     TransitionChainData,
     TransitionPathNode,
 } from '../gdbDebugSession';
@@ -35,6 +37,18 @@ interface SourceMapConfig {
     [key: string]: unknown;
 }
 
+interface HistorySnapshotRecord {
+    id: number;
+    timestamp: number;
+    path: SnapshotNode[];
+    raw: {
+        thread_id: number;
+        pathLength: number;
+        privilege?: string;
+        transition_event?: string;
+    };
+}
+
 /**
  * Async Inspector Panel - Webview for displaying async execution trees
  */
@@ -45,7 +59,11 @@ export class AsyncInspectorPanel {
     private _disposables: vscode.Disposable[] = [];
     private _debugAdapterFactory: ARDDebugAdapterFactory | undefined;
     private _debugSession: vscode.DebugSession | undefined;
-    private _treeRoots: Map<number, TreeNode> = new Map(); // root CID -> tree node
+    private _currentSnapshotTreeRoots: Map<number, TreeNode> = new Map(); // root CID -> current snapshot tree node
+    private _historyTreeRoots: TreeNode[] = [];
+    private _historySnapshots: HistorySnapshotRecord[] = [];
+    private _observedPathRoots: TreeNode[] = [];
+    private _nextSnapshotId = 1;
     /** Cache of the last snapshot, used by selectNode to find frame indices. */
     private _lastSnapshot: SnapshotPathData | undefined;
     private _lastTransitionPath: TransitionPathNode[] = [];
@@ -78,6 +96,12 @@ export class AsyncInspectorPanel {
                     case 'snapshot':
                         await this.handleSnapshot();
                         break;
+                    case 'refreshHistory':
+                        await this.handleRefreshHistory();
+                        break;
+                    case 'clearHistory':
+                        await this.handleClearHistory();
+                        break;
                     case 'chain':
                         await this.handleChainSnapshot();
                         break;
@@ -92,6 +116,18 @@ export class AsyncInspectorPanel {
                         break;
                     case 'refreshCandidates':
                         await this.handleRefreshCandidates();
+                        break;
+                    case 'scanTransitionCandidates':
+                        await this.handleScanTransitionCandidates();
+                        break;
+                    case 'generateTransitionProbeDraft':
+                        await this.handleGenerateTransitionProbeDraft();
+                        break;
+                    case 'reloadTransitionCandidates':
+                        await this.handleReloadTransitionCandidates();
+                        break;
+                    case 'reloadTransitionProbeDraft':
+                        await this.handleReloadTransitionProbeDraft();
                         break;
                 }
             },
@@ -136,21 +172,14 @@ export class AsyncInspectorPanel {
         this._panel.reveal();
     }
 
-    /**
-     * Called when the debug adapter sends a "stopped" event.
-     * Triggers snapshot refresh automatically when the inferior has been
-     * started (not the synthetic "entry" stop).
-     */
+    /** Refresh the runtime call graph whenever GDB reports a real stop. */
     public onDebugStopped(session: vscode.DebugSession, stoppedBody: any): void {
         this._debugSession = session;
         const isEntry = stoppedBody?.reason === 'entry';
         console.log(`[AsyncInspector] onDebugStopped reason=${stoppedBody?.reason} isEntry=${isEntry} hasSession=${!!this._debugSession}`);
 
         if (!isEntry) {
-            // No delay needed — the FIFO command queue in gdbAdapter
-            // correctly routes console output even when MI commands
-            // are in flight concurrently.
-            this.handleStoppedSnapshot().catch((e) => {
+            this.handleStoppedAutoRefresh().catch((e) => {
                 console.error('[AsyncInspector] onDebugStopped handlers failed:', e);
             });
         }
@@ -160,7 +189,8 @@ export class AsyncInspectorPanel {
         const session = this._debugAdapterFactory?.getActiveSession();
         if (session) {
             await session.reset();
-            this._treeRoots.clear();
+            this._currentSnapshotTreeRoots.clear();
+            this.resetHistoryState();
             this._lastTransitionPath = [];
             this._update();
             vscode.window.showInformationMessage('ARD reset completed');
@@ -248,12 +278,44 @@ export class AsyncInspectorPanel {
         return session.getTransitionChain(suppressOutput);
     }
 
+    private async fetchHistoryTree(suppressOutput: boolean = false): Promise<HistoryTreeData | undefined> {
+        const session = this._debugAdapterFactory?.getActiveSession();
+        if (!session) {
+            console.warn('[AsyncInspector] fetchHistoryTree: no GDB session from factory');
+            return undefined;
+        }
+        return session.refreshHistoryTree(suppressOutput);
+    }
+
+    private async clearBackendHistoryTree(suppressOutput: boolean = false): Promise<void> {
+        const session = this._debugAdapterFactory?.getActiveSession();
+        if (!session) {
+            return;
+        }
+        await session.clearHistoryTree(suppressOutput);
+    }
+
     private renderAsyncTreeFromSnapshot(snapshot: SnapshotPathData): void {
         this._lastSnapshot = snapshot;
         this.updateTreeFromSnapshot(snapshot);
+        this.recordHistorySnapshot(snapshot);
+        this._observedPathRoots = this.buildObservedPathsTree();
+        this._historyTreeRoots = this.getHistoryTreeData();
         this._panel.webview.postMessage({
             command: 'updateTree',
-            treeData: Array.from(this._treeRoots.values()),
+            treeData: this._historyTreeRoots,
+        });
+    }
+
+    private renderRuntimeHistoryTree(historyTree: HistoryTreeData): void {
+        const runtimeRoots = this.normalizeRuntimeHistoryNodes(historyTree.roots || []);
+        // The graph header is static webview UI. Render only the actual
+        // runtime roots so the old virtual call-graph node does not
+        // become a second title above the execution graph.
+        this._historyTreeRoots = runtimeRoots;
+        this._panel.webview.postMessage({
+            command: 'updateTree',
+            treeData: this._historyTreeRoots,
         });
     }
 
@@ -267,10 +329,39 @@ export class AsyncInspectorPanel {
         });
     }
 
+    private async handleClearHistory(): Promise<void> {
+        await this.clearBackendHistoryTree(false);
+        this.clearHistory();
+    }
+
+    private clearHistory(): void {
+        this.resetHistoryState();
+        this._panel.webview.postMessage({
+            command: 'updateTree',
+            treeData: this._historyTreeRoots,
+        });
+    }
+
+    private resetHistoryState(): void {
+        this._historySnapshots = [];
+        this._observedPathRoots = [];
+        this._nextSnapshotId = 1;
+        this._historyTreeRoots = [];
+    }
+
     private async handleSnapshot(): Promise<void> {
-        const snapshot = await this.fetchSnapshotPath(false);
-        if (snapshot) {
-            this.renderAsyncTreeFromSnapshot(snapshot);
+        await this.fetchSnapshot(false);
+    }
+
+    private async handleRefreshHistory(): Promise<void> {
+        const historyTree = await this.fetchHistoryTree(false);
+        if (historyTree) {
+            this.renderRuntimeHistoryTree(historyTree);
+            const currentSnapshot = await this.fetchSnapshotPath(true);
+            if (currentSnapshot) {
+                this._lastSnapshot = currentSnapshot;
+                this.updateTreeFromSnapshot(currentSnapshot);
+            }
         }
     }
 
@@ -281,10 +372,18 @@ export class AsyncInspectorPanel {
         }
     }
 
-    private async handleStoppedSnapshot(): Promise<void> {
+    private async handleStoppedAutoRefresh(): Promise<void> {
+        const historyTree = await this.fetchHistoryTree(true);
+        if (historyTree) {
+            this.renderRuntimeHistoryTree(historyTree);
+        }
+
+        // Keep current snapshot data available for source/frame selection and
+        // transition rendering without using it as a History Tree data source.
         const snapshot = await this.fetchSnapshot(true);
         if (snapshot) {
-            this.renderAsyncTreeFromSnapshot(snapshot);
+            this._lastSnapshot = snapshot;
+            this.updateTreeFromSnapshot(snapshot);
             this.renderCrossPrivilegeChainFromSnapshot(snapshot);
         }
     }
@@ -355,6 +454,85 @@ export class AsyncInspectorPanel {
                 candidates: candidates
             });
         }
+    }
+
+    private async handleScanTransitionCandidates(): Promise<void> {
+        const session = this._debugAdapterFactory?.getActiveSession();
+        if (!session) {
+            this.postTransitionCandidates({
+                path: '',
+                candidates: [],
+                error: 'No active debug session. Start debugging before scanning.',
+            });
+            return;
+        }
+        this.postTransitionCandidates(await session.scanTransitionCandidates());
+    }
+
+    private async handleGenerateTransitionProbeDraft(): Promise<void> {
+        const session = this._debugAdapterFactory?.getActiveSession();
+        if (!session) {
+            this.postTransitionProbeDraft({
+                path: '',
+                probes: [],
+                error: 'No active debug session. Start debugging before generating a draft.',
+            });
+            return;
+        }
+        this.postTransitionProbeDraft(await session.generateTransitionProbeDraft());
+    }
+
+    private async handleReloadTransitionCandidates(): Promise<void> {
+        const session = this._debugAdapterFactory?.getActiveSession();
+        if (!session) {
+            this.postTransitionCandidates({
+                path: '',
+                candidates: [],
+                error: 'Transition candidates are unavailable.',
+            });
+            return;
+        }
+        this.postTransitionCandidates(await session.loadTransitionCandidates());
+    }
+
+    private async handleReloadTransitionProbeDraft(): Promise<void> {
+        const session = this._debugAdapterFactory?.getActiveSession();
+        if (!session) {
+            this.postTransitionProbeDraft({
+                path: '',
+                probes: [],
+                error: 'Probe draft is unavailable.',
+            });
+            return;
+        }
+        this.postTransitionProbeDraft(await session.loadTransitionProbeDraft());
+    }
+
+    private postTransitionCandidates(result: {
+        path: string;
+        candidates: unknown[];
+        candidateCount?: number;
+        generatedAt?: string;
+        error?: string;
+    }): void {
+        this._panel.webview.postMessage({
+            command: 'updateTransitionCandidates',
+            ...result,
+        });
+    }
+
+    private postTransitionProbeDraft(result: {
+        path: string;
+        probes: unknown[];
+        candidateCount?: number;
+        selectedCount?: number;
+        generatedAt?: string;
+        error?: string;
+    }): void {
+        this._panel.webview.postMessage({
+            command: 'updateTransitionProbeDraft',
+            ...result,
+        });
     }
 
     private inspectorLog(level: 'info' | 'warn' | 'error', message: string): void {
@@ -968,10 +1146,231 @@ export class AsyncInspectorPanel {
         target.transition_event = source.transition_event;
     }
 
+    private normalizeRuntimeHistoryNodes(nodes: HistoryTreeNode[]): TreeNode[] {
+        return nodes.map(node => {
+            const nodeType = node.type === 'sync' || node.type === 'transition'
+                ? node.type
+                : 'async';
+            // Runtime displayLabel is intentionally ignored here: the backend
+            // may append transient calls/active diagnostics to it, while the
+            // History Tree title should stay the canonical function symbol.
+            const func = String(node.func || node.displayLabel || '<unknown>');
+            const treeNode: TreeNode = {
+                type: nodeType,
+                cid: typeof node.cid === 'number' ? node.cid : null,
+                func,
+                displayLabel: func,
+                addr: typeof node.addr === 'string' ? node.addr : '',
+                poll: typeof node.poll === 'number' ? node.poll : 0,
+                state: typeof node.state === 'number' || typeof node.state === 'string'
+                    ? node.state
+                    : 'N/A',
+                state_read_status: typeof node.state_read_status === 'string' ? node.state_read_status : undefined,
+                state_read_error: typeof node.state_read_error === 'string' ? node.state_read_error : undefined,
+                origin: typeof node.origin === 'string' ? node.origin : 'runtime-history',
+                historyKind: typeof node.historyKind === 'string' ? node.historyKind : 'call-graph',
+                thread_id: node.thread_id,
+                parent_cid: node.parent_cid,
+                enter_count: typeof node.enter_count === 'number' ? node.enter_count : 0,
+                exit_count: typeof node.exit_count === 'number' ? node.exit_count : 0,
+                seenCount: typeof node.seenCount === 'number' ? node.seenCount : node.enter_count,
+                active: typeof node.active === 'boolean' ? node.active : false,
+                currentlyInLatestSnapshot: typeof node.currentlyInLatestSnapshot === 'boolean'
+                    ? node.currentlyInLatestSnapshot
+                    : node.active,
+                privilege: typeof node.privilege === 'string' ? node.privilege : undefined,
+                transition_event: typeof node.transition_event === 'string' ? node.transition_event : undefined,
+                children: this.normalizeRuntimeHistoryNodes(Array.isArray(node.children) ? node.children : []),
+            };
+            return treeNode;
+        });
+    }
+
+    private recordHistorySnapshot(snapshot: SnapshotPathData): void {
+        const id = this._nextSnapshotId++;
+        this._historySnapshots.push({
+            id,
+            timestamp: Date.now(),
+            path: snapshot.path.map(node => ({ ...node })),
+            raw: {
+                thread_id: snapshot.thread_id,
+                pathLength: snapshot.path.length,
+                privilege: snapshot.privilege,
+                transition_event: snapshot.transition_event,
+            },
+        });
+    }
+
+    private getSnapshotHistoryTreeData(): TreeNode[] {
+        return this._historySnapshots.map(record => ({
+            type: 'transition',
+            cid: null,
+            func: `Snapshot #${record.id}`,
+            displayLabel: `Snapshot #${record.id}`,
+            addr: '',
+            poll: 0,
+            state: new Date(record.timestamp).toISOString(),
+            historyKind: 'snapshot',
+            snapshotId: record.id,
+            timestamp: record.timestamp,
+            origin: 'observed-history',
+            raw: record.raw,
+            children: this.buildSnapshotPathTree(record.path),
+        }));
+    }
+
+    private getHistoryTreeData(): TreeNode[] {
+        if (this._historySnapshots.length === 0) {
+            return [];
+        }
+
+        return [
+            {
+                type: 'transition',
+                cid: null,
+                func: 'Observed Async Paths',
+                displayLabel: 'Observed Async Paths (observed / seen before)',
+                addr: '',
+                poll: 0,
+                state: `snapshots=${this._historySnapshots.length}`,
+                historyKind: 'observed-root',
+                origin: 'observed-history',
+                children: this._observedPathRoots,
+            },
+            {
+                type: 'transition',
+                cid: null,
+                func: 'Snapshots',
+                displayLabel: 'Snapshots',
+                addr: '',
+                poll: 0,
+                state: `count=${this._historySnapshots.length}`,
+                historyKind: 'snapshot-root',
+                origin: 'observed-history',
+                children: this.getSnapshotHistoryTreeData(),
+            },
+        ];
+    }
+
+    private buildObservedPathsTree(): TreeNode[] {
+        const roots: TreeNode[] = [];
+        const latestSnapshotId = this._historySnapshots[this._historySnapshots.length - 1]?.id;
+
+        for (const record of this._historySnapshots) {
+            const pathNodes = this.getSnapshotPathSegment(record.path);
+            let siblings = roots;
+
+            for (const pathNode of pathNodes) {
+                const key = this.getObservedNodeKey(pathNode);
+                let observedNode = siblings.find(node => node.observedKey === key);
+                if (!observedNode) {
+                    observedNode = this.createTreeNodeFromSnapshotNode(pathNode);
+                    observedNode.historyKind = 'observed';
+                    observedNode.observedKey = key;
+                    observedNode.seenCount = 0;
+                    observedNode.firstSeenSnapshot = record.id;
+                    observedNode.currentlyInLatestSnapshot = false;
+                    siblings.push(observedNode);
+                }
+
+                if (observedNode.lastSeenSnapshot !== record.id) {
+                    observedNode.seenCount = (observedNode.seenCount ?? 0) + 1;
+                    observedNode.firstSeenSnapshot = Math.min(
+                        observedNode.firstSeenSnapshot ?? record.id,
+                        record.id
+                    );
+                    observedNode.lastSeenSnapshot = record.id;
+                }
+
+                if (record.id === latestSnapshotId) {
+                    observedNode.currentlyInLatestSnapshot = true;
+                    observedNode.cid = pathNode.cid;
+                    observedNode.addr = pathNode.addr;
+                    observedNode.poll = pathNode.poll ?? 0;
+                    observedNode.state = pathNode.state ?? (pathNode.type === 'sync' ? 'NON-ASYNC' : 'N/A');
+                    observedNode.origin = this.getSnapshotNodeOrigin(pathNode);
+                    observedNode.file = pathNode.file;
+                    observedNode.fullname = pathNode.fullname;
+                    observedNode.line = pathNode.line;
+                    this.copySnapshotMetadata(observedNode, pathNode);
+                }
+
+                siblings = observedNode.children;
+            }
+        }
+
+        roots.forEach(root => this.finalizeObservedNodeLabels(root));
+        return roots;
+    }
+
+    private getSnapshotPathSegment(pathNodes: SnapshotNode[]): SnapshotNode[] {
+        const rootIndex = pathNodes.findIndex(node => node.type === 'async');
+        return rootIndex >= 0 ? pathNodes.slice(rootIndex) : [];
+    }
+
+    private getObservedNodeKey(node: SnapshotNode): string {
+        const name = node.func || node.addr || '<unknown>';
+        return `${node.type}:${name}`;
+    }
+
+    private finalizeObservedNodeLabels(node: TreeNode): void {
+        if (node.historyKind === 'observed') {
+            const latest = node.currentlyInLatestSnapshot ? 'yes' : 'no';
+            node.displayLabel = `${node.func} [seen=${node.seenCount ?? 0} latest=${latest}]`;
+        }
+        node.children.forEach(child => this.finalizeObservedNodeLabels(child));
+    }
+
+    private buildSnapshotPathTree(pathNodes: SnapshotNode[]): TreeNode[] {
+        if (pathNodes.length === 0) {
+            return [];
+        }
+
+        let rootIndex = -1;
+        for (let i = 0; i < pathNodes.length; i++) {
+            if (pathNodes[i].type === 'async') {
+                rootIndex = i;
+                break;
+            }
+        }
+
+        if (rootIndex < 0) {
+            return [];
+        }
+
+        const root = this.createTreeNodeFromSnapshotNode(pathNodes[rootIndex]);
+        let current = root;
+        for (let i = rootIndex + 1; i < pathNodes.length; i++) {
+            const child = this.createTreeNodeFromSnapshotNode(pathNodes[i]);
+            current.children.push(child);
+            current = child;
+        }
+
+        return [root];
+    }
+
+    private createTreeNodeFromSnapshotNode(node: SnapshotNode): TreeNode {
+        const treeNode: TreeNode = {
+            type: node.type,
+            cid: node.cid,
+            func: node.func,
+            addr: node.addr,
+            poll: node.poll ?? 0,
+            state: node.state ?? (node.type === 'sync' ? 'NON-ASYNC' : 'N/A'),
+            origin: this.getSnapshotNodeOrigin(node),
+            file: node.file,
+            fullname: node.fullname,
+            line: node.line,
+            children: [],
+        };
+        this.copySnapshotMetadata(treeNode, node);
+        return treeNode;
+    }
+
     private updateTreeFromSnapshot(snapshot: SnapshotPathData): void {
         // The Inspector is a view of the current snapshot, not accumulated
         // trace history. Rebuild so nodes absent from this path disappear.
-        this._treeRoots.clear();
+        this._currentSnapshotTreeRoots.clear();
 
         if (snapshot.path.length === 0) {
             return;
@@ -994,7 +1393,7 @@ export class AsyncInspectorPanel {
             return;
         }
 
-        let root = this._treeRoots.get(rootNode.cid);
+        let root = this._currentSnapshotTreeRoots.get(rootNode.cid);
         if (!root) {
             root = {
                 type: 'async',
@@ -1009,7 +1408,7 @@ export class AsyncInspectorPanel {
                 line: rootNode.line,
                 children: []
             };
-            this._treeRoots.set(rootNode.cid, root);
+            this._currentSnapshotTreeRoots.set(rootNode.cid, root);
         } else {
             root.poll = rootNode.poll;
             root.state = rootNode.state;
@@ -1214,7 +1613,7 @@ export class AsyncInspectorPanel {
                     }
                     .transition-chain {
                         display: block;
-                        flex: 1 1 50%;
+                        height: 100%;
                         min-height: 0;
                         margin: 0;
                         padding: 8px;
@@ -1243,18 +1642,46 @@ export class AsyncInspectorPanel {
                         font-size: 11px;
                         padding-left: 10px;
                     }
-                    .side-panel {
-                        min-height: 0;
-                        overflow: hidden;
-                        gap: 12px;
-                    }
                     .candidates-section {
-                        flex: 1 1 50%;
+                        flex: 1;
                         min-height: 0;
+                        overflow-y: auto;
                     }
                     #candidatesList {
                         max-height: none;
                         overflow-y: visible;
+                    }
+                    .async-trace-candidates {
+                        min-width: 0;
+                    }
+                    .async-trace-candidates-scroll {
+                        max-width: 100%;
+                        max-height: 300px;
+                        overflow-x: auto;
+                        overflow-y: auto;
+                    }
+                    .async-trace-candidates-scroll #candidatesList {
+                        min-width: max-content;
+                        max-height: none;
+                        overflow: visible;
+                    }
+                    .async-trace-candidates-scroll .candidate-item {
+                        min-width: max-content;
+                    }
+                    .async-trace-candidates-scroll .candidate-symbol {
+                        white-space: nowrap;
+                    }
+                    .execution-graph-header {
+                        margin-bottom: 10px;
+                    }
+                    .execution-graph-header h3 {
+                        margin-bottom: 4px;
+                    }
+                    .execution-graph-description {
+                        color: var(--vscode-descriptionForeground);
+                        font-size: 11px;
+                        line-height: 1.4;
+                        overflow-wrap: anywhere;
                     }
                 </style>
                 <title>Async Inspector</title>
@@ -1266,29 +1693,37 @@ export class AsyncInspectorPanel {
                         <button id="resetBtn" class="btn">Reset</button>
                         <button id="genWhitelistBtn" class="btn">Gen Whitelist</button>
                         <button id="snapshotBtn" class="btn">Snapshot</button>
+                        <button id="historyBtn" class="btn">History</button>
+                        <button id="clearHistoryBtn" class="btn">Clear History</button>
                         <button id="chainBtn" class="btn">Chain</button>
-                    </div>
-                    <div style="padding: 0 10px 10px; color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.4;">
-                        Snapshot refreshes the current execution tree. Chain refreshes the cross-privilege transition path.
                     </div>
                     <div class="main-content">
                         <div class="tree-panel">
-                            <h3>Async Execution Tree</h3>
+                            <div class="execution-graph-header">
+                                <h3>Async Execution Graph</h3>
+                                <div class="execution-graph-description">Runtime call graph from whitelist-admitted runtime events. Snapshot only prints the current snapshot. Trace only selects the observation root; graph nodes are built from whitelist-admitted runtime events.</div>
+                            </div>
                             <div id="treeContainer"></div>
                         </div>
-                        <div class="side-panel">
-                            <div class="candidates-section">
-                                <h3>Candidates</h3>
-                                <div id="candidatesList"></div>
-                            </div>
+                        <div class="transition-panel">
                             <div id="transitionChain" class="transition-chain"></div>
+                        </div>
+                        <div class="candidates-panel">
+                            <div class="candidates-section">
+                                <div class="candidate-block async-trace-candidates">
+                                    <h3>Async Trace Candidates</h3>
+                                    <div class="async-trace-candidates-scroll">
+                                        <div id="candidatesList"></div>
+                                    </div>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
                 <script>
                     window.ardInspectorVscode = window.ardInspectorVscode || acquireVsCodeApi();
                     window.acquireVsCodeApi = function() { return window.ardInspectorVscode; };
-                    window.treeData = ${JSON.stringify(Array.from(this._treeRoots.values()))};
+                    window.treeData = ${JSON.stringify(this._historyTreeRoots)};
                     window.transitionPath = ${JSON.stringify(this._lastTransitionPath)};
                 </script>
                 <script src="${scriptUri}"></script>
@@ -1318,89 +1753,6 @@ export class AsyncInspectorPanel {
                             badge.className = 'ard-badge ' + (extraClass || '');
                             badge.textContent = text;
                             container.appendChild(badge);
-                        }
-
-                        function stateBadge(node) {
-                            var status = node && node.state_read_status;
-                            if (status === 'ok') {
-                                return { text: 'STATE:OK', cls: 'state-ok' };
-                            }
-                            if (status === 'unsupported') {
-                                return { text: 'STATE:UNSUPPORTED', cls: 'state-unsupported' };
-                            }
-                            if (status) {
-                                return { text: 'STATE:' + String(status).toUpperCase(), cls: 'state-unsupported' };
-                            }
-                            return { text: 'STATE:N/A', cls: 'state-unsupported' };
-                        }
-
-                        function originBadge(node) {
-                            var origin = node && node.origin;
-                            switch (origin) {
-                                case 'trace':
-                                    return 'TRACE';
-                                case 'trace-upgraded':
-                                    return 'TRACE-UPGRADED';
-                                case 'inferred':
-                                    return 'INFERRED';
-                                case 'physical':
-                                    return 'PHYSICAL';
-                                default:
-                                    return 'ORIGIN:N/A';
-                            }
-                        }
-
-                        function transitionBadge(node) {
-                            var event = node && node.transition_event;
-                            if (event === 'user_to_kernel') {
-                                return 'USER->KERNEL';
-                            }
-                            if (event === 'kernel_to_user') {
-                                return 'KERNEL->USER';
-                            }
-                            if (event && event !== 'none') {
-                                return String(event).toUpperCase();
-                            }
-                            return '';
-                        }
-
-                        function formatEvidence(node) {
-                            var origin = node && node.origin;
-                            switch (origin) {
-                                case 'trace':
-                                    return 'Evidence: real poll hit';
-                                case 'trace-upgraded':
-                                    return 'Evidence: inferred node upgraded by trace hit';
-                                case 'inferred':
-                                    return 'Evidence: inferred from frame / awaitee';
-                                case 'physical':
-                                    return 'Evidence: physical stack frame';
-                                default:
-                                    return 'Evidence: unavailable';
-                            }
-                        }
-
-                        function formatChildHit(node) {
-                            if (!node) {
-                                return 'ChildHit: N/A';
-                            }
-                            var parent = node.child_hit_parent_symbol;
-                            var child = node.child_hit_child_symbol;
-                            if (parent || child) {
-                                return 'ChildHit: ' + valueOrNA(parent) + ' -> ' + valueOrNA(child);
-                            }
-                            var match = node.child_hit_match;
-                            if (match && match !== 'not_applicable') {
-                                return 'ChildHit: ' + match;
-                            }
-                            return 'ChildHit: ' + valueOrNA(match || 'not_applicable');
-                        }
-
-                        function appendDetail(info, text, extraClass) {
-                            var line = document.createElement('div');
-                            line.className = 'node-detail-line ' + (extraClass || '');
-                            line.textContent = text;
-                            info.appendChild(line);
                         }
 
                         function transitionNodeText(node) {
@@ -1483,75 +1835,51 @@ export class AsyncInspectorPanel {
                             var oldDetails = info.querySelectorAll(':scope > .node-detail-line');
                             oldDetails.forEach(function(detail) { detail.remove(); });
 
-                            var badges = document.createElement('div');
-                            badges.className = 'node-badges';
-                            var typeText = node.type === 'async' ? 'ASYNC' : (node.type === 'transition' ? 'TRANSITION' : 'SYNC');
-                            addBadge(badges, typeText, node.type === 'async' ? 'async' : (node.type === 'sync' ? 'sync' : 'transition'));
+                            // Prefer the canonical function field over backend
+                            // displayLabel diagnostics such as [calls=...].
+                            func.textContent = node.func || node.displayLabel || '<unknown>';
 
-                            var privilege = node.privilege;
-                            if (privilege === 'kernel') {
-                                addBadge(badges, 'KERNEL', 'kernel');
-                            } else if (privilege === 'user') {
-                                addBadge(badges, 'USER', 'user');
-                            } else {
-                                addBadge(badges, 'PRIV:N/A', '');
+                            if (node.historyKind !== 'call-graph-root' && node.type !== 'transition') {
+                                var badges = document.createElement('div');
+                                badges.className = 'node-badges';
+                                var typeText = node.type === 'async' ? 'ASYNC' : 'SYNC';
+                                addBadge(badges, typeText, node.type === 'async' ? 'async' : 'sync');
+
+                                var privilege = node.privilege;
+                                if (privilege === 'kernel') {
+                                    addBadge(badges, 'KERNEL', 'kernel');
+                                } else if (privilege === 'user') {
+                                    addBadge(badges, 'USER', 'user');
+                                }
+                                info.insertBefore(badges, func);
                             }
 
-                            addBadge(badges, originBadge(node), 'trace');
-                            var state = stateBadge(node);
-                            addBadge(badges, state.text, state.cls);
-                            var transition = transitionBadge(node);
-                            if (transition) {
-                                addBadge(badges, transition, 'transition');
-                            }
-
-                            info.insertBefore(badges, func);
-
-                            if (node.type === 'async') {
+                            if (node.historyKind === 'observed-root') {
+                                meta.textContent = 'Observed paths accumulated across snapshots; latest=yes marks membership in the newest snapshot.path.';
+                            } else if (node.historyKind === 'call-graph-root') {
+                                meta.textContent = 'Runtime call graph from whitelist-admitted runtime events. Snapshot only prints the current snapshot. Trace only selects the observation root; graph nodes are built from whitelist-admitted runtime events.';
+                            } else if (node.historyKind === 'call-graph') {
+                                meta.textContent =
+                                    'CallGraph: calls=' + valueOrNA(node.enter_count) +
+                                    ' | exit=' + valueOrNA(node.exit_count) +
+                                    ' | active=' + (node.active ? 'yes' : 'no') +
+                                    ' | thread=' + valueOrNA(node.thread_id);
+                            } else if (node.historyKind === 'snapshot-root') {
+                                meta.textContent = 'Recorded snapshot.path samples, grouped by snapshot id.';
+                            } else if (node.historyKind === 'snapshot') {
+                                meta.textContent = 'Snapshot #' + valueOrNA(node.snapshotId);
+                            } else if (node.historyKind === 'observed') {
+                                meta.textContent =
+                                    'Observed: seen=' + valueOrNA(node.seenCount) +
+                                    ' | first=#' + valueOrNA(node.firstSeenSnapshot) +
+                                    ' | last=#' + valueOrNA(node.lastSeenSnapshot) +
+                                    ' | latest=' + (node.currentlyInLatestSnapshot ? 'yes' : 'no');
+                            } else if (node.type === 'async') {
                                 meta.textContent =
                                     'CID: ' + valueOrNA(node.cid) +
-                                    ' | Poll: ' + valueOrNA(node.poll) +
-                                    ' | State: ' + formatDisplayState(node) +
-                                    ' | StateRead: ' + valueOrNA(node.state_read_status);
+                                    ' | Poll: ' + valueOrNA(node.poll);
                             } else {
                                 meta.textContent = 'Addr: ' + valueOrNA(node.addr);
-                            }
-
-                            if (node.transition_event && node.transition_event !== 'none') {
-                                appendDetail(info, 'Transition: ' + node.transition_event);
-                            } else if (node.transition_event === 'none') {
-                                appendDetail(info, 'Transition: none');
-                            }
-                            appendDetail(info, formatEvidence(node));
-                            appendDetail(info, formatChildHit(node));
-                            if (node.state_read_error) {
-                                appendDetail(info, 'StateReadError: ' + node.state_read_error, 'node-detail-note');
-                            }
-                        }
-
-                        function formatDisplayState(node) {
-                            var state = node ? node.state : undefined;
-                            if (state === 'NON-ASYNC') {
-                                return 'NON-ASYNC';
-                            }
-                            if (typeof state === 'number') {
-                                return String(state);
-                            }
-                            if (typeof state === 'string' && state !== 'N/A') {
-                                return state;
-                            }
-
-                            switch (node && node.origin) {
-                                case 'trace':
-                                    return 'unavailable';
-                                case 'trace-upgraded':
-                                    return 'trace-hit, state unavailable';
-                                case 'physical':
-                                    return 'physical-only';
-                                case 'inferred':
-                                    return 'inferred';
-                                default:
-                                    return 'unavailable';
                             }
                         }
 
@@ -1649,6 +1977,7 @@ interface TreeNode {
     type: 'async' | 'sync' | 'transition';
     cid: number | null;
     func: string;
+    displayLabel?: string;
     addr: string;
     poll: number;
     state: number | string;
@@ -1663,6 +1992,20 @@ interface TreeNode {
     privilege?: string;
     transition_event?: string;
     origin?: string;
+    historyKind?: string;
+    observedKey?: string;
+    seenCount?: number;
+    firstSeenSnapshot?: number;
+    lastSeenSnapshot?: number;
+    currentlyInLatestSnapshot?: boolean;
+    thread_id?: number | string | null;
+    parent_cid?: number | string | null;
+    enter_count?: number;
+    exit_count?: number;
+    active?: boolean;
+    snapshotId?: number;
+    timestamp?: number;
+    raw?: unknown;
     file?: string;
     fullname?: string;
     line?: number;

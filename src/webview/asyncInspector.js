@@ -24,9 +24,18 @@
             vscode.postMessage({ command: 'snapshot' });
         });
 
+        document.getElementById('historyBtn').addEventListener('click', () => {
+            vscode.postMessage({ command: 'refreshHistory' });
+        });
+
+        document.getElementById('clearHistoryBtn').addEventListener('click', () => {
+            vscode.postMessage({ command: 'clearHistory' });
+        });
+
         document.getElementById('chainBtn').addEventListener('click', () => {
             vscode.postMessage({ command: 'chain' });
         });
+
     }
 
     function renderTree(roots) {
@@ -34,7 +43,7 @@
         container.innerHTML = '';
 
         if (roots.length === 0) {
-            container.innerHTML = '<div class="placeholder-text">No async execution tree available. Start debugging and set a trace point.</div>';
+            container.innerHTML = '<div class="placeholder-text">No async history tree available. Start debugging and take a snapshot.</div>';
             return;
         }
 
@@ -46,7 +55,7 @@
 
     function createTreeNode(node, depth) {
         const div = document.createElement('div');
-        div.className = `tree-node ${node.type} ${selectedNode === node.cid ? 'selected' : ''}`;
+        div.className = `tree-node ${node.type} ${selectedNode !== null && selectedNode === node.cid ? 'selected' : ''}`;
         div.style.marginLeft = `${depth * 20}px`;
 
         const content = document.createElement('div');
@@ -62,12 +71,12 @@
 
         const func = document.createElement('div');
         func.className = 'node-func';
-        func.textContent = node.func;
+        func.textContent = node.func || node.displayLabel;
 
         const meta = document.createElement('div');
         meta.className = 'node-meta';
         if (node.type === 'async') {
-            meta.textContent = `CID: ${node.cid} | Poll: ${node.poll} | State: ${node.state}`;
+            meta.textContent = `CID: ${node.cid} | Poll: ${node.poll}`;
         } else {
             meta.textContent = `Addr: ${node.addr}`;
         }

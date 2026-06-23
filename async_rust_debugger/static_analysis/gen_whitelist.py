@@ -76,6 +76,7 @@ def _extract_symbol_name(signature: str) -> str | None:
     return s[:i].strip()
 
 def gen_poll_whitelist(out_path: str):
+    gdb.write("[ARD] whitelist scan: command=info functions\n")
     output = gdb.execute("info functions", to_string=True)
     funcs = parse_info_functions(output)
 
@@ -96,12 +97,18 @@ def gen_poll_whitelist(out_path: str):
             uniq.append(s)
             seen.add(s)
 
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    output_dir = os.path.dirname(os.path.abspath(out_path))
+    os.makedirs(output_dir, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as fp:
         for i, s in enumerate(uniq):
             fp.write(f"{i} {s}\n")
 
-    gdb.write(f"[ARD] wrote whitelist: {len(uniq)} symbols -> {out_path}\n")
+    gdb.write(f"[ARD] whitelist generated: count={len(uniq)} path={out_path}\n")
+    if not uniq:
+        gdb.write(
+            "[ARD] no Poll-return functions found from GDB info functions; "
+            "check kernel.elf debug info\n"
+        )
 
 def gen_default_whitelist():
     temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")

@@ -48,7 +48,10 @@ class GDBDebugSession {
         // Determine temp directory
         const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         const envTempDir = process.env.ASYNC_RUST_DEBUGGER_TEMP_DIR;
-        this.tempDir = envTempDir || (workspaceFolder ? path.join(workspaceFolder, 'temp') : './temp');
+        this.tempDir = path.resolve(envTempDir ||
+            (workspaceFolder
+                ? path.join(workspaceFolder, 'temp')
+                : path.join(context.extensionUri.fsPath, 'temp')));
         this.logPath = path.join(this.tempDir, 'ardb.log');
         this.whitelistPath = path.join(this.tempDir, 'poll_functions.txt');
         // Ensure temp directory exists
@@ -83,7 +86,8 @@ class GDBDebugSession {
         const configuredCwd = typeof config.cwd === 'string'
             ? this.expandWorkspaceFolder(config.cwd, workspaceFolder)
             : workspaceFolder;
-        const configuredTempDir = config.env?.ASYNC_RUST_DEBUGGER_TEMP_DIR;
+        const configuredTempDir = config.env?.ASYNC_RUST_DEBUGGER_TEMP_DIR ||
+            process.env.ASYNC_RUST_DEBUGGER_TEMP_DIR;
         if (typeof configuredTempDir === 'string' && configuredTempDir.trim()) {
             const expandedTempDir = this.expandWorkspaceFolder(configuredTempDir, workspaceFolder);
             return path.isAbsolute(expandedTempDir)
@@ -297,6 +301,47 @@ class GDBDebugSession {
             return this.lastTransitionChain;
         }
     }
+    async getHistoryTree(suppressOutput = false) {
+        try {
+            const output = await this.executeGDBCommand('ardb-get-history-tree', suppressOutput);
+            const result = this.parseJSONResult(output);
+            if (result && result.type === 'history_tree' && Array.isArray(result.roots)) {
+                this.lastHistoryTree = result;
+                return result;
+            }
+            return undefined;
+        }
+        catch (error) {
+            console.error('Failed to get history tree:', error);
+            return undefined;
+        }
+    }
+    /** Fetch the backend runtime call graph for manual and stopped-event refreshes. */
+    async refreshHistoryTree(suppressOutput = true) {
+        return this.getHistoryTree(suppressOutput);
+    }
+    async clearHistoryTree(suppressOutput = false) {
+        try {
+            const output = await this.executeGDBCommand('ardb-clear-history-tree', suppressOutput);
+            const result = this.parseJSONResult(output);
+            if (result && result.type === 'history_tree') {
+                this.lastHistoryTree = result;
+                return result;
+            }
+            this.lastHistoryTree = {
+                type: 'history_tree',
+                roots: [],
+                events_count: 0,
+                nodes_count: 0,
+                cleared: true,
+            };
+            return this.lastHistoryTree;
+        }
+        catch (error) {
+            console.error('Failed to clear history tree:', error);
+            return undefined;
+        }
+    }
     parseJSONResult(output) {
         if (!output) {
             return undefined;
@@ -307,6 +352,168 @@ class GDBDebugSession {
             return undefined;
         }
         return JSON.parse(output.substring(jsonStart, jsonEnd + 1));
+    }
+    transitionCandidatesPath() {
+        return path.join(this.tempDir, 'transition_candidates.json');
+    }
+    transitionProbeDraftPath() {
+        return path.join(this.tempDir, 'transition-probe.draft.json');
+    }
+    quoteGDBArgument(value) {
+        return JSON.stringify(value);
+    }
+    async loadTransitionCandidates() {
+        const candidatesPath = this.transitionCandidatesPath();
+        try {
+            if (!fs.existsSync(candidatesPath)) {
+                return {
+                    path: candidatesPath,
+                    candidates: [],
+                    error: 'No transition candidates available. Run Scan Candidates first.',
+                };
+            }
+            const payload = JSON.parse(fs.readFileSync(candidatesPath, 'utf-8'));
+            if (!payload || !Array.isArray(payload.candidates)) {
+                return {
+                    path: candidatesPath,
+                    candidates: [],
+                    error: "Invalid transition candidates file: 'candidates' must be an array.",
+                };
+            }
+            if (!payload.candidates.every(candidate => candidate && typeof candidate === 'object')) {
+                return {
+                    path: candidatesPath,
+                    candidates: [],
+                    error: 'Invalid transition candidates file: every candidate must be an object.',
+                };
+            }
+            const candidates = payload.candidates;
+            return {
+                path: candidatesPath,
+                candidates,
+                candidateCount: candidates.length,
+                generatedAt: typeof payload.generated_at === 'string'
+                    ? payload.generated_at
+                    : undefined,
+            };
+        }
+        catch (error) {
+            console.error('Failed to load transition candidates:', error);
+            return {
+                path: candidatesPath,
+                candidates: [],
+                error: `Failed to load transition candidates: ${String(error)}`,
+            };
+        }
+    }
+    async loadTransitionProbeDraft() {
+        const draftPath = this.transitionProbeDraftPath();
+        try {
+            if (!fs.existsSync(draftPath)) {
+                return {
+                    path: draftPath,
+                    probes: [],
+                    error: 'No probe draft available. Run Generate Draft first.',
+                };
+            }
+            const payload = JSON.parse(fs.readFileSync(draftPath, 'utf-8'));
+            if (!payload || !Array.isArray(payload.probes)) {
+                return {
+                    path: draftPath,
+                    probes: [],
+                    error: "Invalid transition probe draft: 'probes' must be an array.",
+                };
+            }
+            if (!payload.probes.every(probe => probe && typeof probe === 'object')) {
+                return {
+                    path: draftPath,
+                    probes: [],
+                    error: 'Invalid transition probe draft: every probe must be an object.',
+                };
+            }
+            const probes = payload.probes;
+            return {
+                path: draftPath,
+                probes,
+                candidateCount: typeof payload.candidate_count === 'number'
+                    ? payload.candidate_count
+                    : undefined,
+                selectedCount: typeof payload.selected_count === 'number'
+                    ? payload.selected_count
+                    : probes.length,
+                generatedAt: typeof payload.generated_at === 'string'
+                    ? payload.generated_at
+                    : undefined,
+            };
+        }
+        catch (error) {
+            console.error('Failed to load transition probe draft:', error);
+            return {
+                path: draftPath,
+                probes: [],
+                error: `Failed to load transition probe draft: ${String(error)}`,
+            };
+        }
+    }
+    async scanTransitionCandidates() {
+        const candidatesPath = this.transitionCandidatesPath();
+        try {
+            const output = await this.executeGDBCommand(`ardb-scan-transition-candidates ${this.quoteGDBArgument(candidatesPath)}`);
+            if (!output.trim()) {
+                return {
+                    path: candidatesPath,
+                    candidates: [],
+                    error: 'No response from ardb-scan-transition-candidates.',
+                };
+            }
+            if (/\[ARD\]\[transition-candidates\].*failed:|undefined command|error while executing/i
+                .test(output)) {
+                return {
+                    path: candidatesPath,
+                    candidates: [],
+                    error: output.trim(),
+                };
+            }
+            return this.loadTransitionCandidates();
+        }
+        catch (error) {
+            return {
+                path: candidatesPath,
+                candidates: [],
+                error: `Failed to scan transition candidates: ${String(error)}`,
+            };
+        }
+    }
+    async generateTransitionProbeDraft() {
+        const candidatesPath = this.transitionCandidatesPath();
+        const draftPath = this.transitionProbeDraftPath();
+        try {
+            const output = await this.executeGDBCommand('ardb-generate-transition-probe-draft ' +
+                `${this.quoteGDBArgument(candidatesPath)} ${this.quoteGDBArgument(draftPath)}`);
+            if (!output.trim()) {
+                return {
+                    path: draftPath,
+                    probes: [],
+                    error: 'No response from ardb-generate-transition-probe-draft.',
+                };
+            }
+            if (/\[ARD\]\[transition-draft\].*failed:|undefined command|error while executing/i
+                .test(output)) {
+                return {
+                    path: draftPath,
+                    probes: [],
+                    error: output.trim(),
+                };
+            }
+            return this.loadTransitionProbeDraft();
+        }
+        catch (error) {
+            return {
+                path: draftPath,
+                probes: [],
+                error: `Failed to generate transition probe draft: ${String(error)}`,
+            };
+        }
     }
     /**
      * Execute ardb-reset command.
@@ -329,7 +536,14 @@ class GDBDebugSession {
             }
             await this.loadWhitelist();
             const count = await this.getWhitelistSymbolCount();
-            vscode.window.showInformationMessage(`Whitelist generated and loaded (${count} symbols found)`);
+            const result = `whitelist generated: count=${count} path=${this.whitelistPath}`;
+            if (count === 0) {
+                vscode.window.showWarningMessage(`${result}; no Poll-return functions found from GDB info functions; ` +
+                    'check kernel.elf debug info');
+            }
+            else {
+                vscode.window.showInformationMessage(result);
+            }
             const doc = await vscode.workspace.openTextDocument(this.whitelistPath);
             await vscode.window.showTextDocument(doc);
         }

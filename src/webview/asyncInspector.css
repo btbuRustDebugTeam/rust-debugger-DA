@@ -41,26 +41,40 @@ body {
 }
 
 .main-content {
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(420px, 1fr) 280px 300px;
     flex: 1;
-    gap: 20px;
-    overflow: hidden;
+    min-height: 0;
+    gap: 16px;
+    overflow-x: auto;
+    overflow-y: hidden;
 }
 
 .tree-panel {
-    flex: 1;
     display: flex;
     flex-direction: column;
-    overflow: auto;
+    min-width: 420px;
+    min-height: 0;
+    overflow: hidden;
 }
 
-.side-panel {
+.transition-panel,
+.candidates-panel {
+    min-height: 0;
+    border-left: 1px solid var(--vscode-panel-border);
+    padding-left: 10px;
+}
+
+.transition-panel {
+    width: 280px;
+    overflow: hidden;
+}
+
+.candidates-panel {
     width: 300px;
     display: flex;
     flex-direction: column;
-    gap: 20px;
-    border-left: 1px solid var(--vscode-panel-border);
-    padding-left: 10px;
+    overflow: hidden;
 }
 
 h3 {
@@ -132,7 +146,45 @@ h3 {
 
 .candidates-section {
     flex: 1;
+    min-height: 0;
     overflow: auto;
+}
+
+.candidate-block {
+    padding-bottom: 10px;
+    margin-bottom: 10px;
+    border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.candidate-block:last-child {
+    margin-bottom: 0;
+    border-bottom: none;
+}
+
+.candidate-section-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.candidate-section-header h3 {
+    margin-bottom: 0;
+}
+
+.candidate-section-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 4px;
+}
+
+.candidate-file-summary {
+    margin-bottom: 6px;
+    color: var(--vscode-descriptionForeground);
+    font-size: 10px;
+    overflow-wrap: anywhere;
 }
 
 #candidatesList {
@@ -176,6 +228,67 @@ h3 {
 
 .candidate-btn:hover {
     background-color: var(--vscode-button-secondaryHoverBackground);
+}
+
+.candidate-btn:disabled {
+    cursor: default;
+    opacity: 0.65;
+}
+
+.transition-confidence-group {
+    margin-top: 8px;
+}
+
+.transition-confidence-title {
+    margin-bottom: 4px;
+    color: var(--vscode-descriptionForeground);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.transition-candidate-card,
+.transition-draft-card {
+    padding: 6px;
+    margin: 4px 0;
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 3px;
+    background: var(--vscode-editorWidget-background);
+    overflow-wrap: anywhere;
+}
+
+.transition-candidate-name,
+.transition-draft-name {
+    font-family: var(--vscode-editor-font-family);
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.transition-candidate-meta,
+.transition-draft-meta,
+.transition-candidate-detail,
+.transition-draft-detail {
+    margin-top: 3px;
+    color: var(--vscode-descriptionForeground);
+    font-size: 10px;
+    line-height: 1.35;
+}
+
+.transition-draft-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+    margin-bottom: 4px;
+}
+
+.transition-draft-badge {
+    padding: 1px 4px;
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 3px;
+    color: var(--vscode-descriptionForeground);
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
 }
 
 .placeholder-text {
