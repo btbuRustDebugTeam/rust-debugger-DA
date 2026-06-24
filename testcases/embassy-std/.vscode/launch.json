@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug embassy-std tick (ARD manual connect)",
+      "type": "ardb",
+      "request": "launch",
+      "program": "/home/user/embassy/examples/std/target/debug/tick",
+      "cwd": "${workspaceFolder}",
+      "gdbPath": "gdb",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/../..",
+        "ASYNC_RUST_DEBUGGER_TEMP_DIR": "${workspaceFolder}/temp"
+      }
+    }
+  ]
+}

@@ -46,6 +46,21 @@
       "internalConsoleOptions": "openOnSessionStart"
     },
     {
+      "name": "Run Extension - embassy-std tick",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "${workspaceFolder}/testcases/embassy-std"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/out/**/*.js"
+      ],
+      "preLaunchTask": "npm: compile",
+      "sourceMaps": true,
+      "internalConsoleOptions": "openOnSessionStart"
+    },
+    {
       "name": "Debug Adapter (standalone)",
       "type": "node",
       "request": "launch",

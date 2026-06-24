@@ -1,0 +1,36 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "embassy-std: build tick",
+      "type": "shell",
+      "command": "./build_examples.sh tick",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "embassy-std: generate tick whitelist",
+      "type": "shell",
+      "command": "./gen_whitelist.sh tick",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "embassy-std: start tick gdbserver",
+      "type": "shell",
+      "command": "./run_example_gdbserver.sh tick 1234",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    }
+  ]
+}

@@ -36,6 +36,37 @@
         "$rustc"
       ],
       "group": "build"
+    },
+    {
+      "label": "embassy-std: build tick",
+      "type": "shell",
+      "command": "./build_examples.sh tick",
+      "options": {
+        "cwd": "${workspaceFolder}/testcases/embassy-std"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "embassy-std: gen whitelist",
+      "type": "shell",
+      "command": "./gen_whitelist.sh tick",
+      "options": {
+        "cwd": "${workspaceFolder}/testcases/embassy-std"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "embassy-std: start gdbserver tick",
+      "type": "shell",
+      "command": "./run_example_gdbserver.sh tick 1234",
+      "options": {
+        "cwd": "${workspaceFolder}/testcases/embassy-std"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
     }
   ]
 }
