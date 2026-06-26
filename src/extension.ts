@@ -6,6 +6,28 @@ import { AsyncInspectorPanel } from './webview/asyncInspectorPanel';
 let debugAdapterFactory: ARDDebugAdapterFactory | undefined;
 let inspectorPanel: AsyncInspectorPanel | undefined;
 
+function ensureInspectorPanel(context: vscode.ExtensionContext): AsyncInspectorPanel | undefined {
+    if (!debugAdapterFactory) {
+        return undefined;
+    }
+
+    if (AsyncInspectorPanel.currentPanel) {
+        inspectorPanel = AsyncInspectorPanel.currentPanel;
+        inspectorPanel.reveal();
+        return inspectorPanel;
+    }
+
+    inspectorPanel = AsyncInspectorPanel.createOrShow(context.extensionUri, debugAdapterFactory);
+    return inspectorPanel;
+}
+
+async function showInspectorForTestcaseLaunch(context: vscode.ExtensionContext, reason: string): Promise<void> {
+    console.log(`[ARD] showing Async Inspector for ${reason}`);
+    ensureInspectorPanel(context);
+    await vscode.commands.executeCommand('workbench.view.debug');
+    await vscode.commands.executeCommand('workbench.panel.repl.view.focus');
+}
+
 export function activate(context: vscode.ExtensionContext) {
     console.log('ARD Debug Adapter extension is now active');
 
@@ -37,11 +59,7 @@ export function activate(context: vscode.ExtensionContext) {
             vscode.window.showErrorMessage('Debug adapter factory not initialized');
             return;
         }
-        if (!inspectorPanel) {
-            inspectorPanel = AsyncInspectorPanel.createOrShow(context.extensionUri, debugAdapterFactory);
-        } else {
-            inspectorPanel.reveal();
-        }
+        ensureInspectorPanel(context);
     });
 
     // Register command to trace function from editor
@@ -78,15 +96,13 @@ export function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(openInspectorCommand, traceFunctionCommand);
 
-    // Open inspector automatically when debug session starts
+    // Match the rel4 testcase flow: when an ARD debug session starts, show the
+    // Inspector in the main editor area and keep the normal debug UI visible.
     const onDidStartDebugSession = vscode.debug.onDidStartDebugSession((session) => {
         if (session.type === 'ardb' && debugAdapterFactory) {
-            if (!inspectorPanel) {
-                inspectorPanel = AsyncInspectorPanel.createOrShow(
-                    context.extensionUri,
-                    debugAdapterFactory
-                );
-            }
+            showInspectorForTestcaseLaunch(context, session.name).catch((error) => {
+                console.error('[ARD] failed to show Async Inspector for debug session:', error);
+            });
         }
     });
 

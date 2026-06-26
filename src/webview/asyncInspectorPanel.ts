@@ -143,8 +143,8 @@ export class AsyncInspectorPanel {
 
     public static createOrShow(extensionUri: vscode.Uri, debugAdapterFactory: ARDDebugAdapterFactory): AsyncInspectorPanel {
         const column = vscode.window.activeTextEditor
-            ? vscode.window.activeTextEditor.viewColumn
-            : undefined;
+            ? vscode.window.activeTextEditor.viewColumn ?? vscode.ViewColumn.Active
+            : vscode.ViewColumn.Active;
 
         // If we already have a panel, show it
         if (AsyncInspectorPanel.currentPanel) {
@@ -156,7 +156,7 @@ export class AsyncInspectorPanel {
         const panel = vscode.window.createWebviewPanel(
             'asyncInspector',
             'Async Inspector',
-            column || vscode.ViewColumn.Two,
+            column,
             {
                 enableScripts: true,
                 localResourceRoots: [extensionUri],

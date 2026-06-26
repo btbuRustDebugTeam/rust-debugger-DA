@@ -61,6 +61,21 @@
       "internalConsoleOptions": "openOnSessionStart"
     },
     {
+      "name": "Extension Development Host (with lilos)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "${workspaceFolder}/testcases/lilos_src"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/out/**/*.js"
+      ],
+      "preLaunchTask": "npm: compile",
+      "sourceMaps": true,
+      "internalConsoleOptions": "openOnSessionStart"
+    },
+    {
       "name": "Debug Adapter (standalone)",
       "type": "node",
       "request": "launch",

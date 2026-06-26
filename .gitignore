@@ -18,3 +18,5 @@ testcases/**/temp/
 *.log
 *.pyc
 __pycache__/
+out/
+*.map

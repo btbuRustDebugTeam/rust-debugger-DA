@@ -67,6 +67,32 @@
         "reveal": "always",
         "panel": "dedicated"
       }
+    },
+    {
+      "label": "lilos: start qemu",
+      "type": "shell",
+      "command": "echo '[LILOS] Manual mode: cd testcases/lilos_src && ./run_lilos.sh qemu 1234'",
+      "problemMatcher": []
+    },
+    {
+      "label": "lilos: gen whitelist",
+      "type": "shell",
+      "command": "bash testcases/lilos_src/gen_whitelist.sh",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      }
+    },
+    {
+      "label": "lilos: gdb attach",
+      "type": "shell",
+      "command": "gdb-multiarch /home/user/lilos/target/thumbv7m-none-eabi/debug/lilos-testsuite-lm3s6965",
+      "options": {
+        "cwd": "${workspaceFolder}/testcases/lilos_src"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
     }
   ]
 }
