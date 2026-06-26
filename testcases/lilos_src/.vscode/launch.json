@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Attach to :1234 (ARD)",
+      "type": "ardb",
+      "request": "launch",
+      "program": "/home/user/lilos/target/thumbv7m-none-eabi/debug/lilos-testsuite-lm3s6965",
+      "cwd": "${workspaceFolder}",
+      "gdbPath": "gdb-multiarch",
+      "targetRemote": ":1234",
+      "env": {
+        "ASYNC_RUST_DEBUGGER_TEMP_DIR": "${workspaceFolder}/temp"
+      }
+    }
+  ]
+}

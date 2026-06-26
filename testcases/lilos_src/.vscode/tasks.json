@@ -1,0 +1,29 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "lilos: show manual qemu command",
+      "type": "shell",
+      "command": "echo 'Run manually: cd /home/user/RustDebug/rust-debugger-DA/testcases/lilos_src && ./run_lilos.sh qemu 1234'",
+      "problemMatcher": []
+    },
+    {
+      "label": "lilos: gen whitelist",
+      "type": "shell",
+      "command": "bash ./gen_whitelist.sh",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "lilos: gdb attach helper",
+      "type": "shell",
+      "command": "gdb-multiarch /home/user/lilos/target/thumbv7m-none-eabi/debug/lilos-testsuite-lm3s6965 -ex 'target remote :1234'",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    }
+  ]
+}
