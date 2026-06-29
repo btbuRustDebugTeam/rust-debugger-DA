@@ -1,4 +1,6 @@
-![学校logo](docs/assets/校徽.png)
+<p align="center">
+  <img src="docs/assets/校徽.png" alt="学校logo">
+</p>
 
 # 操作系统跨特权级统一调试平台
 
