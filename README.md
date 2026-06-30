@@ -376,7 +376,7 @@ Async Inspector 与原生 Call Stack 形成「物理流 + 逻辑流」双轨协�
 
 ### 2. 初赛 PPT
 
-[操作系统跨特权级统一调试平台初赛PPT](docs/)
+[操作系统跨特权级统一调试平台初赛PPT](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/%E5%88%9D%E8%B5%9BPPT-%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E8%B7%A8%E7%89%B9%E6%9D%83%E7%BA%A7%E7%BB%9F%E4%B8%80%E8%B0%83%E8%AF%95%E5%B9%B3%E5%8F%B0.pdf)
 
 
 ## 九、参考说明
