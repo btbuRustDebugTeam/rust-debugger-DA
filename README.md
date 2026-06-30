@@ -14,6 +14,9 @@
 | **学校**     | 北京工商大学                                                 |
 | **小组成员** | 曾小红、王浩铭、武雪妍                                       |
 | **指导老师** | 吴竞邦                                                       |
+| **初赛文档** | [操作系统跨特权级统一调试平台初赛文档](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/%E5%88%9D%E8%B5%9B%E6%96%87%E6%A1%A3-%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E8%B7%A8%E7%89%B9%E6%9D%83%E7%BA%A7%E7%BB%9F%E4%B8%80%E8%B0%83%E8%AF%95%E5%B9%B3%E5%8F%B0.pdf)                                                      |
+| **初赛PPT** | [操作系统跨特权级统一调试平台初赛PP](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/%E5%88%9D%E8%B5%9BPPT-%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E8%B7%A8%E7%89%B9%E6%9D%83%E7%BA%A7%E7%BB%9F%E4%B8%80%E8%B0%83%E8%AF%95%E5%B9%B3%E5%8F%B0.pdf)                                                       |
+| **演示视频** | [操作系统跨特权级统一调试平台初赛演示视频](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/tree/main/docs)                                                      |
 
 ### 1.2 摘要
 
@@ -57,7 +60,7 @@
 
 | **成员** | **主要分工**                                                                                 |
 | -------- | -------------------------------------------------------------------------------------------- |
-| 曾小红   | StarryOS 适配与验证、async-debug 插件设计与实现、Async Inspector 面板、async-debug 的 OS 调试功能移植、embassy 验证、撰写参赛文档、演示视频录制 |
+| 曾小红   | StarryOS 适配与验证、async-debug 插件设计与实现、Async Inspector 面板、async-debug 的 OS 调试功能移植、embassy 验证、撰写参赛文档、演示视频录制、PPT制作 |
 | 王浩铭   | 复现 2023–2024 年 code-debug 的前序工作；文档测试章节的撰写 |
 | 武雪妍   | 图片制作、PPT 制作 |
 
