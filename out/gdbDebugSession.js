@@ -442,8 +442,10 @@ class GDBDebugSession {
             for (const line of content.split('\n')) {
                 const trimmed = line.trim();
                 if (trimmed && !trimmed.startsWith('#')) {
-                    const parts = trimmed.split(/\s+/);
-                    const symbol = parts.length >= 2 ? parts[1] : trimmed;
+                    // Preserve the complete symbol after the optional numeric
+                    // index; Rust generic symbols may contain spaces.
+                    const indexed = trimmed.match(/^\d+\s+(.+)$/);
+                    const symbol = indexed ? indexed[1].trim() : trimmed;
                     if (symbol) {
                         candidates.push(symbol);
                     }

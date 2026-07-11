@@ -1204,33 +1204,54 @@ class AsyncInspectorPanel {
                         padding-left: 10px;
                     }
                     .candidates-section {
-                        flex: 1;
-                        min-height: 0;
-                        overflow-y: auto;
+                        flex: 0 0 auto;
+                        min-height: auto;
+                        overflow: visible;
                     }
                     #candidatesList {
+                        width: max-content;
+                        min-width: 100%;
                         max-height: none;
-                        overflow-y: visible;
+                        overflow: visible;
                     }
                     .async-trace-candidates {
                         min-width: 0;
                     }
                     .async-trace-candidates-scroll {
+                        width: 100%;
                         max-width: 100%;
-                        max-height: 300px;
+                        max-height: none;
                         overflow-x: auto;
-                        overflow-y: auto;
+                        overflow-y: visible;
+                        padding-bottom: 4px;
                     }
                     .async-trace-candidates-scroll #candidatesList {
-                        min-width: max-content;
+                        width: max-content;
+                        min-width: 100%;
                         max-height: none;
                         overflow: visible;
                     }
                     .async-trace-candidates-scroll .candidate-item {
-                        min-width: max-content;
+                        display: grid;
+                        grid-template-columns: max-content max-content;
+                        width: max-content;
+                        min-width: 100%;
+                        column-gap: 12px;
+                    }
+                    .async-trace-candidates-scroll .candidate-actions {
+                        position: sticky;
+                        right: 0;
+                        z-index: 2;
+                        justify-self: end;
+                        padding-left: 8px;
+                        background: var(--vscode-editor-background);
                     }
                     .async-trace-candidates-scroll .candidate-symbol {
+                        width: max-content;
+                        min-width: max-content;
                         white-space: nowrap;
+                        overflow: visible;
+                        text-overflow: clip;
                     }
                     .execution-graph-header {
                         margin-bottom: 10px;
