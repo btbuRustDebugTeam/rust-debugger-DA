@@ -370,11 +370,11 @@ export class AsyncInspectorPanel {
                 }
                 current = child;
             } else {
-                const existing = current.children.find(
+                let child = current.children.find(
                     c => c.cid === null && c.func === node.func && c.addr === node.addr
                 );
-                if (!existing) {
-                    const untrackedChild: TreeNode = {
+                if (!child) {
+                    child = {
                         type: node.type,
                         cid: null,
                         func: node.func,
@@ -383,8 +383,9 @@ export class AsyncInspectorPanel {
                         state: node.state,
                         children: [],
                     };
-                    current.children.push(untrackedChild);
+                    current.children.push(child);
                 }
+                current = child;
             }
         }
     }

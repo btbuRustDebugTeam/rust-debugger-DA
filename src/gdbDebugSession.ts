@@ -731,9 +731,7 @@ export class GDBDebugSession extends DebugSession {
         try {
             await this.miDebugger!.sendCommand(`thread-select ${threadId}`);
 
-            const record = await this.miDebugger!.sendCliCommand('ardb-get-snapshot');
-            const output = this.getConsoleOutput(record);
-            const snapshot = this.parseSnapshot(output);
+            const snapshot = await this.getSnapshotFromGDB();
 
             if (snapshot && snapshot.path.length > 0) {
                 const reversedPath = [...snapshot.path].reverse();
@@ -1068,9 +1066,7 @@ export class GDBDebugSession extends DebugSession {
 
     private async handleArdGetSnapshot(response: DebugProtocol.Response): Promise<void> {
         if (!this.miDebugger) { response.body = { snapshot: null }; this.sendResponse(response); return; }
-        const record = await this.miDebugger.sendCliCommand('ardb-get-snapshot');
-        const output = this.getConsoleOutput(record);
-        const snapshot = this.parseSnapshot(output);
+        const snapshot = await this.getSnapshotFromGDB();
         response.body = { snapshot: snapshot || null };
         this.sendResponse(response);
     }
@@ -1592,6 +1588,25 @@ export class GDBDebugSession extends DebugSession {
     // Helper methods
     // -----------------------------------------------------------------------
 
+    /** Send ardb-get-snapshot to GDB, then read the JSON result from disk. */
+    private async getSnapshotFromGDB(): Promise<SnapshotData | undefined> {
+        if (!this.miDebugger) return undefined;
+        await this.miDebugger.sendCliCommand('ardb-get-snapshot');
+        const snapshotPath = path.join(this.tempDir, 'ardb_snapshot.json');
+        try {
+            if (fs.existsSync(snapshotPath)) {
+                const content = fs.readFileSync(snapshotPath, 'utf-8');
+                const data = JSON.parse(content);
+                if (data && Array.isArray(data.path)) {
+                    return data as SnapshotData;
+                }
+            }
+        } catch {
+            // ignore read/parse errors
+        }
+        return undefined;
+    }
+
     /** Extract console stream output accumulated by MI2 sendCliCommand result */
     private getConsoleOutput(node: MINode): string {
         // MI2's sendCliCommand collects console stream lines into resultRecords?.results
@@ -1614,10 +1629,6 @@ export class GDBDebugSession extends DebugSession {
         if (!node) return '';
         // The consoleOutput is stored in node via our patched sendCommand
         return (node as any)._consoleOutput || '';
-    }
-
-    private parseSnapshot(output: string): SnapshotData | undefined {
-        return this.parseJsonFromOutput(output) as SnapshotData | undefined;
     }
 
     private parseJsonFromOutput(output: string): any | undefined {
