@@ -66,6 +66,11 @@
         "command": "ardb.traceFunction",
         "title": "Trace Function",
         "icon": "$(debug-start)"
+      },
+      {
+        "command": "async-rust-debugger.revealStopLocation",
+        "title": "ARD: Reveal Stop Location",
+        "icon": "$(go-to-file)"
       }
     ],
     "menus": {

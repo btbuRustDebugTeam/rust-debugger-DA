@@ -16,6 +16,20 @@
       "internalConsoleOptions": "openOnSessionStart"
     },
     {
+      "name": "Extension Development Host (with OS)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/out/**/*.js"
+      ],
+      "preLaunchTask": "npm: compile",
+      "sourceMaps": true,
+      "internalConsoleOptions": "openOnSessionStart"
+    },
+    {
       "name": "Extension Development Host (with testcase)",
       "type": "extensionHost",
       "request": "launch",

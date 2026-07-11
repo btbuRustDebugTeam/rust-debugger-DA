@@ -1,0 +1,45 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "cargo build",
+      "type": "shell",
+      "command": "cargo",
+      "args": [
+        "build"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$rustc"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "gen whitelist",
+      "type": "shell",
+      "command": "./gen_whitelist.sh",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "start gdbserver :1234",
+      "type": "shell",
+      "command": "./run_gdbserver.sh",
+      "args": [
+        "1234"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "isBackground": true,
+      "problemMatcher": []
+    }
+  ]
+}

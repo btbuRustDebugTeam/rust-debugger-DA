@@ -1,0 +1,28 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug no_external_runtime (ARD)",
+      "type": "ardb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/no_runtime_futures",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "stopOnEntry": false,
+      "console": "internalConsole",
+      "preLaunchTask": "cargo build"
+    },
+    {
+      "name": "Attach no_external_runtime :1234 (ARD)",
+      "type": "ardb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/no_runtime_futures",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "stopOnEntry": true,
+      "console": "internalConsole",
+      "targetRemote": ":1234",
+      "preLaunchTask": "cargo build"
+    }
+  ]
+}

@@ -20,16 +20,18 @@
             vscode.postMessage({ command: 'genWhitelist' });
         });
 
+        document.getElementById('continueBtn').addEventListener('click', () => {
+            const continueBtn = document.getElementById('continueBtn');
+            continueBtn.disabled = true;
+            vscode.postMessage({ command: 'continueExecution' });
+        });
+
         document.getElementById('snapshotBtn').addEventListener('click', () => {
             vscode.postMessage({ command: 'snapshot' });
         });
 
         document.getElementById('historyBtn').addEventListener('click', () => {
             vscode.postMessage({ command: 'refreshHistory' });
-        });
-
-        document.getElementById('clearHistoryBtn').addEventListener('click', () => {
-            vscode.postMessage({ command: 'clearHistory' });
         });
 
         document.getElementById('chainBtn').addEventListener('click', () => {
@@ -43,7 +45,7 @@
         container.innerHTML = '';
 
         if (roots.length === 0) {
-            container.innerHTML = '<div class="placeholder-text">No async history tree available. Start debugging and take a snapshot.</div>';
+            container.innerHTML = '<div class="placeholder-text">No async execution graph available. Start debugging and select a trace root.</div>';
             return;
         }
 
@@ -184,6 +186,9 @@
             case 'updateCandidates':
                 candidates = message.candidates;
                 renderCandidates(candidates);
+                break;
+            case 'continueExecutionResult':
+                document.getElementById('continueBtn').disabled = false;
                 break;
         }
     });

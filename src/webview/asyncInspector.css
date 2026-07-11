@@ -235,62 +235,6 @@ h3 {
     opacity: 0.65;
 }
 
-.transition-confidence-group {
-    margin-top: 8px;
-}
-
-.transition-confidence-title {
-    margin-bottom: 4px;
-    color: var(--vscode-descriptionForeground);
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-}
-
-.transition-candidate-card,
-.transition-draft-card {
-    padding: 6px;
-    margin: 4px 0;
-    border: 1px solid var(--vscode-panel-border);
-    border-radius: 3px;
-    background: var(--vscode-editorWidget-background);
-    overflow-wrap: anywhere;
-}
-
-.transition-candidate-name,
-.transition-draft-name {
-    font-family: var(--vscode-editor-font-family);
-    font-size: 11px;
-    font-weight: 600;
-}
-
-.transition-candidate-meta,
-.transition-draft-meta,
-.transition-candidate-detail,
-.transition-draft-detail {
-    margin-top: 3px;
-    color: var(--vscode-descriptionForeground);
-    font-size: 10px;
-    line-height: 1.35;
-}
-
-.transition-draft-badges {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 3px;
-    margin-bottom: 4px;
-}
-
-.transition-draft-badge {
-    padding: 1px 4px;
-    border: 1px solid var(--vscode-panel-border);
-    border-radius: 3px;
-    color: var(--vscode-descriptionForeground);
-    font-size: 9px;
-    font-weight: 600;
-    text-transform: uppercase;
-}
-
 .placeholder-text {
     padding: 10px;
     color: var(--vscode-descriptionForeground);

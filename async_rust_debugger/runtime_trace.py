@@ -3,6 +3,7 @@ import re
 import struct
 import gdb
 import json
+import copy
 from datetime import datetime, timezone
 # -------------------------
 # Debug runtime_trace.py
@@ -78,6 +79,15 @@ _RECENT_CALL_ROOT_MAX_EVENT_GAP = 64
 _RECENT_CALL_PARENT_BY_THREAD = {}  # thread_num -> most recent non-root admitted function
 _RECENT_CALL_PARENT_GLOBAL = None
 _RECENT_CALL_PARENT_MAX_EVENT_GAP = 64
+_TRACE_SESSION = None
+_TRACE_SESSION_SEQ = 0
+_TRACE_SESSION_SINGLE_ROOT_ENV = "ARD_NO_EXTERNAL_RUNTIME_SINGLE_ROOT"
+_TRACE_SESSION_DEFAULT_ENTRY = "no_runtime_futures::async_coordinator::{async_fn#0}"
+_TRACE_SESSION_SOURCE_PRIORITY = {
+    "entry": 1,
+    "breakpoint": 2,
+    "ardb-trace": 3,
+}
 # parent poll symbol -> last observed direct child poll hit
 _LAST_CHILD_HIT_BY_PARENT = {}
 _LAST_CHILD_HIT_BY_CALLER_FRAME = {}
@@ -103,45 +113,6 @@ _TRANSITION_PROBE_CONFIG_COUNT = 0
 _REL4_TRANSITION_PROBE_CONFIG = os.path.join(
     "testcases", "rel4-async", "transition-probe.json"
 )
-
-_TRANSITION_CANDIDATE_KEYWORDS = (
-    "trap",
-    "syscall",
-    "user_to_kernel",
-    "kernel_to_user",
-    "decode_invocation",
-    "decode",
-    "invocation",
-    "handle_syscall",
-    "async_syscall",
-    "async_syscall_handler",
-    "switch_to_user",
-    "restore",
-    "entry",
-    "exception",
-    "interrupt",
-    "ecall",
-    "sret",
-)
-
-_TRANSITION_DRAFT_KEYWORD_PRIORITY = (
-    "user_to_kernel",
-    "kernel_to_user",
-    "syscall",
-    "handle_syscall",
-    "decode_invocation",
-    "decode",
-    "invocation",
-    "async_syscall",
-    "async_syscall_handler",
-    "trap",
-    "entry",
-    "restore",
-    "interrupt",
-    "exception",
-)
-_TRANSITION_DRAFT_CONFIDENCE = ("high", "medium-high")
-_TRANSITION_DRAFT_MAX_PROBES = 20
 
 def _thread_id() -> int:
     t = gdb.selected_thread()
@@ -329,11 +300,106 @@ def _call_graph_node_key(func):
         return "<unknown>"
 
 
+def _single_root_trace_session_enabled():
+    try:
+        return os.environ.get(_TRACE_SESSION_SINGLE_ROOT_ENV, "").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+    except Exception:
+        return False
+
+
+def _trace_session_priority(source):
+    try:
+        return int(_TRACE_SESSION_SOURCE_PRIORITY.get(str(source or ""), 0))
+    except Exception:
+        return 0
+
+
+def _ensure_trace_session():
+    global _TRACE_SESSION, _TRACE_SESSION_SEQ
+    if not _single_root_trace_session_enabled():
+        return None
+    if _TRACE_SESSION is None:
+        _TRACE_SESSION_SEQ += 1
+        session_id = f"no_external_runtime:{_TRACE_SESSION_SEQ}"
+        _TRACE_SESSION = {
+            "session_id": session_id,
+            "trace_session_id": session_id,
+            "executor_id": "no_external_runtime",
+            "root_id": None,
+            "root_source": None,
+            "single_root_per_session": True,
+        }
+    return _TRACE_SESSION
+
+
+def _bind_trace_session_root(root_id, source):
+    session = _ensure_trace_session()
+    key = _call_graph_node_key(root_id)
+    if not session or not key or key == "<unknown>":
+        return None
+    old_root = session.get("root_id")
+    old_source = session.get("root_source")
+    if old_root and _trace_session_priority(old_source) > _trace_session_priority(source):
+        return old_root
+    session["root_id"] = key
+    session["root_source"] = source
+    for node in _CALL_GRAPH_NODES.values():
+        try:
+            node["session_id"] = session.get("session_id")
+            node["trace_session_id"] = session.get("trace_session_id")
+            node["executor_id"] = session.get("executor_id")
+            node["root_id"] = key
+            node["single_root_per_session"] = True
+        except Exception:
+            pass
+    return key
+
+
+def _trace_session_root_key(default_to_entry=True):
+    session = _ensure_trace_session()
+    if not session:
+        return None
+    root_key = session.get("root_id")
+    if root_key:
+        return root_key
+    if ACTIVE_TRACE_ROOT:
+        return _bind_trace_session_root(ACTIVE_TRACE_ROOT, "ardb-trace")
+    if not default_to_entry:
+        return None
+    return _bind_trace_session_root(_TRACE_SESSION_DEFAULT_ENTRY, "entry")
+
+
+def _assign_trace_session_node(key, node):
+    session = _ensure_trace_session()
+    if not session or not node:
+        return None
+    root_key = _trace_session_root_key(default_to_entry=False)
+    node["session_id"] = session.get("session_id")
+    node["trace_session_id"] = session.get("trace_session_id")
+    node["executor_id"] = session.get("executor_id")
+    node["root_id"] = root_key
+    node["single_root_per_session"] = True
+    return root_key
+
+
+def _trace_session_existing_root_key():
+    root_key = _trace_session_root_key()
+    if root_key in _CALL_GRAPH_NODES:
+        return root_key
+    return None
+
+
 def _mark_stable_call_root(key, first_enter_event=None):
     """Remember a session entry point independently from later graph edges."""
     try:
         if key not in _CALL_GRAPH_NODES:
             return False
+        if _single_root_trace_session_enabled():
+            root_key = _trace_session_root_key()
+            if key != root_key:
+                return False
         node = _CALL_GRAPH_NODES[key]
         event_id = first_enter_event or node.get("first_enter_event") or _CALL_GRAPH_NEXT_EVENT_ID
         existing = _STABLE_CALL_ROOTS.get(key)
@@ -506,6 +572,7 @@ def _ensure_call_graph_node(func, cid=None, **meta):
                 node[field] = _json_safe(meta.get(field))
         if cid:
             node["cid"] = cid
+        _assign_trace_session_node(key, node)
         _refresh_call_graph_display_label(key, node)
         return key, node
     except Exception as e:
@@ -770,6 +837,14 @@ def _record_call_enter(func, cid=None, parent_cid=None, **meta):
         key, node = _ensure_call_graph_node(func, cid, **meta)
         if not node:
             return None
+        if _single_root_trace_session_enabled():
+            session = _ensure_trace_session()
+            if session and not session.get("root_id"):
+                if ACTIVE_TRACE_ROOT:
+                    _bind_trace_session_root(ACTIVE_TRACE_ROOT, "ardb-trace")
+                else:
+                    _bind_trace_session_root(key, "breakpoint")
+            _assign_trace_session_node(key, node)
         is_first_enter = node.get("first_enter_event") is None
         node["enter_count"] = int(node.get("enter_count", 0)) + 1
         node["seenCount"] = node["enter_count"]
@@ -780,6 +855,8 @@ def _record_call_enter(func, cid=None, parent_cid=None, **meta):
         node["last_enter_event"] = _CALL_GRAPH_NEXT_EVENT_ID
         if is_first_enter:
             node["first_enter_event"] = _CALL_GRAPH_NEXT_EVENT_ID
+        if _single_root_trace_session_enabled() and key == _trace_session_root_key():
+            _mark_stable_call_root(key, node.get("first_enter_event"))
         _refresh_call_graph_display_label(key, node)
         edge_status = None
         if parent_key:
@@ -939,6 +1016,39 @@ def _export_call_graph():
                     out["children"].append(child)
             return out
 
+        if _single_root_trace_session_enabled():
+            root_key = _trace_session_existing_root_key()
+            if root_key:
+                _mark_stable_call_root(root_key)
+                root = clone_node(root_key)
+                if root is not None:
+                    for key in sorted(
+                        _CALL_GRAPH_NODES.keys(),
+                        key=lambda k: (
+                            _CALL_GRAPH_NODES[k].get("first_enter_event")
+                            or _CALL_GRAPH_NODES[k].get("last_enter_event")
+                            or 0,
+                            k,
+                        ),
+                    ):
+                        if key == root_key or key in exported_keys:
+                            continue
+                        child = clone_node(key)
+                        if child is not None:
+                            root["children"].append(child)
+                    return {
+                        "type": "history_tree",
+                        "roots": [root],
+                        "events_count": len(_CALL_GRAPH_EVENTS),
+                        "nodes_count": len(_CALL_GRAPH_NODES),
+                        "roots_count": 1,
+                        "stable_roots_count": 1,
+                        "edges_count": len(_CALL_GRAPH_EDGES),
+                        "graph_kind": "call_graph",
+                        "trace_session": _json_safe(_TRACE_SESSION),
+                        "single_root_per_session": True,
+                    }
+
         roots = []
         root_keys = [
             key for key, _event_id in sorted(
@@ -1064,13 +1174,25 @@ def _validate_call_graph():
                 adjacency[parent_key].add(child_key)
                 incoming[child_key].add(parent_key)
 
-        root_keys = set(_CALL_GRAPH_ROOTS)
-        root_keys.update(_STABLE_CALL_ROOTS.keys())
+        single_root_key = None
+        if _single_root_trace_session_enabled():
+            single_root_key = _trace_session_existing_root_key()
+        if single_root_key:
+            root_keys = {single_root_key}
+        else:
+            root_keys = set(_CALL_GRAPH_ROOTS)
+            root_keys.update(_STABLE_CALL_ROOTS.keys())
         for root_key in root_keys:
             if root_key not in node_keys:
                 add_error("missing_root_node", str(root_key))
 
         for node_key in node_keys:
+            if (
+                single_root_key
+                and node_key != single_root_key
+                and nodes.get(node_key, {}).get("root_id") == single_root_key
+            ):
+                continue
             if node_key not in root_keys and not incoming[node_key]:
                 add_warning("orphan_node", str(node_key))
 
@@ -1138,7 +1260,7 @@ def _validate_call_graph():
         "stats": {
             "nodes_count": len(_CALL_GRAPH_NODES),
             "edges_count": len(_CALL_GRAPH_EDGES),
-            "roots_count": len(set(_CALL_GRAPH_ROOTS) | set(_STABLE_CALL_ROOTS)),
+            "roots_count": 1 if single_root_key else len(set(_CALL_GRAPH_ROOTS) | set(_STABLE_CALL_ROOTS)),
             "events_count": len(_CALL_GRAPH_EVENTS),
         },
     }
@@ -1151,6 +1273,7 @@ def _validate_call_graph():
 
 def _clear_call_graph():
     global _CALL_GRAPH_NEXT_EVENT_ID, _RECENT_CALL_ROOT_GLOBAL, _RECENT_CALL_PARENT_GLOBAL
+    global _TRACE_SESSION
     try:
         _CALL_GRAPH_NODES.clear()
         _CALL_GRAPH_ROOTS.clear()
@@ -1162,6 +1285,7 @@ def _clear_call_graph():
         _RECENT_CALL_ROOT_GLOBAL = None
         _RECENT_CALL_PARENT_BY_THREAD.clear()
         _RECENT_CALL_PARENT_GLOBAL = None
+        _TRACE_SESSION = None
         _CALL_GRAPH_NEXT_EVENT_ID = 1
     except Exception:
         pass
@@ -1436,6 +1560,52 @@ def _frame_source_fields():
             line = int(sal.line or 0)
     except Exception:
         pass
+    return file, fullname, line
+
+
+def _quote_gdb_symbol(sym: str) -> str:
+    return "'" + str(sym).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _symbol_source_fields(sym: str):
+    """Resolve a symbol to source fields, preferring GDB's real symtab fullname."""
+    file = ""
+    fullname = ""
+    line = 0
+
+    try:
+        _locations, sals = gdb.decode_line(_quote_gdb_symbol(sym))
+        for sal in sals or ():
+            symtab = getattr(sal, "symtab", None)
+            if not symtab:
+                continue
+            file = getattr(symtab, "filename", "") or file
+            try:
+                fullname = symtab.fullname() or fullname
+            except Exception:
+                pass
+            try:
+                line = int(getattr(sal, "line", 0) or line)
+            except Exception:
+                pass
+            if file or fullname or line:
+                break
+    except Exception:
+        pass
+
+    try:
+        info = gdb.execute(f"info line {_quote_gdb_symbol(sym)}", to_string=True)
+        m = _re_info_line.match(info)
+        if m:
+            if not line:
+                line = int(m.group(1))
+            if not file:
+                file = m.group(2)
+            if not fullname and file:
+                fullname = os.path.abspath(file)
+    except Exception:
+        pass
+
     return file, fullname, line
 
 
@@ -2655,498 +2825,6 @@ def _try_addr_by_info_address(name: str) -> int | None:
     return None
 
 
-def _default_transition_candidates_path() -> str:
-    temp_dir = (os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR") or "").strip()
-    if temp_dir:
-        out_dir = os.path.abspath(os.path.expanduser(temp_dir))
-    else:
-        out_dir = os.path.join(os.getcwd(), "temp")
-    return os.path.join(out_dir, "transition_candidates.json")
-
-
-def _transition_candidate_symbol(signature: str) -> str:
-    text = (signature or "").strip().rstrip(";").strip()
-    if not text:
-        return ""
-
-    rust_match = re.match(r"^(?:static\s+)?fn\s+(.+)$", text)
-    if rust_match:
-        text = rust_match.group(1).strip()
-        paren = text.find("(")
-        return text[:paren].strip() if paren >= 0 else text
-
-    paren = text.find("(")
-    head = text[:paren].strip() if paren >= 0 else text
-    if not head:
-        return ""
-    return head.rsplit(None, 1)[-1].strip()
-
-
-def _parse_transition_candidate_functions(output: str):
-    functions = []
-    current_file = ""
-    for raw_line in (output or "").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith("File "):
-            current_file = line[len("File "):].rstrip(":").strip()
-            continue
-        if line.startswith("Non-debugging symbols:"):
-            current_file = ""
-            continue
-
-        source_match = re.match(r"^(\d+):\s*(.+)$", line)
-        if source_match and current_file:
-            signature = source_match.group(2).strip()
-            symbol = _transition_candidate_symbol(signature)
-            if symbol:
-                functions.append({
-                    "file": current_file,
-                    "line": int(source_match.group(1)),
-                    "signature": signature,
-                    "symbol": symbol,
-                    "addr": None,
-                })
-            continue
-
-        address_match = re.match(r"^(0x[0-9a-fA-F]+)\s+(.+)$", line)
-        if address_match:
-            signature = address_match.group(2).strip()
-            symbol = _transition_candidate_symbol(signature)
-            if symbol:
-                functions.append({
-                    "file": "",
-                    "line": 0,
-                    "signature": signature,
-                    "symbol": symbol,
-                    "addr": int(address_match.group(1), 16),
-                })
-    return functions
-
-
-def _transition_candidate_keyword_hits(symbol: str, signature: str):
-    haystack = f"{symbol} {signature}".lower()
-    return [keyword for keyword in _TRANSITION_CANDIDATE_KEYWORDS if keyword in haystack]
-
-
-def _transition_candidate_privilege(addr):
-    if addr is None:
-        return "unknown", "address: unavailable"
-    value = int(addr)
-    if value >= 0xffffffff00000000:
-        return "kernel", "address: kernel high range"
-    if value <= 0x00000000ffffffff:
-        return "user", "address: user low range"
-    return "unknown", "address: privilege range unknown"
-
-
-def _transition_candidate_confidence(keyword_hits):
-    hits = set(keyword_hits)
-    if hits.intersection({"async_syscall_handler", "user_to_kernel", "kernel_to_user"}):
-        return "high"
-    if hits.intersection({"decode_invocation", "syscall"}):
-        return "medium-high"
-    if hits and hits.issubset({"trap", "entry", "restore"}):
-        return "medium"
-    return "low"
-
-
-def _transition_candidate_source(entry: dict, addr):
-    file = str(entry.get("file") or "")
-    fullname = file if file and os.path.isabs(file) else ""
-    line = int(entry.get("line") or 0)
-
-    if addr is not None:
-        try:
-            sal = gdb.find_pc_line(int(addr))
-            if sal and sal.symtab:
-                if not file:
-                    file = sal.symtab.filename or ""
-                try:
-                    fullname = sal.symtab.fullname() or fullname
-                except Exception:
-                    pass
-                if not line:
-                    line = int(sal.line or 0)
-        except Exception:
-            pass
-    return file, fullname, line
-
-
-def _scan_transition_candidates():
-    output = gdb.execute("info functions", to_string=True)
-    functions = _parse_transition_candidate_functions(output)
-    candidates_by_symbol = {}
-
-    for entry in functions:
-        symbol = str(entry.get("symbol") or "").strip()
-        signature = str(entry.get("signature") or "").strip()
-        keyword_hits = _transition_candidate_keyword_hits(symbol, signature)
-        if not keyword_hits:
-            continue
-
-        addr = entry.get("addr")
-        if addr is None:
-            for resolver in (_try_addr_by_lookup_global_symbol, _try_addr_by_info_address):
-                addr = resolver(symbol)
-                if addr is not None:
-                    break
-
-        file, fullname, line = _transition_candidate_source(entry, addr)
-        privilege_guess, address_reason = _transition_candidate_privilege(addr)
-        reason = [f"keyword: {keyword}" for keyword in keyword_hits]
-        reason.append(address_reason)
-
-        candidate = {
-            "label": symbol,
-            "func": symbol,
-            "symbol": symbol,
-            "location": f"*0x{int(addr):x}" if addr is not None else "",
-            "addr": f"0x{int(addr):x}" if addr is not None else "",
-            "file": file,
-            "fullname": fullname,
-            "line": line,
-            "keyword_hits": keyword_hits,
-            "privilege_guess": privilege_guess,
-            "confidence": _transition_candidate_confidence(keyword_hits),
-            "reason": reason,
-        }
-
-        previous = candidates_by_symbol.get(symbol)
-        if previous is None:
-            candidates_by_symbol[symbol] = candidate
-        else:
-            if not previous.get("location") and candidate.get("location"):
-                for field in ("location", "addr", "privilege_guess"):
-                    previous[field] = candidate[field]
-            for field in ("file", "fullname", "line"):
-                if not previous.get(field) and candidate.get(field):
-                    previous[field] = candidate[field]
-
-            merged_hits = [
-                keyword for keyword in _TRANSITION_CANDIDATE_KEYWORDS
-                if keyword in set(previous["keyword_hits"]) | set(keyword_hits)
-            ]
-            previous["keyword_hits"] = merged_hits
-            previous["confidence"] = _transition_candidate_confidence(merged_hits)
-            previous["reason"] = [f"keyword: {keyword}" for keyword in merged_hits]
-            previous["reason"].append(
-                _transition_candidate_privilege(
-                    int(previous["addr"], 16) if previous.get("addr") else None
-                )[1]
-            )
-
-    confidence_rank = {"high": 0, "medium-high": 1, "medium": 2, "low": 3}
-    candidates = sorted(
-        candidates_by_symbol.values(),
-        key=lambda item: (
-            confidence_rank.get(item.get("confidence"), 9),
-            item.get("symbol", "").lower(),
-        ),
-    )
-    return len(functions), candidates
-
-
-def _write_transition_candidates(output_path: str):
-    scanned_count, candidates = _scan_transition_candidates()
-    path = os.path.abspath(os.path.expanduser(output_path))
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    payload = {
-        "version": 1,
-        "name": "transition-candidates",
-        "source": "info functions",
-        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "candidates": candidates,
-    }
-    with open(path, "w", encoding="utf-8") as fp:
-        json.dump(payload, fp, indent=2, ensure_ascii=False)
-        fp.write("\n")
-    return path, scanned_count, len(candidates)
-
-
-def _default_transition_probe_draft_path() -> str:
-    temp_dir = (os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR") or "").strip()
-    if temp_dir:
-        out_dir = os.path.abspath(os.path.expanduser(temp_dir))
-    else:
-        out_dir = os.path.join(os.getcwd(), "temp")
-    return os.path.join(out_dir, "transition-probe.draft.json")
-
-
-def _load_transition_candidates(path: str):
-    resolved_path, _ = _resolve_transition_probe_config_path(path)
-    try:
-        with open(resolved_path, "r", encoding="utf-8") as fp:
-            payload = json.load(fp)
-    except Exception as e:
-        raise ValueError(
-            f"failed to read candidates {resolved_path}: {_short_error(e)}"
-        )
-
-    if not isinstance(payload, dict):
-        raise ValueError("transition candidates JSON must be an object")
-    candidates = payload.get("candidates")
-    if not isinstance(candidates, list):
-        raise ValueError("transition candidates field 'candidates' must be an array")
-    for index, candidate in enumerate(candidates):
-        if not isinstance(candidate, dict):
-            raise ValueError(f"candidates[{index}] must be an object")
-    return resolved_path, candidates
-
-
-def _transition_draft_location(candidate: dict) -> str:
-    location = str(candidate.get("location") or "").strip()
-    if not location:
-        location = str(candidate.get("addr") or "").strip()
-    if location and not location.startswith("*"):
-        location = f"*{location}"
-    if not re.fullmatch(r"\*0x[0-9a-fA-F]+", location):
-        return ""
-    return location.lower()
-
-
-def _transition_draft_keyword_hits(candidate: dict):
-    raw_hits = candidate.get("keyword_hits")
-    if not isinstance(raw_hits, list):
-        return []
-    present = {
-        str(keyword).strip().lower()
-        for keyword in raw_hits
-        if isinstance(keyword, str) and keyword.strip()
-    }
-    return [
-        keyword for keyword in _TRANSITION_DRAFT_KEYWORD_PRIORITY
-        if keyword in present
-    ]
-
-
-def _transition_draft_completeness(candidate: dict) -> int:
-    score = 0
-    for field in ("label", "func", "symbol", "location", "file", "fullname"):
-        if str(candidate.get(field) or "").strip():
-            score += 1
-    try:
-        if int(candidate.get("line") or 0) > 0:
-            score += 1
-    except Exception:
-        pass
-    if isinstance(candidate.get("reason"), list) and candidate["reason"]:
-        score += 1
-    return score
-
-
-def _transition_draft_semantic_rank(candidate: dict, keyword_hits):
-    symbol = str(candidate.get("symbol") or candidate.get("func") or "").lower()
-    compact_symbol = re.sub(r"[^a-z0-9]+", "", symbol)
-    hits = set(keyword_hits)
-
-    if hits.intersection({"user_to_kernel", "kernel_to_user"}):
-        return 0
-    if "handlesyscall" in compact_symbol or "handle_syscall" in hits:
-        return 1
-    if "decode_invocation" in symbol or "decode_invocation" in hits:
-        return 2
-    if symbol.count("async_syscall_handler") >= 2:
-        return 3
-    if "syscall" in hits:
-        return 4
-    if hits.intersection({"decode", "invocation"}):
-        return 5
-    if "async_syscall_handler" in hits:
-        return 6
-    return 7
-
-
-def _transition_draft_sort_key(item: dict):
-    confidence_rank = {"high": 0, "medium-high": 1}
-    keyword_hits = item["_draft_keyword_hits"]
-    keyword_rank = min(
-        (
-            _TRANSITION_DRAFT_KEYWORD_PRIORITY.index(keyword)
-            for keyword in keyword_hits
-        ),
-        default=len(_TRANSITION_DRAFT_KEYWORD_PRIORITY),
-    )
-    return (
-        confidence_rank.get(item["_draft_confidence"], 9),
-        _transition_draft_semantic_rank(item, keyword_hits),
-        keyword_rank,
-        -item["_draft_completeness"],
-        item["_draft_symbol"].lower(),
-        item["_draft_location"],
-        item["_draft_index"],
-    )
-
-
-def _select_transition_probe_draft_candidates(candidates):
-    eligible = []
-    for index, raw_candidate in enumerate(candidates):
-        confidence = str(raw_candidate.get("confidence") or "").strip().lower()
-        if confidence not in _TRANSITION_DRAFT_CONFIDENCE:
-            continue
-        keyword_hits = _transition_draft_keyword_hits(raw_candidate)
-        if not keyword_hits:
-            continue
-        location = _transition_draft_location(raw_candidate)
-        symbol = str(
-            raw_candidate.get("symbol")
-            or raw_candidate.get("func")
-            or raw_candidate.get("label")
-            or ""
-        ).strip()
-        if not symbol or not location:
-            continue
-
-        candidate = dict(raw_candidate)
-        candidate["_draft_index"] = index
-        candidate["_draft_confidence"] = confidence
-        candidate["_draft_keyword_hits"] = keyword_hits
-        candidate["_draft_location"] = location
-        candidate["_draft_symbol"] = symbol
-        candidate["_draft_completeness"] = _transition_draft_completeness(candidate)
-        eligible.append(candidate)
-
-    # Prefer the most complete duplicate before applying the final semantic ordering.
-    dedupe_order = sorted(
-        eligible,
-        key=lambda item: (
-            -item["_draft_completeness"],
-            item["_draft_index"],
-        ),
-    )
-    deduped = []
-    seen_symbols = set()
-    seen_locations = set()
-    for candidate in dedupe_order:
-        symbol_key = candidate["_draft_symbol"].lower()
-        location_key = candidate["_draft_location"]
-        if symbol_key in seen_symbols or location_key in seen_locations:
-            continue
-        seen_symbols.add(symbol_key)
-        seen_locations.add(location_key)
-        deduped.append(candidate)
-
-    ordered = sorted(deduped, key=_transition_draft_sort_key)
-    selected = []
-    selected_ids = set()
-
-    # Preserve semantic diversity before filling the remaining slots by global rank.
-    seed_rules = (
-        (lambda item: set(item["_draft_keyword_hits"]).intersection(
-            {"user_to_kernel", "kernel_to_user"}
-        ), 2),
-        (lambda item: _transition_draft_semantic_rank(
-            item, item["_draft_keyword_hits"]
-        ) == 1, 3),
-        (lambda item: _transition_draft_semantic_rank(
-            item, item["_draft_keyword_hits"]
-        ) == 2, 3),
-        (lambda item: _transition_draft_semantic_rank(
-            item, item["_draft_keyword_hits"]
-        ) == 3, 2),
-    )
-    for predicate, limit in seed_rules:
-        added = 0
-        for candidate in ordered:
-            candidate_id = candidate["_draft_index"]
-            if candidate_id in selected_ids or not predicate(candidate):
-                continue
-            selected.append(candidate)
-            selected_ids.add(candidate_id)
-            added += 1
-            if added >= limit:
-                break
-
-    for candidate in ordered:
-        if len(selected) >= _TRANSITION_DRAFT_MAX_PROBES:
-            break
-        candidate_id = candidate["_draft_index"]
-        if candidate_id in selected_ids:
-            continue
-        selected.append(candidate)
-        selected_ids.add(candidate_id)
-
-    return sorted(selected, key=_transition_draft_sort_key)
-
-
-def _transition_probe_draft_spec(candidate: dict) -> dict:
-    keyword_hits = candidate["_draft_keyword_hits"]
-    event = ""
-    if "user_to_kernel" in keyword_hits:
-        event = "user_to_kernel"
-    elif "kernel_to_user" in keyword_hits:
-        event = "kernel_to_user"
-
-    privilege = str(candidate.get("privilege_guess") or "unknown").strip().lower()
-    if privilege not in ("user", "kernel", "unknown"):
-        privilege = "unknown"
-    try:
-        line = int(candidate.get("line") or 0)
-    except Exception:
-        line = 0
-    reason = candidate.get("reason")
-    if not isinstance(reason, list):
-        reason = []
-
-    spec = {
-        "label": str(candidate.get("label") or candidate["_draft_symbol"]).strip(),
-        "type": "transition" if event else "sync",
-        "privilege": privilege,
-        "location": candidate["_draft_location"],
-        "func": str(candidate.get("func") or candidate["_draft_symbol"]).strip(),
-        "file": str(candidate.get("file") or "").strip(),
-        "fullname": str(candidate.get("fullname") or "").strip(),
-        "line": line,
-        "confidence": candidate["_draft_confidence"],
-        "reason": [str(item) for item in reason],
-        "draft_note": "review required before enabling",
-    }
-    if event:
-        spec["event"] = event
-    return spec
-
-
-def _write_transition_probe_draft(candidates_path: str, output_path: str):
-    resolved_candidates_path, candidates = _load_transition_candidates(candidates_path)
-    path = os.path.abspath(os.path.expanduser(output_path))
-    formal_path = os.path.abspath(
-        os.path.join(_transition_probe_project_root(), _REL4_TRANSITION_PROBE_CONFIG)
-    )
-    if os.path.normcase(os.path.realpath(path)) == os.path.normcase(
-        os.path.realpath(formal_path)
-    ):
-        raise ValueError("refusing to overwrite the formal rel4 transition-probe.json")
-    if os.path.basename(path).lower() == "transition-probe.json":
-        raise ValueError("draft output must not be named transition-probe.json")
-    if os.path.normcase(os.path.realpath(path)) == os.path.normcase(
-        os.path.realpath(resolved_candidates_path)
-    ):
-        raise ValueError("draft output must differ from the candidates input")
-
-    selected = _select_transition_probe_draft_candidates(candidates)
-    probes = [_transition_probe_draft_spec(candidate) for candidate in selected]
-    payload = {
-        "version": 1,
-        "name": "draft-from-candidates",
-        "source": "transition-candidates",
-        "generated_from": resolved_candidates_path,
-        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "candidate_count": len(candidates),
-        "selected_count": len(probes),
-        "selection_policy": (
-            "high and medium-high transition-related candidates; "
-            "semantic diversity; maximum 20 probes"
-        ),
-        "probes": probes,
-    }
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fp:
-        json.dump(payload, fp, indent=2, ensure_ascii=False)
-        fp.write("\n")
-    return path, len(candidates), len(probes)
-
-
 def _whitelist_enabled() -> bool:
     return (_WHITELIST_EXACT is not None) or (_WHITELIST_PREFIX is not None)
 
@@ -4181,6 +3859,8 @@ def _trace_symbol(sym):
         # Observation roots are view/snapshot context only. They must never
         # create a node, edge, graph event, or runtime breakpoint.
         ACTIVE_TRACE_ROOT = sym
+        if _single_root_trace_session_enabled():
+            _bind_trace_session_root(sym, "ardb-trace")
         gdb.write(f"[ARD] trace root 已切换到 {sym}\n")
         return True
     except Exception as e:
@@ -4191,6 +3871,103 @@ def _trace_symbol(sym):
 def _quote_gdb_break_location(sym):
     # Single quotes preserve Rust symbols containing braces, #, and ::.
     return "'" + sym.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+_SOURCE_BREAKPOINT_ROOTS = {
+    "minimal": [
+        "/home/user/RustDebug/rust-debugger-DA/testcases/minimal",
+    ],
+    "no_external_runtime": [
+        "/home/user/RustDebug/rust-debugger-DA/testcases/no_external_runtime",
+    ],
+    "embassy": [
+        "/home/user/embassy/examples/std",
+    ],
+    "rel4": [
+        "/home/user/AsyncOS/rel4-manifest-workspace/rel4_kernel",
+    ],
+    "lilos": [
+        "/home/user/RustDebug/rust-debugger-DA/testcases/lilos_src",
+        "/home/user/lilos/testsuite/src",
+    ],
+}
+
+
+def _quote_gdb_source_location(file_path: str, line: int) -> str:
+    quoted_file = "'" + str(file_path).replace("\\", "\\\\").replace("'", "\\'") + "'"
+    return f"{quoted_file}:{line}"
+
+
+def _dedupe_repeated_gdb_lines(text: str) -> str:
+    if not text:
+        return text
+
+    seen = set()
+    deduped = []
+    for line in text.splitlines():
+        if line in seen:
+            continue
+        seen.add(line)
+        deduped.append(line)
+
+    output = "\n".join(deduped)
+    if text.endswith("\n"):
+        output += "\n"
+    return output
+
+
+def _parse_source_file_line(spec: str):
+    raw = (spec or "").strip()
+    if ":" not in raw:
+        raise ValueError("invalid file:line: missing ':'")
+
+    file_part, line_part = raw.rsplit(":", 1)
+    file_part = file_part.strip()
+    line_part = line_part.strip()
+    if not file_part:
+        raise ValueError("invalid file:line: missing file")
+    if not line_part:
+        raise ValueError("invalid file:line: missing line")
+
+    try:
+        line = int(line_part, 10)
+    except ValueError:
+        raise ValueError(f"invalid file:line: line is not an integer: {line_part}")
+    if line <= 0:
+        raise ValueError(f"invalid file:line: line must be positive: {line_part}")
+
+    return file_part, line
+
+
+def _lilos_relative_candidates(relative_path: str):
+    normalized = relative_path.replace("\\", "/").lstrip("/")
+    candidates = [normalized]
+    if normalized.startswith("src/"):
+        candidates.append(normalized[len("src/"):])
+    return list(dict.fromkeys(candidates))
+
+
+def _resolve_source_breakpoint_path(testcase: str, file_path: str):
+    expanded = os.path.expanduser(file_path)
+    if os.path.isabs(expanded):
+        resolved = os.path.abspath(expanded)
+        return resolved if os.path.exists(resolved) else None
+
+    roots = _SOURCE_BREAKPOINT_ROOTS.get(testcase)
+    if roots is None:
+        return None
+
+    rel_candidates = (
+        _lilos_relative_candidates(expanded)
+        if testcase == "lilos"
+        else [expanded.replace("\\", "/").lstrip("/")]
+    )
+    for root in roots:
+        for rel in rel_candidates:
+            candidate = os.path.abspath(os.path.join(root, rel))
+            if os.path.exists(candidate):
+                return candidate
+    return None
 
 
 class ARDTraceCommand(gdb.Command):
@@ -4226,6 +4003,77 @@ class ARDTraceBreakCommand(gdb.Command):
             gdb.write(f"[ARD] trace+break root: {sym}\n")
         except Exception as e:
             gdb.write(f"[ARD] warning: break failed for {sym}: {_short_error(e)}\n")
+
+
+class ARDBreakSourceCommand(gdb.Command):
+    """
+    Set a plain GDB source breakpoint for a known ARD testcase.
+
+    Usage: ardb-break-src <minimal|no_external_runtime|embassy|rel4|lilos> <file:line>
+    """
+    def __init__(self):
+        super().__init__("ardb-break-src", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        usage = "usage: ardb-break-src <minimal|no_external_runtime|embassy|rel4|lilos> <file:line>\n"
+        try:
+            parts = gdb.string_to_argv(arg)
+        except Exception:
+            parts = arg.split()
+
+        if len(parts) < 2:
+            gdb.write(usage)
+            return
+
+        testcase = parts[0].strip()
+        input_spec = parts[1].strip()
+        if testcase not in _SOURCE_BREAKPOINT_ROOTS:
+            gdb.write(f"[ARD] source breakpoint failed: unknown testcase: {testcase}\n")
+            gdb.write(usage)
+            return
+
+        try:
+            file_part, line = _parse_source_file_line(input_spec)
+        except ValueError as e:
+            gdb.write(f"[ARD] source breakpoint failed: {e}\n")
+            return
+
+        resolved_file = _resolve_source_breakpoint_path(testcase, file_part)
+        if not resolved_file:
+            gdb.write(
+                "[ARD] source breakpoint failed: source file not found: "
+                f"{file_part} (testcase={testcase})\n"
+            )
+            return
+
+        location = _quote_gdb_source_location(resolved_file, line)
+        try:
+            info_output = gdb.execute(f"info line {location}", to_string=True)
+        except Exception as e:
+            gdb.write(
+                "[ARD] source breakpoint failed: GDB info line failed: "
+                f"{_short_error(e)}\n"
+            )
+            return
+
+        if info_output:
+            info_output = _dedupe_repeated_gdb_lines(info_output)
+            gdb.write(info_output if info_output.endswith("\n") else info_output + "\n")
+
+        try:
+            break_output = gdb.execute(f"break {location}", to_string=True)
+        except Exception as e:
+            gdb.write(
+                "[ARD] source breakpoint failed: GDB break failed: "
+                f"{_short_error(e)}\n"
+            )
+            return
+
+        if break_output:
+            gdb.write(break_output if break_output.endswith("\n") else break_output + "\n")
+
+        gdb.write(f"[ARD] source breakpoint requested: {testcase} {input_spec}\n")
+        gdb.write(f"[ARD] resolved source: {resolved_file}:{line}\n")
 
 
 class ARDPrivAddCommand(gdb.Command):
@@ -4451,6 +4299,10 @@ class ARDRel4EnableTransitionProbeCommand(gdb.Command):
         super().__init__("ardb-rel4-enable-transition-probe", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
+        gdb.write(
+            "[ARD][deprecated] ardb-rel4-enable-transition-probe is deprecated; "
+            "use ardb-enable-transition-probe testcases/rel4-async/transition-probe.json\n"
+        )
         _enable_transition_probe(_REL4_TRANSITION_PROBE_CONFIG)
 
 
@@ -4460,6 +4312,10 @@ class ARDRel4DisableTransitionProbeCommand(gdb.Command):
         super().__init__("ardb-rel4-disable-transition-probe", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
+        gdb.write(
+            "[ARD][deprecated] ardb-rel4-disable-transition-probe is deprecated; "
+            "use ardb-disable-transition-probe\n"
+        )
         _disable_transition_probe()
 
 
@@ -4469,80 +4325,14 @@ class ARDRel4TransitionProbeStatusCommand(gdb.Command):
         super().__init__("ardb-rel4-transition-probe-status", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
+        gdb.write(
+            "[ARD][deprecated] ardb-rel4-transition-probe-status is deprecated; "
+            "use ardb-transition-probe-status\n"
+        )
         gdb.write(json.dumps({
             "rel4_transition_probe": _transition_probe_status(),
             "transition_path": _get_transition_path_snapshot(),
         }) + "\n")
-
-
-class ARDScanTransitionCandidatesCommand(gdb.Command):
-    """
-    Scan GDB function symbols for possible privilege-transition boundaries.
-    Usage: ardb-scan-transition-candidates [output_json]
-    """
-    def __init__(self):
-        super().__init__("ardb-scan-transition-candidates", gdb.COMMAND_USER)
-
-    def invoke(self, arg, from_tty):
-        try:
-            parts = gdb.string_to_argv(arg)
-        except Exception:
-            parts = (arg or "").split()
-        if len(parts) > 1:
-            gdb.write("Usage: ardb-scan-transition-candidates [output_json]\n")
-            return
-
-        output_path = parts[0] if parts else _default_transition_candidates_path()
-        try:
-            path, scanned_count, candidate_count = _write_transition_candidates(output_path)
-        except Exception as e:
-            gdb.write(
-                f"[ARD][transition-candidates] scan failed: {_short_error(e)}\n"
-            )
-            return
-
-        gdb.write(f"[ARD][transition-candidates] scanned functions: {scanned_count}\n")
-        gdb.write(f"[ARD][transition-candidates] candidates: {candidate_count}\n")
-        gdb.write(f"[ARD][transition-candidates] output: {path}\n")
-
-
-class ARDGenerateTransitionProbeDraftCommand(gdb.Command):
-    """
-    Generate a review-only transition probe draft from candidate scan JSON.
-    Usage: ardb-generate-transition-probe-draft <candidates_json> [output_json]
-    """
-    def __init__(self):
-        super().__init__("ardb-generate-transition-probe-draft", gdb.COMMAND_USER)
-
-    def invoke(self, arg, from_tty):
-        try:
-            parts = gdb.string_to_argv(arg)
-        except Exception:
-            parts = (arg or "").split()
-        if len(parts) not in (1, 2):
-            gdb.write(
-                "Usage: ardb-generate-transition-probe-draft "
-                "<candidates_json> [output_json]\n"
-            )
-            return
-
-        output_path = (
-            parts[1] if len(parts) == 2 else _default_transition_probe_draft_path()
-        )
-        try:
-            path, candidate_count, selected_count = _write_transition_probe_draft(
-                parts[0], output_path
-            )
-        except Exception as e:
-            gdb.write(
-                f"[ARD][transition-draft] generation failed: {_short_error(e)}\n"
-            )
-            return
-
-        gdb.write(f"[ARD][transition-draft] loaded candidates: {candidate_count}\n")
-        gdb.write(f"[ARD][transition-draft] selected probes: {selected_count}\n")
-        gdb.write(f"[ARD][transition-draft] output: {path}\n")
-        gdb.write("[ARD][transition-draft] review required before enabling\n")
 
 
 class ARDResetCommand(gdb.Command):
@@ -4699,16 +4489,7 @@ class ARDGetSnapshotCommand(gdb.Command):
             async_file = ""
             async_fullname = ""
             async_line = 0
-            try:
-                info = gdb.execute(f"info line '{poll_sym}'", to_string=True)
-                m = _re_info_line.match(info)
-                if m:
-                    async_line = int(m.group(1))
-                    async_file = m.group(2)
-                    # Try to resolve absolute path
-                    async_fullname = os.path.abspath(async_file) if async_file else ""
-            except Exception:
-                pass
+            async_file, async_fullname, async_line = _symbol_source_fields(poll_sym)
 
             snapshot["path"].append({
                 "type": node_type,
@@ -5110,13 +4891,18 @@ class ARDGetHistoryTreeCommand(gdb.Command):
         super().__init__("ardb-get-history-tree", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
+        observer_root = ACTIVE_TRACE_ROOT or None
+        observer_root_log = observer_root if observer_root is not None else "null"
+        _log_ard(f"[ARD] history tree query: observer_root={observer_root_log}")
         try:
             result = _export_call_graph()
+            result["observer_root"] = observer_root
             result["validation"] = _validate_call_graph()
             gdb.write(json.dumps(result) + "\n")
         except Exception as e:
             gdb.write(json.dumps({
                 "type": "history_tree",
+                "observer_root": observer_root,
                 "roots": [],
                 "events_count": len(_CALL_GRAPH_EVENTS),
                 "nodes_count": len(_CALL_GRAPH_NODES),
@@ -5126,6 +4912,58 @@ class ARDGetHistoryTreeCommand(gdb.Command):
                 "graph_kind": "call_graph",
                 "error": _short_error(e),
                 "validation": _validate_call_graph(),
+            }) + "\n")
+
+
+def _find_observer_subtree(nodes, observer_root):
+    """Return a detached copy of one exported History Tree subtree."""
+    if not observer_root:
+        return None
+
+    for node in nodes if isinstance(nodes, list) else []:
+        if not isinstance(node, dict):
+            continue
+        if node.get("func") == observer_root:
+            return copy.deepcopy(node)
+        found = _find_observer_subtree(node.get("children", []), observer_root)
+        if found is not None:
+            return found
+    return None
+
+
+class ARDGetObserverTreeCommand(gdb.Command):
+    """Project the current observer-root subtree from the exported History Tree."""
+    def __init__(self):
+        super().__init__("ardb-get-observer-tree", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        observer_root = ACTIVE_TRACE_ROOT or None
+        observer_root_log = observer_root if observer_root is not None else "null"
+        try:
+            history_tree = _export_call_graph()
+            observer_subtree = _find_observer_subtree(
+                history_tree.get("roots", []), observer_root
+            )
+            roots = [observer_subtree] if observer_subtree is not None else []
+            _log_ard(
+                f"[ARD] observer tree query: observer_root={observer_root_log} "
+                f"roots={len(roots)}"
+            )
+            gdb.write(json.dumps({
+                "type": "observer_tree",
+                "observer_root": observer_root,
+                "roots": roots,
+            }) + "\n")
+        except Exception as e:
+            _log_ard(
+                f"[ARD] observer tree query failed: observer_root={observer_root_log} "
+                f"error={_short_error(e)}"
+            )
+            gdb.write(json.dumps({
+                "type": "observer_tree",
+                "observer_root": observer_root,
+                "roots": [],
+                "error": _short_error(e),
             }) + "\n")
 
 
@@ -5334,6 +5172,7 @@ def install():
     ARDTraceCommand()
     ARDTraceBreakCommand()
     ARDTraceBreakCommand("ardb-tb")
+    ARDBreakSourceCommand()
     ARDPrivAddCommand()
     ARDPrivEnableCommand()
     ARDPrivResetCommand()
@@ -5348,8 +5187,6 @@ def install():
     ARDRel4EnableTransitionProbeCommand()
     ARDRel4DisableTransitionProbeCommand()
     ARDRel4TransitionProbeStatusCommand()
-    ARDScanTransitionCandidatesCommand()
-    ARDGenerateTransitionProbeDraftCommand()
     ARDResetCommand()
     ARDLoadWhitelistCommand()
     ARDGenWhitelistCommand()
@@ -5357,6 +5194,7 @@ def install():
     ARDGetSnapshotPathCommand()
     ARDGetTransitionChainCommand()
     ARDGetHistoryTreeCommand()
+    ARDGetObserverTreeCommand()
     ARDValidateHistoryTreeCommand()
     ARDClearHistoryTreeCommand()
     ARDGetGroupedWhitelistCommand()
@@ -5374,4 +5212,4 @@ def install():
             pass
         _EVENTS_INSTALLED = True
 
-    gdb.write("[ARD] installed. Commands: ardb-gen-whitelist, ardb-load-whitelist, ardb-trace, ardb-trace-break, ardb-tb, ardb-get-snapshot, ardb-get-snapshot-path, ardb-get-transition-chain, ardb-get-history-tree, ardb-validate-history-tree, ardb-clear-history-tree, ardb-reset, ardb-get-whitelist-grouped, ardb-update-whitelist, ardb-infer-trace-root, ardb-priv-add, ardb-priv-enable, ardb-priv-reset, ardb-priv-status, ardb-transition-reset, ardb-transition-add, ardb-transition-event, ardb-transition-status, ardb-enable-transition-probe, ardb-disable-transition-probe, ardb-transition-probe-status, ardb-rel4-enable-transition-probe, ardb-rel4-disable-transition-probe, ardb-rel4-transition-probe-status, ardb-scan-transition-candidates, ardb-generate-transition-probe-draft\n")
+    gdb.write("[ARD] installed. Commands: ardb-gen-whitelist, ardb-load-whitelist, ardb-trace, ardb-trace-break, ardb-tb, ardb-break-src, ardb-get-snapshot, ardb-get-snapshot-path, ardb-get-transition-chain, ardb-get-history-tree, ardb-get-observer-tree, ardb-validate-history-tree, ardb-clear-history-tree, ardb-reset, ardb-get-whitelist-grouped, ardb-update-whitelist, ardb-infer-trace-root, ardb-priv-add, ardb-priv-enable, ardb-priv-reset, ardb-priv-status, ardb-transition-reset, ardb-transition-add, ardb-transition-event, ardb-transition-status, ardb-enable-transition-probe, ardb-disable-transition-probe, ardb-transition-probe-status, ardb-rel4-enable-transition-probe, ardb-rel4-disable-transition-probe, ardb-rel4-transition-probe-status\n")

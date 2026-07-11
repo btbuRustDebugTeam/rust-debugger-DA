@@ -5,6 +5,7 @@ import {
     SnapshotPathData,
     HistoryTreeData,
     HistoryTreeNode,
+    ObserverTreeData,
     TransitionChainData,
     TransitionPathNode,
 } from '../gdbDebugSession';
@@ -37,18 +38,6 @@ interface SourceMapConfig {
     [key: string]: unknown;
 }
 
-interface HistorySnapshotRecord {
-    id: number;
-    timestamp: number;
-    path: SnapshotNode[];
-    raw: {
-        thread_id: number;
-        pathLength: number;
-        privilege?: string;
-        transition_event?: string;
-    };
-}
-
 /**
  * Async Inspector Panel - Webview for displaying async execution trees
  */
@@ -61,9 +50,8 @@ export class AsyncInspectorPanel {
     private _debugSession: vscode.DebugSession | undefined;
     private _currentSnapshotTreeRoots: Map<number, TreeNode> = new Map(); // root CID -> current snapshot tree node
     private _historyTreeRoots: TreeNode[] = [];
-    private _historySnapshots: HistorySnapshotRecord[] = [];
-    private _observedPathRoots: TreeNode[] = [];
-    private _nextSnapshotId = 1;
+    private _observerTreeRoots: TreeNode[] = [];
+    private _activeTreeView: 'history' | 'observer' = 'observer';
     /** Cache of the last snapshot, used by selectNode to find frame indices. */
     private _lastSnapshot: SnapshotPathData | undefined;
     private _lastTransitionPath: TransitionPathNode[] = [];
@@ -99,14 +87,17 @@ export class AsyncInspectorPanel {
                     case 'refreshHistory':
                         await this.handleRefreshHistory();
                         break;
-                    case 'clearHistory':
-                        await this.handleClearHistory();
+                    case 'refreshObserver':
+                        await this.handleRefreshObserver();
                         break;
                     case 'chain':
                         await this.handleChainSnapshot();
                         break;
                     case 'connectRemote':
                         await this.handleConnectRemote();
+                        break;
+                    case 'continueExecution':
+                        await this.handleContinueExecution();
                         break;
                     case 'selectNode':
                         await this.handleSelectNode(message);
@@ -116,18 +107,6 @@ export class AsyncInspectorPanel {
                         break;
                     case 'refreshCandidates':
                         await this.handleRefreshCandidates();
-                        break;
-                    case 'scanTransitionCandidates':
-                        await this.handleScanTransitionCandidates();
-                        break;
-                    case 'generateTransitionProbeDraft':
-                        await this.handleGenerateTransitionProbeDraft();
-                        break;
-                    case 'reloadTransitionCandidates':
-                        await this.handleReloadTransitionCandidates();
-                        break;
-                    case 'reloadTransitionProbeDraft':
-                        await this.handleReloadTransitionProbeDraft();
                         break;
                 }
             },
@@ -226,6 +205,39 @@ export class AsyncInspectorPanel {
         });
     }
 
+    private async handleContinueExecution(): Promise<void> {
+        const session = this._debugAdapterFactory?.getActiveSession();
+        if (!session) {
+            const message = '[ARD] failed to continue: no active debug session';
+            this.inspectorLog('error', message);
+            vscode.window.showErrorMessage(message);
+            this._panel.webview.postMessage({
+                command: 'continueExecutionResult',
+                status: 'failed',
+                message,
+            });
+            return;
+        }
+
+        try {
+            await session.executeGDBCommand('interpreter-exec mi "-exec-continue"', true);
+            this._panel.webview.postMessage({
+                command: 'continueExecutionResult',
+                status: 'ok',
+                message: '[ARD] sent -exec-continue',
+            });
+        } catch (error) {
+            const message = `[ARD] failed to continue: ${error}`;
+            this.inspectorLog('error', message);
+            vscode.window.showErrorMessage(message);
+            this._panel.webview.postMessage({
+                command: 'continueExecutionResult',
+                status: 'failed',
+                message,
+            });
+        }
+    }
+
     private async handleGenWhitelist(): Promise<void> {
         const session = this._debugAdapterFactory?.getActiveSession();
         if (session) {
@@ -287,24 +299,13 @@ export class AsyncInspectorPanel {
         return session.refreshHistoryTree(suppressOutput);
     }
 
-    private async clearBackendHistoryTree(suppressOutput: boolean = false): Promise<void> {
+    private async fetchObserverTree(suppressOutput: boolean = false): Promise<ObserverTreeData | undefined> {
         const session = this._debugAdapterFactory?.getActiveSession();
         if (!session) {
-            return;
+            console.warn('[AsyncInspector] fetchObserverTree: no GDB session from factory');
+            return undefined;
         }
-        await session.clearHistoryTree(suppressOutput);
-    }
-
-    private renderAsyncTreeFromSnapshot(snapshot: SnapshotPathData): void {
-        this._lastSnapshot = snapshot;
-        this.updateTreeFromSnapshot(snapshot);
-        this.recordHistorySnapshot(snapshot);
-        this._observedPathRoots = this.buildObservedPathsTree();
-        this._historyTreeRoots = this.getHistoryTreeData();
-        this._panel.webview.postMessage({
-            command: 'updateTree',
-            treeData: this._historyTreeRoots,
-        });
+        return session.getObserverTree(suppressOutput);
     }
 
     private renderRuntimeHistoryTree(historyTree: HistoryTreeData): void {
@@ -313,9 +314,28 @@ export class AsyncInspectorPanel {
         // runtime roots so the old virtual call-graph node does not
         // become a second title above the execution graph.
         this._historyTreeRoots = runtimeRoots;
+        if (this._activeTreeView === 'history') {
+            this.postActiveTree();
+        }
+    }
+
+    private renderRuntimeObserverTree(observerTree: ObserverTreeData): void {
+        this._observerTreeRoots = this.normalizeRuntimeHistoryNodes(observerTree.roots || []);
+        if (this._activeTreeView === 'observer') {
+            this.postActiveTree(observerTree.observer_root);
+        }
+    }
+
+    private postActiveTree(observerRoot?: string | null): void {
+        const isObserver = this._activeTreeView === 'observer';
         this._panel.webview.postMessage({
             command: 'updateTree',
-            treeData: this._historyTreeRoots,
+            treeData: isObserver ? this._observerTreeRoots : this._historyTreeRoots,
+        });
+        this._panel.webview.postMessage({
+            command: 'updateTreeView',
+            view: this._activeTreeView,
+            observerRoot: observerRoot ?? null,
         });
     }
 
@@ -329,24 +349,9 @@ export class AsyncInspectorPanel {
         });
     }
 
-    private async handleClearHistory(): Promise<void> {
-        await this.clearBackendHistoryTree(false);
-        this.clearHistory();
-    }
-
-    private clearHistory(): void {
-        this.resetHistoryState();
-        this._panel.webview.postMessage({
-            command: 'updateTree',
-            treeData: this._historyTreeRoots,
-        });
-    }
-
     private resetHistoryState(): void {
-        this._historySnapshots = [];
-        this._observedPathRoots = [];
-        this._nextSnapshotId = 1;
         this._historyTreeRoots = [];
+        this._observerTreeRoots = [];
     }
 
     private async handleSnapshot(): Promise<void> {
@@ -354,14 +359,20 @@ export class AsyncInspectorPanel {
     }
 
     private async handleRefreshHistory(): Promise<void> {
-        const historyTree = await this.fetchHistoryTree(false);
-        if (historyTree) {
-            this.renderRuntimeHistoryTree(historyTree);
-            const currentSnapshot = await this.fetchSnapshotPath(true);
-            if (currentSnapshot) {
-                this._lastSnapshot = currentSnapshot;
-                this.updateTreeFromSnapshot(currentSnapshot);
-            }
+        // This is a diagnostics-only query. With suppressOutput=false the
+        // complete JSON is emitted to the Debug Console by the DAP evaluate path.
+        // It must not switch or update the Async Execution Graph view.
+        await this.fetchHistoryTree(false);
+    }
+
+    private async handleRefreshObserver(): Promise<void> {
+        this._activeTreeView = 'observer';
+        const observerTree = await this.fetchObserverTree(false);
+        if (observerTree) {
+            this.renderRuntimeObserverTree(observerTree);
+        } else {
+            this._observerTreeRoots = [];
+            this.postActiveTree(null);
         }
     }
 
@@ -373,9 +384,16 @@ export class AsyncInspectorPanel {
     }
 
     private async handleStoppedAutoRefresh(): Promise<void> {
-        const historyTree = await this.fetchHistoryTree(true);
-        if (historyTree) {
-            this.renderRuntimeHistoryTree(historyTree);
+        if (this._activeTreeView === 'observer') {
+            const observerTree = await this.fetchObserverTree(true);
+            if (observerTree) {
+                this.renderRuntimeObserverTree(observerTree);
+            }
+        } else {
+            const historyTree = await this.fetchHistoryTree(true);
+            if (historyTree) {
+                this.renderRuntimeHistoryTree(historyTree);
+            }
         }
 
         // Keep current snapshot data available for source/frame selection and
@@ -454,85 +472,6 @@ export class AsyncInspectorPanel {
                 candidates: candidates
             });
         }
-    }
-
-    private async handleScanTransitionCandidates(): Promise<void> {
-        const session = this._debugAdapterFactory?.getActiveSession();
-        if (!session) {
-            this.postTransitionCandidates({
-                path: '',
-                candidates: [],
-                error: 'No active debug session. Start debugging before scanning.',
-            });
-            return;
-        }
-        this.postTransitionCandidates(await session.scanTransitionCandidates());
-    }
-
-    private async handleGenerateTransitionProbeDraft(): Promise<void> {
-        const session = this._debugAdapterFactory?.getActiveSession();
-        if (!session) {
-            this.postTransitionProbeDraft({
-                path: '',
-                probes: [],
-                error: 'No active debug session. Start debugging before generating a draft.',
-            });
-            return;
-        }
-        this.postTransitionProbeDraft(await session.generateTransitionProbeDraft());
-    }
-
-    private async handleReloadTransitionCandidates(): Promise<void> {
-        const session = this._debugAdapterFactory?.getActiveSession();
-        if (!session) {
-            this.postTransitionCandidates({
-                path: '',
-                candidates: [],
-                error: 'Transition candidates are unavailable.',
-            });
-            return;
-        }
-        this.postTransitionCandidates(await session.loadTransitionCandidates());
-    }
-
-    private async handleReloadTransitionProbeDraft(): Promise<void> {
-        const session = this._debugAdapterFactory?.getActiveSession();
-        if (!session) {
-            this.postTransitionProbeDraft({
-                path: '',
-                probes: [],
-                error: 'Probe draft is unavailable.',
-            });
-            return;
-        }
-        this.postTransitionProbeDraft(await session.loadTransitionProbeDraft());
-    }
-
-    private postTransitionCandidates(result: {
-        path: string;
-        candidates: unknown[];
-        candidateCount?: number;
-        generatedAt?: string;
-        error?: string;
-    }): void {
-        this._panel.webview.postMessage({
-            command: 'updateTransitionCandidates',
-            ...result,
-        });
-    }
-
-    private postTransitionProbeDraft(result: {
-        path: string;
-        probes: unknown[];
-        candidateCount?: number;
-        selectedCount?: number;
-        generatedAt?: string;
-        error?: string;
-    }): void {
-        this._panel.webview.postMessage({
-            command: 'updateTransitionProbeDraft',
-            ...result,
-        });
     }
 
     private inspectorLog(level: 'info' | 'warn' | 'error', message: string): void {
@@ -1186,187 +1125,6 @@ export class AsyncInspectorPanel {
         });
     }
 
-    private recordHistorySnapshot(snapshot: SnapshotPathData): void {
-        const id = this._nextSnapshotId++;
-        this._historySnapshots.push({
-            id,
-            timestamp: Date.now(),
-            path: snapshot.path.map(node => ({ ...node })),
-            raw: {
-                thread_id: snapshot.thread_id,
-                pathLength: snapshot.path.length,
-                privilege: snapshot.privilege,
-                transition_event: snapshot.transition_event,
-            },
-        });
-    }
-
-    private getSnapshotHistoryTreeData(): TreeNode[] {
-        return this._historySnapshots.map(record => ({
-            type: 'transition',
-            cid: null,
-            func: `Snapshot #${record.id}`,
-            displayLabel: `Snapshot #${record.id}`,
-            addr: '',
-            poll: 0,
-            state: new Date(record.timestamp).toISOString(),
-            historyKind: 'snapshot',
-            snapshotId: record.id,
-            timestamp: record.timestamp,
-            origin: 'observed-history',
-            raw: record.raw,
-            children: this.buildSnapshotPathTree(record.path),
-        }));
-    }
-
-    private getHistoryTreeData(): TreeNode[] {
-        if (this._historySnapshots.length === 0) {
-            return [];
-        }
-
-        return [
-            {
-                type: 'transition',
-                cid: null,
-                func: 'Observed Async Paths',
-                displayLabel: 'Observed Async Paths (observed / seen before)',
-                addr: '',
-                poll: 0,
-                state: `snapshots=${this._historySnapshots.length}`,
-                historyKind: 'observed-root',
-                origin: 'observed-history',
-                children: this._observedPathRoots,
-            },
-            {
-                type: 'transition',
-                cid: null,
-                func: 'Snapshots',
-                displayLabel: 'Snapshots',
-                addr: '',
-                poll: 0,
-                state: `count=${this._historySnapshots.length}`,
-                historyKind: 'snapshot-root',
-                origin: 'observed-history',
-                children: this.getSnapshotHistoryTreeData(),
-            },
-        ];
-    }
-
-    private buildObservedPathsTree(): TreeNode[] {
-        const roots: TreeNode[] = [];
-        const latestSnapshotId = this._historySnapshots[this._historySnapshots.length - 1]?.id;
-
-        for (const record of this._historySnapshots) {
-            const pathNodes = this.getSnapshotPathSegment(record.path);
-            let siblings = roots;
-
-            for (const pathNode of pathNodes) {
-                const key = this.getObservedNodeKey(pathNode);
-                let observedNode = siblings.find(node => node.observedKey === key);
-                if (!observedNode) {
-                    observedNode = this.createTreeNodeFromSnapshotNode(pathNode);
-                    observedNode.historyKind = 'observed';
-                    observedNode.observedKey = key;
-                    observedNode.seenCount = 0;
-                    observedNode.firstSeenSnapshot = record.id;
-                    observedNode.currentlyInLatestSnapshot = false;
-                    siblings.push(observedNode);
-                }
-
-                if (observedNode.lastSeenSnapshot !== record.id) {
-                    observedNode.seenCount = (observedNode.seenCount ?? 0) + 1;
-                    observedNode.firstSeenSnapshot = Math.min(
-                        observedNode.firstSeenSnapshot ?? record.id,
-                        record.id
-                    );
-                    observedNode.lastSeenSnapshot = record.id;
-                }
-
-                if (record.id === latestSnapshotId) {
-                    observedNode.currentlyInLatestSnapshot = true;
-                    observedNode.cid = pathNode.cid;
-                    observedNode.addr = pathNode.addr;
-                    observedNode.poll = pathNode.poll ?? 0;
-                    observedNode.state = pathNode.state ?? (pathNode.type === 'sync' ? 'NON-ASYNC' : 'N/A');
-                    observedNode.origin = this.getSnapshotNodeOrigin(pathNode);
-                    observedNode.file = pathNode.file;
-                    observedNode.fullname = pathNode.fullname;
-                    observedNode.line = pathNode.line;
-                    this.copySnapshotMetadata(observedNode, pathNode);
-                }
-
-                siblings = observedNode.children;
-            }
-        }
-
-        roots.forEach(root => this.finalizeObservedNodeLabels(root));
-        return roots;
-    }
-
-    private getSnapshotPathSegment(pathNodes: SnapshotNode[]): SnapshotNode[] {
-        const rootIndex = pathNodes.findIndex(node => node.type === 'async');
-        return rootIndex >= 0 ? pathNodes.slice(rootIndex) : [];
-    }
-
-    private getObservedNodeKey(node: SnapshotNode): string {
-        const name = node.func || node.addr || '<unknown>';
-        return `${node.type}:${name}`;
-    }
-
-    private finalizeObservedNodeLabels(node: TreeNode): void {
-        if (node.historyKind === 'observed') {
-            const latest = node.currentlyInLatestSnapshot ? 'yes' : 'no';
-            node.displayLabel = `${node.func} [seen=${node.seenCount ?? 0} latest=${latest}]`;
-        }
-        node.children.forEach(child => this.finalizeObservedNodeLabels(child));
-    }
-
-    private buildSnapshotPathTree(pathNodes: SnapshotNode[]): TreeNode[] {
-        if (pathNodes.length === 0) {
-            return [];
-        }
-
-        let rootIndex = -1;
-        for (let i = 0; i < pathNodes.length; i++) {
-            if (pathNodes[i].type === 'async') {
-                rootIndex = i;
-                break;
-            }
-        }
-
-        if (rootIndex < 0) {
-            return [];
-        }
-
-        const root = this.createTreeNodeFromSnapshotNode(pathNodes[rootIndex]);
-        let current = root;
-        for (let i = rootIndex + 1; i < pathNodes.length; i++) {
-            const child = this.createTreeNodeFromSnapshotNode(pathNodes[i]);
-            current.children.push(child);
-            current = child;
-        }
-
-        return [root];
-    }
-
-    private createTreeNodeFromSnapshotNode(node: SnapshotNode): TreeNode {
-        const treeNode: TreeNode = {
-            type: node.type,
-            cid: node.cid,
-            func: node.func,
-            addr: node.addr,
-            poll: node.poll ?? 0,
-            state: node.state ?? (node.type === 'sync' ? 'NON-ASYNC' : 'N/A'),
-            origin: this.getSnapshotNodeOrigin(node),
-            file: node.file,
-            fullname: node.fullname,
-            line: node.line,
-            children: [],
-        };
-        this.copySnapshotMetadata(treeNode, node);
-        return treeNode;
-    }
-
     private updateTreeFromSnapshot(snapshot: SnapshotPathData): void {
         // The Inspector is a view of the current snapshot, not accumulated
         // trace history. Rebuild so nodes absent from this path disappear.
@@ -1692,16 +1450,17 @@ export class AsyncInspectorPanel {
                         <button id="connectRemoteBtn" class="btn">Connect :1234</button>
                         <button id="resetBtn" class="btn">Reset</button>
                         <button id="genWhitelistBtn" class="btn">Gen Whitelist</button>
+                        <button id="continueBtn" class="btn">Continue</button>
                         <button id="snapshotBtn" class="btn">Snapshot</button>
                         <button id="historyBtn" class="btn">History</button>
-                        <button id="clearHistoryBtn" class="btn">Clear History</button>
+                        <button id="observerBtn" class="btn">Refresh Graph</button>
                         <button id="chainBtn" class="btn">Chain</button>
                     </div>
                     <div class="main-content">
                         <div class="tree-panel">
                             <div class="execution-graph-header">
-                                <h3>Async Execution Graph</h3>
-                                <div class="execution-graph-description">Runtime call graph from whitelist-admitted runtime events. Snapshot only prints the current snapshot. Trace only selects the observation root; graph nodes are built from whitelist-admitted runtime events.</div>
+                                <h3 id="executionGraphTitle">Async Execution Graph</h3>
+                                <div id="executionGraphDescription" class="execution-graph-description">Async execution graph built from runtime events with the selected trace function as the observation root.</div>
                             </div>
                             <div id="treeContainer"></div>
                         </div>
@@ -1916,6 +1675,15 @@ export class AsyncInspectorPanel {
                             var message = event.data;
                             if (message && message.command === 'updateTree') {
                                 scheduleInspectorPatch(message.treeData);
+                            } else if (message && message.command === 'updateTreeView') {
+                                var title = document.getElementById('executionGraphTitle');
+                                var description = document.getElementById('executionGraphDescription');
+                                if (title) {
+                                    title.textContent = 'Async Execution Graph';
+                                }
+                                if (description) {
+                                    description.textContent = 'Async execution graph built from runtime events with the selected trace function as the observation root.';
+                                }
                             } else if (message && message.command === 'updateTransitionPath') {
                                 window.transitionPath = message.transitionPath || [];
                                 renderTransitionPath(window.transitionPath);
@@ -1939,6 +1707,13 @@ export class AsyncInspectorPanel {
                                     host: '127.0.0.1',
                                     port: 1234,
                                 });
+                            });
+                        }
+
+                        var observerBtn = document.getElementById('observerBtn');
+                        if (observerBtn) {
+                            observerBtn.addEventListener('click', function() {
+                                window.ardInspectorVscode.postMessage({ command: 'refreshObserver' });
                             });
                         }
 

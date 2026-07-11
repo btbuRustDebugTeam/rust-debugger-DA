@@ -46,6 +46,33 @@ function logToFile(message) {
     }
     catch { }
 }
+function logDapRevealDebug(message, data = {}) {
+    const logFile = path.join(cwd, 'temp', 'logs', 'dap_reveal_debug.log');
+    try {
+        fs.mkdirSync(path.dirname(logFile), { recursive: true });
+        const timestamp = new Date().toISOString();
+        fs.appendFileSync(logFile, `${timestamp} ${message} ${JSON.stringify(data)}\n`, 'utf8');
+    }
+    catch { }
+}
+function logRevealStopLocation(message, data = {}) {
+    const logFile = path.join(cwd, 'temp', 'logs', 'reveal_stop_location_helper.log');
+    try {
+        fs.mkdirSync(path.dirname(logFile), { recursive: true });
+        const timestamp = new Date().toISOString();
+        fs.appendFileSync(logFile, `${timestamp} ${message} ${JSON.stringify(data)}\n`, 'utf8');
+    }
+    catch { }
+}
+function logAutoRevealStopLocation(message, data = {}) {
+    const logFile = path.join(cwd, 'temp', 'logs', 'auto_reveal_stop_location.log');
+    try {
+        fs.mkdirSync(path.dirname(logFile), { recursive: true });
+        const timestamp = new Date().toISOString();
+        fs.appendFileSync(logFile, `${timestamp} ${message} ${JSON.stringify(data)}\n`, 'utf8');
+    }
+    catch { }
+}
 function normalizeTargetRemote(remote) {
     if (remote === '127.0.0.1:1234' || remote === 'localhost:1234') {
         return ':1234';
@@ -83,6 +110,9 @@ let gdbOutputBuffer = '';
  * Before this is true, the first "continue" must use -exec-run instead.
  */
 let inferiorStarted = false;
+let lastStoppedFrame;
+let stoppedEventSerial = 0;
+let lastStoppedFrameSerial = 0;
 // ---------------------------------------------------------------------------
 // Breakpoint state
 // ---------------------------------------------------------------------------
@@ -239,6 +269,9 @@ function handleRequest(request) {
         case 'evaluate':
             handleEvaluate(request);
             break;
+        case 'ardbRevealStopLocation':
+            handleRevealStopLocation(request);
+            break;
         case 'disconnect':
             if (gdbProcess)
                 gdbProcess.kill();
@@ -249,6 +282,64 @@ function handleRequest(request) {
             // Acknowledge unknown requests so VS Code doesn't hang
             sendResponse(request);
     }
+}
+function handleRevealStopLocation(request) {
+    const isAutoReveal = request.arguments?.autoReveal === true;
+    if (isAutoReveal) {
+        logAutoRevealStopLocation('[adapter] auto reveal request', {
+            reason: request.arguments?.reason,
+            stoppedEventSerial,
+            lastStoppedFrameSerial,
+        });
+    }
+    logRevealStopLocation('[adapter] reveal request received');
+    if (!lastStoppedFrame) {
+        const message = 'No stopped frame available';
+        logRevealStopLocation('[adapter] reveal failed', { reason: message });
+        sendResponse(request, { ok: false, message });
+        return;
+    }
+    if (isAutoReveal && lastStoppedFrameSerial !== stoppedEventSerial) {
+        const message = 'No current stopped frame source location available';
+        logRevealStopLocation('[adapter] reveal failed', {
+            reason: message,
+            stoppedEventSerial,
+            lastStoppedFrameSerial,
+        });
+        sendResponse(request, { ok: false, message });
+        return;
+    }
+    const rawPath = lastStoppedFrame.fullname || lastStoppedFrame.file || '';
+    const mappedPath = remapGdbSourcePath(rawPath);
+    const line = lastStoppedFrame.line || 0;
+    if (!mappedPath || line <= 0) {
+        const message = 'No stopped frame source location available';
+        logRevealStopLocation('[adapter] reveal failed', {
+            reason: message,
+            hasPath: !!mappedPath,
+            line,
+            func: lastStoppedFrame.func,
+            addr: lastStoppedFrame.addr,
+            threadId: lastStoppedFrame.threadId,
+        });
+        sendResponse(request, { ok: false, message });
+        return;
+    }
+    logRevealStopLocation('[adapter] reveal success', {
+        path: mappedPath,
+        line,
+        func: lastStoppedFrame.func,
+        addr: lastStoppedFrame.addr,
+        threadId: lastStoppedFrame.threadId,
+    });
+    sendResponse(request, {
+        ok: true,
+        path: mappedPath,
+        line,
+        func: lastStoppedFrame.func,
+        addr: lastStoppedFrame.addr,
+        threadId: lastStoppedFrame.threadId,
+    });
 }
 // ---------------------------------------------------------------------------
 // DAP request handlers
@@ -1035,6 +1126,17 @@ function sendGDBRaw(command) {
 // DAP message helpers
 // ---------------------------------------------------------------------------
 function sendResponse(request, body = {}) {
+    if (request.command === 'stackTrace') {
+        const stackFrames = Array.isArray(body.stackFrames) ? body.stackFrames : [];
+        const firstFrame = stackFrames[0] || {};
+        logDapRevealDebug('sendResponse stackTrace', {
+            stackFramesCount: stackFrames.length,
+            firstFrameName: firstFrame.name,
+            firstFrameSourcePath: firstFrame.source?.path,
+            firstFrameLine: firstFrame.line,
+            firstFrameInstructionPointerReference: firstFrame.instructionPointerReference,
+        });
+    }
     const response = {
         type: 'response',
         request_seq: request.seq,
@@ -1058,6 +1160,12 @@ function sendErrorResponse(request, message) {
     process.stdout.write(`Content-Length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`);
 }
 function sendEvent(event, body = {}) {
+    if (event === 'stopped') {
+        logDapRevealDebug('sendEvent stopped', {
+            reason: body.reason,
+            threadId: body.threadId,
+        });
+    }
     const message = JSON.stringify({
         type: 'event',
         event: event,
@@ -1203,7 +1311,51 @@ function handleExecAsync(record) {
                 break;
         }
         // Extract thread ID from GDB data
+        stoppedEventSerial += 1;
         const threadId = parseInt(record.data?.['thread-id'] || '1', 10);
+        const frame = record.data?.frame;
+        if (frame) {
+            const parsedLine = parseInt(frame.line || '0', 10);
+            const rawPath = frame.fullname || frame.file || '';
+            const mappedPath = remapGdbSourcePath(rawPath) || '';
+            const revealableLine = Number.isFinite(parsedLine) && parsedLine > 0 ? parsedLine : undefined;
+            logRevealStopLocation('[adapter] raw stopped frame', {
+                threadId,
+                func: frame.func,
+                file: frame.file,
+                fullname: frame.fullname,
+                path: mappedPath,
+                line: revealableLine,
+                addr: frame.addr,
+            });
+            if (!mappedPath || !revealableLine) {
+                logRevealStopLocation('[adapter] stopped frame ignored: not revealable', {
+                    threadId,
+                    func: frame.func,
+                    path: mappedPath,
+                    line: revealableLine,
+                    addr: frame.addr,
+                });
+            }
+            else {
+                lastStoppedFrame = {
+                    threadId,
+                    func: frame.func,
+                    file: frame.file,
+                    fullname: frame.fullname,
+                    line: revealableLine,
+                    addr: frame.addr,
+                };
+                lastStoppedFrameSerial = stoppedEventSerial;
+                logRevealStopLocation('[adapter] stopped frame cached', {
+                    threadId,
+                    func: lastStoppedFrame.func,
+                    path: mappedPath,
+                    line: lastStoppedFrame.line,
+                    addr: lastStoppedFrame.addr,
+                });
+            }
+        }
         sendEvent('stopped', {
             reason: dapReason,
             description,
