@@ -15,6 +15,7 @@ export interface IDebuggerBackend {
 	addSymbolFile(filepath: string, textAddr?: string): Promise<any>;
 	removeSymbolFile(filepath: string): Promise<any>;
 	continue(reverse?: boolean): Promise<boolean>;
+	sendCliCommand(command: string): Promise<any>;
 }
 
 // Entry returned by breakpointGroupNameToDebugFilePaths.
@@ -183,6 +184,14 @@ export class BreakpointGroups {
 		this.currentBreakpointGroupName = this.groups[newIndex].name;
 		this.session.showInformationMessage("breakpoint group changed to " + updateTo);
 
+		// 0. Save async trace state BEFORE clearing old breakpoints.
+		const oldGroupName = this.groups[oldIndex].name;
+		const newGroupName = this.groups[newIndex].name;
+
+		this.session.miDebugger.sendCliCommand(
+			`ardb-save-trace-state ${oldGroupName}`
+		).catch(() => { /* best-effort */ }).then(() => {
+
 		// 1. Clear old group's breakpoints from GDB (parallel, order doesn't matter)
 		const clearOldPromises = this.groups[oldIndex].setBreakpointsArguments.map(
 			(e) => this.session.miDebugger.clearBreakPoints(e.source.path)
@@ -190,13 +199,13 @@ export class BreakpointGroups {
 
 		// 2. Unload old symbol files, load new symbol files — must complete before
 		//    re-inserting breakpoints so GDB can resolve source locations correctly.
-		const oldSymbolFiles: SymbolFileEntry[] = eval(this.session.breakpointGroupNameToDebugFilePaths)(this.groups[oldIndex].name);
-		const newSymbolFiles: SymbolFileEntry[] = eval(this.session.breakpointGroupNameToDebugFilePaths)(this.groups[newIndex].name);
+		const oldSymbolFiles: SymbolFileEntry[] = eval(this.session.breakpointGroupNameToDebugFilePaths)(oldGroupName);
+		const newSymbolFiles: SymbolFileEntry[] = eval(this.session.breakpointGroupNameToDebugFilePaths)(newGroupName);
 
 		const toPath = (e: SymbolFileEntry) => typeof e === 'string' ? e : e.path;
 		const toTextAddr = (e: SymbolFileEntry) => typeof e === 'string' ? undefined : e.textAddr;
 
-		Promise.all(clearOldPromises)
+		return Promise.all(clearOldPromises)
 			.then(() => Promise.all(oldSymbolFiles.map(f => this.session.miDebugger.removeSymbolFile(toPath(f)).catch(err => { console.error('[ardb] removeSymbolFile failed:', err); }))))
 			.then(() => Promise.all(newSymbolFiles.map(f => this.session.miDebugger.addSymbolFile(toPath(f), toTextAddr(f)).catch(err => { console.error('[ardb] addSymbolFile failed:', err); }))))
 			.then(() => {
@@ -225,7 +234,14 @@ export class BreakpointGroups {
 				// 4. Notify session to send BreakpointEvent('changed') for each restored BP
 				const flat = (nestedResults as Array<Array<[boolean, Breakpoint]>>).flat();
 				this.session.onBreakpointsRestored(flat);
-				// 5. Now safe to continue execution
+
+				// 5. Restore async trace state for the new group.
+				return this.session.miDebugger.sendCliCommand(
+					`ardb-restore-trace-state ${newGroupName}`
+				).catch(() => { /* best-effort */ });
+			})
+			.then(() => {
+				// 6. Now safe to continue execution
 				if (continueAfterUpdate) {
 					this.session.miDebugger.continue();
 				}
@@ -236,6 +252,8 @@ export class BreakpointGroups {
 					this.session.miDebugger.continue();
 				}
 			});
+
+		});  // end of save-trace-state .then() wrapper
 	}
 
 	// there should NOT be a `setCurrentBreakpointGroupName()` because changing the name also

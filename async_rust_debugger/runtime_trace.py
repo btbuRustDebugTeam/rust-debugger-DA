@@ -135,6 +135,10 @@ _ASYNC_SYMBOL_SET = None   # set[str] | None
 
 _EVENTS_INSTALLED = False
 
+# Per-breakpoint-group saved trace state (async OS debugging).
+# Key: group label ("kernel", "user").  Value: dict with serialized state.
+_SAVED_STATES: dict[str, dict] = {}
+
 
 # -------------------------
 # Low-level helpers
@@ -883,6 +887,7 @@ class ARDResetCommand(gdb.Command):
 
         _CALLSITE_INSTALLED_FOR_FN.clear()
         _ACTIVE_ROOTS.clear()
+        _SAVED_STATES.clear()
 
         _invalidate_whitelist_addrs()
 
@@ -1295,6 +1300,128 @@ class ARDInferTraceRootCommand(gdb.Command):
         gdb.write(json.dumps(result) + "\n")
 
 
+class ARDSaveTraceStateCommand(gdb.Command):
+    """Save current trace state so it can be restored after a group switch.
+    Usage: ardb-save-trace-state <label>"""
+
+    def __init__(self):
+        super().__init__("ardb-save-trace-state", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        label = arg.strip()
+        if not label:
+            gdb.write("[ARD] Usage: ardb-save-trace-state <label>\n")
+            return
+
+        # Snapshot PollEntryBP metadata before group switch deletes them.
+        poll_entries: list[tuple[str, str, bool]] = []
+        for bp in list(_CREATED_BPS):
+            if isinstance(bp, PollEntryBP):
+                poll_entries.append(
+                    (str(bp.location), bp.poll_sym, bp.internal)
+                )
+
+        state = {
+            "active_roots": set(_ACTIVE_ROOTS),
+            "callsite_installed": set(_CALLSITE_INSTALLED_FOR_FN),
+            "whitelist_exact": (
+                set(_WHITELIST_EXACT) if _WHITELIST_EXACT is not None else None
+            ),
+            "whitelist_prefix": (
+                list(_WHITELIST_PREFIX) if _WHITELIST_PREFIX is not None else None
+            ),
+            "whitelist_addr_map": dict(_WHITELIST_ADDR_MAP),
+            "whitelist_addr_ready": _WHITELIST_ADDR_READY,
+            "async_symbol_set": (
+                set(_ASYNC_SYMBOL_SET) if _ASYNC_SYMBOL_SET is not None else None
+            ),
+            "poll_entries": poll_entries,
+        }
+        _SAVED_STATES[label] = state
+        gdb.write(
+            f"[ARD] saved trace state '{label}': "
+            f"{len(poll_entries)} poll entries, "
+            f"{len(_ACTIVE_ROOTS)} active roots, "
+            f"{len(_CALLSITE_INSTALLED_FOR_FN)} scanned fns\n"
+        )
+
+
+class ARDRestoreTraceStateCommand(gdb.Command):
+    """Restore trace state previously saved by ardb-save-trace-state.
+    Re-installs PollEntryBP instances under the current symbol table.
+    Usage: ardb-restore-trace-state <label>"""
+
+    def __init__(self):
+        super().__init__("ardb-restore-trace-state", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        label = arg.strip()
+        if not label:
+            gdb.write("[ARD] Usage: ardb-restore-trace-state <label>\n")
+            return
+
+        state = _SAVED_STATES.pop(label, None)
+        if state is None:
+            gdb.write(f"[ARD] no saved trace state for '{label}'\n")
+            return
+
+        # 1. Restore whitelist (address map must be rebuilt for new symbols).
+        global _WHITELIST_EXACT, _WHITELIST_PREFIX, _WHITELIST_ADDR_MAP
+        global _WHITELIST_ADDR_READY, _ASYNC_SYMBOL_SET
+        _WHITELIST_EXACT = state["whitelist_exact"]
+        _WHITELIST_PREFIX = state["whitelist_prefix"]
+        _WHITELIST_ADDR_READY = False
+        _WHITELIST_ADDR_MAP = {}
+        _ASYNC_SYMBOL_SET = state["async_symbol_set"]
+
+        # 2. Restore tracking bookkeeping.
+        _ACTIVE_ROOTS.clear()
+        _ACTIVE_ROOTS.update(state["active_roots"])
+        _CALLSITE_INSTALLED_FOR_FN.clear()
+        _CALLSITE_INSTALLED_FOR_FN.update(state["callsite_installed"])
+
+        # 3. Re-install PollEntryBP for every saved entry.
+        restored = 0
+        for location, poll_sym, internal in state["poll_entries"]:
+            try:
+                PollEntryBP(
+                    location,
+                    poll_sym=poll_sym,
+                    internal=internal,
+                    temporary=False,
+                )
+                restored += 1
+            except Exception as e:
+                gdb.write(
+                    f"[ARD] restore: failed to re-install PollEntryBP "
+                    f"at '{location}': {e}\n"
+                )
+
+        gdb.write(
+            f"[ARD] restored trace state '{label}': "
+            f"{restored}/{len(state['poll_entries'])} poll entries\n"
+        )
+
+
+class ARDResetTraceStateCommand(gdb.Command):
+    """Discard saved trace state for a label.
+    Usage: ardb-reset-trace-state <label>"""
+
+    def __init__(self):
+        super().__init__("ardb-reset-trace-state", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        label = arg.strip()
+        if not label:
+            gdb.write("[ARD] Usage: ardb-reset-trace-state <label>\n")
+            return
+        if label in _SAVED_STATES:
+            del _SAVED_STATES[label]
+            gdb.write(f"[ARD] cleared saved trace state '{label}'\n")
+        else:
+            gdb.write(f"[ARD] no saved trace state for '{label}'\n")
+
+
 # -------------------------
 # Entry
 # -------------------------
@@ -1313,6 +1440,9 @@ def install():
     ARDGetGroupedWhitelistCommand()
     ARDUpdateWhitelistCommand()
     ARDInferTraceRootCommand()
+    ARDSaveTraceStateCommand()
+    ARDRestoreTraceStateCommand()
+    ARDResetTraceStateCommand()
 
     if not _EVENTS_INSTALLED:
         try:
