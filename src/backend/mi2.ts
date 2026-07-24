@@ -94,6 +94,23 @@ function readElfTextAddr(filepath: string): string | undefined {
 const nonOutput = /^(?:\d*|undefined)[\*\+\=]|[\~\@\&\^]/;
 const gdbMatch = /(?:\d*|undefined)\(gdb\)/;
 const numRegex = /\d+/;
+const NO_TOKEN_MINODE_CAPACITY = 100;
+const CONSOLE_CAPTURE_TIMEOUT_MS = 10000;
+
+interface ConsoleCaptureFragment {
+	sequence: number;
+	node: MINode;
+}
+
+interface ActiveConsoleCapture {
+	commandToken: number;
+	command: string;
+	startSequence: number;
+	fragments: ConsoleCaptureFragment[];
+	overflowed: boolean;
+	timer: ReturnType<typeof setTimeout>;
+	reject: (reason: any) => void;
+}
 
 function couldBeOutput(line: string) {
 	if (nonOutput.exec(line)) return false;
@@ -132,8 +149,8 @@ export class MI2 extends EventEmitter {
 			this.process = ChildProcess.spawn(this.application, args, { cwd: cwd, env: this.procEnv });
 			this.process.stdout?.on("data", this.stdout.bind(this));
 			this.process.stderr?.on("data", this.stderr.bind(this));
-			this.process.on("exit", () => this.emit("quit"));
-			this.process.on("error", err => this.emit("launcherror", err));
+			this.process.on("exit", () => this.handleDebuggerProcessExit());
+			this.process.on("error", err => this.handleDebuggerProcessError(err));
 			const promises = this.initCommands(target, cwd);
 			if (procArgs && procArgs.length)
 				promises.push(this.sendCommand("exec-arguments " + procArgs));
@@ -153,8 +170,8 @@ export class MI2 extends EventEmitter {
 			this.process = ChildProcess.spawn(this.application, args, { cwd: cwd, env: this.procEnv });
 			this.process.stdout?.on("data", this.stdout.bind(this));
 			this.process.stderr?.on("data", this.stderr.bind(this));
-			this.process.on("exit", () => this.emit("quit"));
-			this.process.on("error", err => this.emit("launcherror", err));
+			this.process.on("exit", () => this.handleDebuggerProcessExit());
+			this.process.on("error", err => this.handleDebuggerProcessError(err));
 			const promises = this.initCommands(target, cwd, true);
 			if (executable)
 				promises.push(this.sendCommand('file-exec-and-symbols "' + escape(executable) + '"'));
@@ -175,8 +192,8 @@ export class MI2 extends EventEmitter {
 			this.process = ChildProcess.spawn(this.application, args, { cwd: cwd, env: this.procEnv });
 			this.process.stdout?.on("data", this.stdout.bind(this));
 			this.process.stderr?.on("data", this.stderr.bind(this));
-			this.process.on("exit", () => this.emit("quit"));
-			this.process.on("error", err => this.emit("launcherror", err));
+			this.process.on("exit", () => this.handleDebuggerProcessExit());
+			this.process.on("error", err => this.handleDebuggerProcessError(err));
 			// First run init commands (gdb-set, list-features, extraCommands) in parallel,
 			// then load symbols, then connect to the remote stub, then run autorun commands.
 			// This order is required: symbols must be loaded before "target remote" so GDB
@@ -300,12 +317,32 @@ export class MI2 extends EventEmitter {
 					this.tokenCount = this.tokenCount + 1;
 					parsed.token = this.tokenCount;
 				} else {
-					parsed.token = this.tokenCount + 1;
-					this.originallyNoTokenMINodes.push(parsed);
-					if (this.originallyNoTokenMINodes.length >= 100) {
-						this.originallyNoTokenMINodes.splice(0, 90);
-						const rest = this.originallyNoTokenMINodes.splice(89);
-						this.originallyNoTokenMINodes = rest;
+					// GDB stream records do not carry the command token. Cache only
+					// console output. A command-owned capture takes precedence over
+					// the legacy "next result" cache so pre-command stop output cannot
+					// contaminate a captured CLI command.
+					const hasConsoleStream = parsed.outOfBandRecord.some(
+						record => record.isStream && record.type === "console"
+					);
+					if (hasConsoleStream) {
+						this.consoleStreamSequence++;
+						if (this.activeConsoleCapture) {
+							if (this.activeConsoleCapture.fragments.length < NO_TOKEN_MINODE_CAPACITY) {
+								this.activeConsoleCapture.fragments.push({
+									sequence: this.consoleStreamSequence,
+									node: parsed,
+								});
+							} else {
+								this.activeConsoleCapture.overflowed = true;
+							}
+						} else {
+							parsed.token = this.tokenCount + 1;
+							this.originallyNoTokenMINodes.push(parsed);
+							const overflow = this.originallyNoTokenMINodes.length - NO_TOKEN_MINODE_CAPACITY;
+							if (overflow > 0) {
+								this.originallyNoTokenMINodes.splice(0, overflow);
+							}
+						}
 					}
 				}
 				if (!handled && parsed.resultRecords && parsed.resultRecords?.resultClass == "error") {
@@ -351,9 +388,11 @@ export class MI2 extends EventEmitter {
 												this.emit("signal-stop", parsed);
 												break;
 											case "exited-normally":
+												this.abortActiveConsoleCapture("Inferior exited during captured console command");
 												this.emit("exited-normally", parsed);
 												break;
 											case "exited":
+												this.abortActiveConsoleCapture("Inferior exited during captured console command");
 												this.log("stderr", "Program exited with code " + parsed.record("exit-code"));
 												this.emit("exited-normally", parsed);
 												break;
@@ -746,6 +785,24 @@ export class MI2 extends EventEmitter {
 		return this.sendCommand(miCommand);
 	}
 
+	/**
+	 * Execute a CLI command with a transport-owned console capture window.
+	 * The window starts immediately before sendRaw and closes on this command's
+	 * exact MI result token. Console records outside that window remain on the
+	 * legacy no-token path and are never attached to this result.
+	 */
+	sendCliCommandCaptured(
+		command: string,
+		threadId: number = 0,
+		frameLevel: number = 0,
+		timeoutMs: number = CONSOLE_CAPTURE_TIMEOUT_MS
+	): Promise<MINode> {
+		let miCommand = "interpreter-exec ";
+		if (threadId != 0) miCommand += `--thread ${threadId} --frame ${frameLevel} `;
+		miCommand += `console "${command.replace(/[\\"']/g, "\\$&")}"`;
+		return this.sendCommandCaptured(miCommand, timeoutMs);
+	}
+
 	addSymbolFile(filepath: string, textAddr?: string): Promise<any> {
 		return new Promise((resolve, reject) => {
 			// GDB requires a .text load address for add-symbol-file.
@@ -790,6 +847,106 @@ export class MI2 extends EventEmitter {
 		});
 	}
 
+	private sendCommandCaptured(command: string, timeoutMs: number): Promise<MINode> {
+		if (this.activeConsoleCapture) {
+			return Promise.reject(new MIError(
+				"Another captured console command is already active",
+				command
+			));
+		}
+
+		const sel = this.currentToken++;
+		return new Promise((resolve, reject) => {
+			this.handlers[sel] = (node: MINode) => {
+				const captureError = this.finalizeConsoleCapture(sel, node);
+				if (captureError) {
+					reject(captureError);
+					return;
+				}
+
+				if (node && node.resultRecords && node.resultRecords.resultClass === "error") {
+					reject(new MIError(node.result("msg") || "Internal error", command));
+				} else {
+					resolve(node);
+				}
+			};
+
+			const boundedTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0
+				? timeoutMs
+				: CONSOLE_CAPTURE_TIMEOUT_MS;
+			const timer = setTimeout(() => {
+				this.abortActiveConsoleCapture(`Timed out after ${boundedTimeout} ms`);
+			}, boundedTimeout);
+
+			// Register synchronously immediately before sendRaw. No console record
+			// emitted before this point can enter this command-owned context.
+			this.activeConsoleCapture = {
+				commandToken: sel,
+				command,
+				startSequence: this.consoleStreamSequence,
+				fragments: [],
+				overflowed: false,
+				timer,
+				reject,
+			};
+
+			try {
+				this.sendRaw(sel + "-" + command);
+				console.log(`[GDB ->] ${sel}-${command}`);
+			} catch (error: any) {
+				this.abortActiveConsoleCapture(error?.message || "Failed to send captured console command");
+			}
+		});
+	}
+
+	private finalizeConsoleCapture(commandToken: number, node: MINode): MIError | undefined {
+		const capture = this.activeConsoleCapture;
+		if (!capture || capture.commandToken !== commandToken) {
+			return new MIError("Captured console command has no matching active context", String(commandToken));
+		}
+
+		clearTimeout(capture.timer);
+		this.activeConsoleCapture = undefined;
+		const endSequence = this.consoleStreamSequence;
+		const streamNodes = capture.fragments
+			.filter(fragment => fragment.sequence > capture.startSequence && fragment.sequence <= endSequence)
+			.map(fragment => fragment.node);
+
+		(node as any)._consoleOutput = streamNodes
+			.flatMap(streamNode => streamNode.outOfBandRecord || [])
+			.filter(record => record.isStream && record.type === "console")
+			.map(record => record.content || "")
+			.join("");
+		(node as any)._consoleCaptureStartSequence = capture.startSequence;
+		(node as any)._consoleCaptureEndSequence = endSequence;
+
+		if (capture.overflowed) {
+			(node as any)._consoleOutput = "";
+			return new MIError("Captured console output exceeded its bounded capacity", capture.command);
+		}
+		return undefined;
+	}
+
+	private abortActiveConsoleCapture(message: string): void {
+		const capture = this.activeConsoleCapture;
+		if (!capture) return;
+
+		clearTimeout(capture.timer);
+		this.activeConsoleCapture = undefined;
+		delete this.handlers[capture.commandToken];
+		capture.reject(new MIError(message, capture.command));
+	}
+
+	private handleDebuggerProcessExit(): void {
+		this.abortActiveConsoleCapture("GDB exited during captured console command");
+		this.emit("quit");
+	}
+
+	private handleDebuggerProcessError(error: Error): void {
+		this.abortActiveConsoleCapture(error.message || "GDB process error during captured console command");
+		this.emit("launcherror", error);
+	}
+
 	isReady(): boolean {
 		return !!this.process;
 	}
@@ -799,13 +956,13 @@ export class MI2 extends EventEmitter {
 	}
 
 	getOriginallyNoTokenMINodes(num: number): Array<MINode> {
-		const info = [];
-		for (let i = this.originallyNoTokenMINodes.length - 1; i >= 0; i--) {
-			if (this.originallyNoTokenMINodes[i].token == num) {
-				info.push(this.originallyNoTokenMINodes[i]);
-				this.originallyNoTokenMINodes.splice(i, 1);
-			}
+		const info: MINode[] = [];
+		const remaining: MINode[] = [];
+		for (const node of this.originallyNoTokenMINodes) {
+			if (node.token === num) info.push(node);
+			else remaining.push(node);
 		}
+		this.originallyNoTokenMINodes = remaining;
 		return info;
 	}
 
@@ -820,4 +977,6 @@ export class MI2 extends EventEmitter {
 	protected process!: ChildProcess.ChildProcess;
 	protected originallyNoTokenMINodes: MINode[] = [];
 	protected tokenCount: number = 0;
+	protected consoleStreamSequence: number = 0;
+	private activeConsoleCapture: ActiveConsoleCapture | undefined;
 }

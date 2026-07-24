@@ -2,7 +2,7 @@
 // Original: https://github.com/WebFreak001/code-debug
 
 export interface MIInfo {
-	token: number;
+	token: number | undefined;
 	outOfBandRecord: {
 		isStream: boolean;
 		type: string;
@@ -49,7 +49,7 @@ function parseString(str: string): string {
 }
 
 export class MINode implements MIInfo {
-	token: number;
+	token: number | undefined;
 	outOfBandRecord: {
 		isStream: boolean;
 		type: string;
@@ -60,7 +60,7 @@ export class MINode implements MIInfo {
 	resultRecords: { resultClass: string; results: [string, any][] } | undefined;
 
 	constructor(
-		token: number,
+		token: number | undefined,
 		info: {
 			isStream: boolean;
 			type: string;
@@ -306,5 +306,5 @@ export function parseMI(output: string): MINode {
 		output = output.replace(newlineRegex, "");
 	}
 
-	return new MINode(token ?? 0, outOfBandRecord || [], resultRecords);
+	return new MINode(token, outOfBandRecord || [], resultRecords);
 }

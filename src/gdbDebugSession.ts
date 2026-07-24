@@ -37,24 +37,57 @@ import {
     stateTransition,
 } from './OSStateMachine';
 import { isKernelAddr, isUserAddr, parseAddr } from './addrSpace';
+import {
+    RuntimeTraceBridge,
+    RuntimeTraceCapabilitiesV1,
+    SnapshotV1,
+    TraceEnableOptionsV1,
+    TraceStatusV1,
+} from './runtimeTraceBridge';
+import type { Breakpoint as BackendBreakpoint } from './backend/backend';
+import {
+    collectTestcaseSourceRoots,
+    gdbSourcePathCandidates,
+    resolveTestcaseSourcePath,
+    sourcePathsEqual,
+} from './sourcePathResolver';
 
 // ---------------------------------------------------------------------------
 // Exported interfaces (used by asyncInspectorPanel and extension)
 // ---------------------------------------------------------------------------
 
-export interface SnapshotData {
-    thread_id: number;
-    path: Array<{
-        type: 'async' | 'sync';
-        cid: number | null;
-        func: string;
-        addr: string;
-        poll: number;
-        state: number | string;
-        file?: string;
-        fullname?: string;
-        line?: number;
-    }>;
+export interface HistoryTreeNode {
+    children?: HistoryTreeNode[];
+    [key: string]: unknown;
+}
+
+export interface HistoryRelationAnnotation {
+    parent: string;
+    child: string;
+    relation: {
+        kind: string;
+        confidence: string;
+        source: string;
+        [key: string]: unknown;
+    };
+}
+
+export interface HistoryTreeData {
+    type: string;
+    roots: HistoryTreeNode[];
+    nodes: Array<Record<string, unknown>>;
+    edges: Array<Record<string, unknown>>;
+    relation_annotations?: HistoryRelationAnnotation[];
+    events: Array<Record<string, unknown>>;
+    counts: Record<string, number>;
+    cleared?: boolean;
+}
+
+export interface ObserverTreeData {
+    type: string;
+    observer_root: string | null;
+    roots: HistoryTreeNode[];
+    relation_annotations?: HistoryRelationAnnotation[];
 }
 
 export interface GroupedWhitelist {
@@ -127,6 +160,7 @@ export class GDBDebugSession extends DebugSession {
 
     // MI2 backend
     private miDebugger: MI2 | undefined;
+    private runtimeTraceBridge: RuntimeTraceBridge;
 
     // Inferior state
     private inferiorStarted = false;
@@ -159,6 +193,8 @@ export class GDBDebugSession extends DebugSession {
         | { type: 'var'; varName: string }
     > = new Map();
     private createdVarObjects: string[] = [];
+    /** Logical SnapshotV1 frames have no one-to-one physical GDB frame scope. */
+    private logicalStackFrameIds: Set<number> = new Set();
 
     // OS debug state
     private osDebugReady = false;
@@ -178,6 +214,43 @@ export class GDBDebugSession extends DebugSession {
         this.logPath = path.join(opts.tempDir, 'ardb.log');
         this.whitelistPath = path.join(opts.tempDir, 'poll_functions.txt');
         this.groupedWhitelistPath = path.join(opts.tempDir, 'poll_functions_grouped.json');
+        this.runtimeTraceBridge = new RuntimeTraceBridge(async (command: string) => {
+            if (!this.miDebugger) {
+                throw new Error('GDB is not available');
+            }
+            const record = await this.miDebugger.sendCliCommandCaptured(command);
+            if (record.token === undefined) {
+                throw new Error('MI command result is missing its token');
+            }
+            if (typeof (record as any)._consoleOutput !== 'string') {
+                throw new Error('MI command result is missing captured console output');
+            }
+            return record;
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Optional runtime_trace v1 queries
+    // -----------------------------------------------------------------------
+
+    private async tryProbeAsyncCapabilities(): Promise<RuntimeTraceCapabilitiesV1 | undefined> {
+        return this.runtimeTraceBridge.probeCapabilities();
+    }
+
+    private async tryGetAsyncSnapshot(): Promise<SnapshotV1 | undefined> {
+        return this.runtimeTraceBridge.getSnapshot();
+    }
+
+    private async tryEnableAsyncTrace(options: TraceEnableOptionsV1 = {}): Promise<TraceStatusV1 | undefined> {
+        return this.runtimeTraceBridge.enable(options);
+    }
+
+    private async tryDisableAsyncTrace(): Promise<TraceStatusV1 | undefined> {
+        return this.runtimeTraceBridge.disable();
+    }
+
+    private async tryGetAsyncTraceStatus(): Promise<TraceStatusV1 | undefined> {
+        return this.runtimeTraceBridge.getStatus();
     }
 
     // -----------------------------------------------------------------------
@@ -272,6 +345,31 @@ export class GDBDebugSession extends DebugSession {
         const bpgSession: IBreakpointGroupsSession = {
             get miDebugger(): IDebuggerBackend {
                 return self.miDebugger as unknown as IDebuggerBackend;
+            },
+            async addSourceBreakpoint(
+                breakpoint: BackendBreakpoint,
+            ): Promise<[boolean, BackendBreakpoint]> {
+                if (!self.miDebugger || !breakpoint.file) {
+                    return self.miDebugger
+                        ? self.miDebugger.addBreakPoint(breakpoint)
+                        : [false, undefined as any];
+                }
+
+                const localPath = breakpoint.file;
+                const gdbPath = await self.resolveGdbBreakpointSourcePath(
+                    localPath,
+                    breakpoint.line || 0,
+                );
+                const result = await self.miDebugger.addBreakPoint({
+                    ...breakpoint,
+                    file: gdbPath,
+                });
+                if (result[1]) {
+                    // MI2 tracks this object. Restoring the local path keeps
+                    // clearBreakPoints() and pending DAP ids on local identity.
+                    result[1].file = localPath;
+                }
+                return result;
             },
             filePathToBreakpointGroupNames: filePathToGroupNames,
             breakpointGroupNameToDebugFilePaths: groupNameToFilePaths,
@@ -386,6 +484,60 @@ export class GDBDebugSession extends DebugSession {
         }
     }
 
+    private breakpointSourceRoots(): string[] {
+        return collectTestcaseSourceRoots(
+            this.cwd ? [this.cwd] : [],
+            this.pythonPath,
+        );
+    }
+
+    private sourcePathsMatch(
+        framePath: string | null | undefined,
+        storedPath: string | null | undefined,
+    ): boolean {
+        return sourcePathsEqual(
+            framePath,
+            storedPath,
+            this.breakpointSourceRoots(),
+        );
+    }
+
+    private async resolveGdbBreakpointSourcePath(
+        localPath: string,
+        line: number,
+    ): Promise<string> {
+        if (!this.miDebugger) {
+            return localPath;
+        }
+
+        const candidates = gdbSourcePathCandidates(
+            localPath,
+            this.breakpointSourceRoots(),
+            this.pythonPath,
+        );
+        for (const candidate of candidates) {
+            console.debug(`[ARD] breakpoint source candidate: ${candidate}:${line}`);
+            try {
+                const record = await this.miDebugger.sendCommand(
+                    `symbol-list-lines "${escape(candidate)}"`,
+                );
+                if (record.resultRecords?.resultClass === 'done') {
+                    console.debug(`[ARD] breakpoint source resolved: ${candidate}:${line}`);
+                    return candidate;
+                }
+            } catch (error) {
+                console.debug(
+                    `[ARD] breakpoint source candidate rejected: ${candidate}:${line}`,
+                    error,
+                );
+            }
+        }
+
+        // Preserve the old behavior when no mapping candidate can be proven.
+        console.debug(`[ARD] breakpoint source fallback: ${localPath}:${line}`);
+        return localPath;
+    }
+
     // -----------------------------------------------------------------------
     // DAP: setBreakpoints
     // -----------------------------------------------------------------------
@@ -480,8 +632,12 @@ export class GDBDebugSession extends DebugSession {
             const dapBreakpoints: DebugProtocol.Breakpoint[] = [];
 
             for (const bp of requestedLines) {
-                const location = `"${escape(filePath)}:${bp.line}"`;
                 try {
+                    const gdbFilePath = await this.resolveGdbBreakpointSourcePath(
+                        filePath,
+                        bp.line,
+                    );
+                    const location = `"${escape(gdbFilePath)}:${bp.line}"`;
                     const record = await this.miDebugger!.sendCommand(`break-insert -f ${location}`);
                     const bkpt = MINode.valueOf(record.resultRecords?.results, "bkpt");
                     const gdbNumber = parseInt(MINode.valueOf(bkpt, "number") || '0');
@@ -730,54 +886,30 @@ export class GDBDebugSession extends DebugSession {
 
         try {
             await this.miDebugger!.sendCommand(`thread-select ${threadId}`);
-
-            const snapshot = await this.getSnapshotFromGDB();
-
-            if (snapshot && snapshot.path.length > 0) {
-                const reversedPath = [...snapshot.path].reverse();
-                const stackFrames: DebugProtocol.StackFrame[] = [];
-
-                for (let i = 0; i < reversedPath.length; i++) {
-                    const node = reversedPath[i];
-                    const frameId = threadId * 10000 + i;
-
-                    let name: string;
-                    if (node.type === 'async') {
-                        name = `[async CID:${node.cid}] ${node.func}`;
-                    } else {
-                        name = node.func || '<unknown>';
-                    }
-
-                    const sf = new StackFrame(
-                        frameId,
-                        name,
-                        (node.fullname || node.file) ? new Source(node.file || '', node.fullname || node.file || '') : undefined,
-                        node.line || 0,
-                        0,
-                    );
-
-                    if (node.addr) {
-                        sf.instructionPointerReference = node.addr;
-                    }
-
-                    stackFrames.push(sf);
-                }
-
-                response.body = { stackFrames, totalFrames: stackFrames.length };
-                this.sendResponse(response);
-            } else {
-                await this.fallbackPhysicalStackTrace(response, threadId);
-            }
         } catch (err: any) {
-            console.log(`[Adapter] snapshot stackTrace failed, falling back: ${err.message}`);
-            try {
-                await this.fallbackPhysicalStackTrace(response, threadId);
-            } catch (err2: any) {
-                console.log(`[Adapter] stackTrace fallback also failed: ${err2.message}`);
-                response.body = { stackFrames: [], totalFrames: 0 };
-                this.sendResponse(response);
-            }
+            console.log(`[Adapter] thread selection for stackTrace failed: ${err.message}`);
+            response.body = { stackFrames: [], totalFrames: 0 };
+            this.sendResponse(response);
+            return;
         }
+
+        const snapshot = await this.tryGetAsyncSnapshot();
+        const logicalFrames = snapshot && !snapshot.empty
+            ? this.buildLogicalAsyncStackFrames(snapshot, threadId)
+            : [];
+
+        let physicalFrames: DebugProtocol.StackFrame[] = [];
+        try {
+            physicalFrames = await this.getPhysicalStackFrames(threadId);
+        } catch (err: any) {
+            console.log(`[Adapter] physical stackTrace failed: ${err.message}`);
+        }
+
+        // Snapshot and the MI stack are different facts. Keep the leaf-first
+        // logical async path at the top without replacing the real stopped stack.
+        const stackFrames = [...logicalFrames, ...physicalFrames];
+        response.body = { stackFrames, totalFrames: stackFrames.length };
+        this.sendResponse(response);
     }
 
     // -----------------------------------------------------------------------
@@ -789,6 +921,11 @@ export class GDBDebugSession extends DebugSession {
         args: DebugProtocol.ScopesArguments,
     ): void {
         const frameId = args.frameId ?? 0;
+        if (this.logicalStackFrameIds.has(frameId)) {
+            response.body = { scopes: [] };
+            this.sendResponse(response);
+            return;
+        }
         const threadId = Math.floor(frameId / 10000);
         const frameLevel = frameId % 10000;
 
@@ -915,6 +1052,24 @@ export class GDBDebugSession extends DebugSession {
             case 'ardb-get-snapshot':
                 this.handleArdGetSnapshot(response).catch(err => {
                     this.sendErrorResponse(response, 100, err.message);
+                });
+                break;
+
+            case 'ardb-get-history-tree':
+                this.handleArdGetHistoryTree(response).catch(err => {
+                    this.sendErrorResponse(response, 110, err.message);
+                });
+                break;
+
+            case 'ardb-get-observer-tree':
+                this.handleArdGetObserverTree(response).catch(err => {
+                    this.sendErrorResponse(response, 112, err.message);
+                });
+                break;
+
+            case 'ardb-clear-history-tree':
+                this.handleArdClearHistoryTree(response).catch(err => {
+                    this.sendErrorResponse(response, 111, err.message);
                 });
                 break;
 
@@ -1066,8 +1221,35 @@ export class GDBDebugSession extends DebugSession {
 
     private async handleArdGetSnapshot(response: DebugProtocol.Response): Promise<void> {
         if (!this.miDebugger) { response.body = { snapshot: null }; this.sendResponse(response); return; }
-        const snapshot = await this.getSnapshotFromGDB();
+        const snapshot = await this.tryGetAsyncSnapshot();
         response.body = { snapshot: snapshot || null };
+        this.sendResponse(response);
+    }
+
+    private async handleArdGetHistoryTree(response: DebugProtocol.Response): Promise<void> {
+        if (!this.miDebugger) { response.body = { historyTree: null }; this.sendResponse(response); return; }
+        const record = await this.miDebugger.sendCliCommandCaptured('ardb-get-history-tree');
+        const output = this.getConsoleOutput(record);
+        const historyTree = this.parseJsonFromOutput(output) as HistoryTreeData | undefined;
+        response.body = { historyTree: historyTree || null };
+        this.sendResponse(response);
+    }
+
+    private async handleArdGetObserverTree(response: DebugProtocol.Response): Promise<void> {
+        if (!this.miDebugger) { response.body = { observerTree: null }; this.sendResponse(response); return; }
+        const record = await this.miDebugger.sendCliCommandCaptured('ardb-get-observer-tree');
+        const output = this.getConsoleOutput(record);
+        const observerTree = this.parseJsonFromOutput(output) as ObserverTreeData | undefined;
+        response.body = { observerTree: observerTree || null };
+        this.sendResponse(response);
+    }
+
+    private async handleArdClearHistoryTree(response: DebugProtocol.Response): Promise<void> {
+        if (!this.miDebugger) { response.body = { history: null }; this.sendResponse(response); return; }
+        const record = await this.miDebugger.sendCliCommandCaptured('ardb-clear-history-tree');
+        const output = this.getConsoleOutput(record);
+        const historyTree = this.parseJsonFromOutput(output) as HistoryTreeData | undefined;
+        response.body = { history: historyTree || null };
         this.sendResponse(response);
     }
 
@@ -1198,13 +1380,26 @@ export class GDBDebugSession extends DebugSession {
             this.sendEvent(new TerminatedEvent());
         });
 
-        this.miDebugger!.on('debug-ready', () => {
-            this.gdbReady = true;
-            if (attachConfig) {
-                this.osDebugReady = true;
-                this.inferiorStarted = true;
+        this.miDebugger!.on('debug-ready', async () => {
+            try {
+                // MI2 emits debug-ready only after the executable symbols are
+                // loaded. Restore an existing flat whitelist at that point so
+                // its RuntimeEvent observers are installed before execution.
+                if (fs.existsSync(this.whitelistPath)) {
+                    await this.miDebugger!.sendCliCommand('ardb-load-whitelist');
+                }
+            } catch (err: any) {
+                // Whitelist restoration is optional and must not prevent the
+                // underlying GDB/DAP session from becoming ready.
+                console.error(`[Adapter] failed to restore whitelist: ${err.message}`);
+            } finally {
+                this.gdbReady = true;
+                if (attachConfig) {
+                    this.osDebugReady = true;
+                    this.inferiorStarted = true;
+                }
+                this.sendEvent(new InitializedEvent());
             }
-            this.sendEvent(new InitializedEvent());
         });
 
         this.miDebugger!.on('breakpoint', (node: MINode) => {
@@ -1418,7 +1613,7 @@ export class GDBDebugSession extends DebugSession {
                 const lineNumber = v[0].line;
                 if (borders) {
                     for (const border of borders) {
-                        if (filepath === border.filepath && lineNumber === border.line) {
+                        if (this.sourcePathsMatch(filepath, border.filepath) && lineNumber === border.line) {
                             this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL_TO_USER_BORDER));
                             break;
                         }
@@ -1438,7 +1633,7 @@ export class GDBDebugSession extends DebugSession {
                 const lineNumber = v[0].line;
                 if (borders) {
                     for (const border of borders) {
-                        if (filepath === border.filepath && lineNumber === border.line) {
+                        if (this.sourcePathsMatch(filepath, border.filepath) && lineNumber === border.line) {
                             this.pendingBreakpointNode = undefined;
                             this.osStateTransition(new OSEvent(OSEvents.AT_USER_TO_KERNEL_BORDER));
                             return;
@@ -1465,7 +1660,7 @@ export class GDBDebugSession extends DebugSession {
                 if (!currentGroup) return;
                 for (const hook of currentGroup.hooks) {
                     this.currentHook = hook;
-                    if (filepath === hook.breakpoint.file && lineNumber === hook.breakpoint.line) {
+                    if (this.sourcePathsMatch(filepath, hook.breakpoint.file) && lineNumber === hook.breakpoint.line) {
                         eval(hook.behavior)().then((hookResult: string) => {
                             this.breakpointGroups!.setNextBreakpointGroup(hookResult);
                             this.currentHook = undefined;
@@ -1498,7 +1693,7 @@ export class GDBDebugSession extends DebugSession {
                 if (!currentGroup) { this.sendUserStoppedEvent(); return; }
 
                 for (const hook of currentGroup.hooks) {
-                    if (filepath === hook.breakpoint.file && lineNumber === hook.breakpoint.line) {
+                    if (this.sourcePathsMatch(filepath, hook.breakpoint.file) && lineNumber === hook.breakpoint.line) {
                         try {
                             const hookResult = await eval(hook.behavior)();
                             this.breakpointGroups!.setNextBreakpointGroup(hookResult);
@@ -1515,7 +1710,7 @@ export class GDBDebugSession extends DebugSession {
 
                 if (currentGroup.borders) {
                     for (const border of currentGroup.borders) {
-                        if (filepath === border.filepath && lineNumber === border.line) {
+                        if (this.sourcePathsMatch(filepath, border.filepath) && lineNumber === border.line) {
                             this.pendingBreakpointNode = undefined;
                             this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL_TO_USER_BORDER));
                             return;
@@ -1588,23 +1783,42 @@ export class GDBDebugSession extends DebugSession {
     // Helper methods
     // -----------------------------------------------------------------------
 
-    /** Send ardb-get-snapshot to GDB, then read the JSON result from disk. */
-    private async getSnapshotFromGDB(): Promise<SnapshotData | undefined> {
-        if (!this.miDebugger) return undefined;
-        await this.miDebugger.sendCliCommand('ardb-get-snapshot');
-        const snapshotPath = path.join(this.tempDir, 'ardb_snapshot.json');
-        try {
-            if (fs.existsSync(snapshotPath)) {
-                const content = fs.readFileSync(snapshotPath, 'utf-8');
-                const data = JSON.parse(content);
-                if (data && Array.isArray(data.path)) {
-                    return data as SnapshotData;
-                }
-            }
-        } catch {
-            // ignore read/parse errors
-        }
-        return undefined;
+    /** Build leaf-first logical DAP frames from the validated SnapshotV1 path. */
+    private buildLogicalAsyncStackFrames(
+        snapshot: SnapshotV1,
+        threadId: number,
+    ): DebugProtocol.StackFrame[] {
+        const roots = this.breakpointSourceRoots();
+        const reversedPath = [...snapshot.async_path].reverse();
+
+        return reversedPath.map((node, index) => {
+            // Physical frame levels occupy the low part of the existing
+            // threadId*10000 namespace. Reserve a disjoint logical range.
+            const frameId = threadId * 10000 + 5000 + index;
+            this.logicalStackFrameIds.add(frameId);
+
+            const cidMarker = node.cid === null ? '' : ` CID:${node.cid}`;
+            const name = `[async${cidMarker}] ${node.function || '<unknown>'}`;
+            const sourcePath = node.source?.path || undefined;
+            const resolvedPath = sourcePath
+                ? resolveTestcaseSourcePath(
+                    sourcePath,
+                    roots,
+                    message => console.debug(message),
+                ) || sourcePath
+                : undefined;
+            const sourceName = node.source?.name
+                || (resolvedPath ? path.basename(resolvedPath) : '');
+            const frame = new StackFrame(
+                frameId,
+                name,
+                resolvedPath ? new Source(sourceName, resolvedPath) : undefined,
+                node.source?.line || 0,
+                0,
+            );
+
+            return frame;
+        });
     }
 
     /** Extract console stream output accumulated by MI2 sendCliCommand result */
@@ -1648,12 +1862,12 @@ export class GDBDebugSession extends DebugSession {
         }
     }
 
-    private async fallbackPhysicalStackTrace(
-        response: DebugProtocol.StackTraceResponse,
+    /** Query the unchanged physical MI stack without sending a DAP response. */
+    private async getPhysicalStackFrames(
         threadId: number,
-    ): Promise<void> {
+    ): Promise<DebugProtocol.StackFrame[]> {
         const stack = await this.miDebugger!.getStack(0, 200, threadId);
-        const stackFrames: DebugProtocol.StackFrame[] = stack.map((f, i) => {
+        return stack.map((f, i) => {
             const frameId = threadId * 10000 + parseInt(f.level as any || i);
             const sf = new StackFrame(
                 frameId,
@@ -1667,9 +1881,6 @@ export class GDBDebugSession extends DebugSession {
             }
             return sf;
         });
-
-        response.body = { stackFrames, totalFrames: stackFrames.length };
-        this.sendResponse(response);
     }
 
     private async handleScopeVariables(
@@ -1766,6 +1977,7 @@ export class GDBDebugSession extends DebugSession {
         }
         this.createdVarObjects.length = 0;
         this.varRefMap.clear();
+        this.logicalStackFrameIds.clear();
         this.nextVarRef = 1;
     }
 

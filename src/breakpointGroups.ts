@@ -23,6 +23,7 @@ export type SymbolFileEntry = string | { path: string; textAddr?: string };
 
 export interface IBreakpointGroupsSession {
 	miDebugger: IDebuggerBackend;
+	addSourceBreakpoint?: (breakpoint: Breakpoint) => Promise<[boolean, Breakpoint]>;
 	filePathToBreakpointGroupNames: FunctionString;
 	breakpointGroupNameToDebugFilePaths: FunctionString;
 	showInformationMessage(msg: string): void;
@@ -206,13 +207,16 @@ export class BreakpointGroups {
 						() => {
 							const path = args.source.path;
 							const all = args.breakpoints!.map((brk) => {
-								return this.session.miDebugger.addBreakPoint({
+								const breakpoint = {
 									file: path,
 									line: brk.line,
 									condition: brk.condition ?? "",
 									countCondition: brk.hitCondition,
 									logMessage: brk.logMessage
-								});
+								};
+								return this.session.addSourceBreakpoint
+									? this.session.addSourceBreakpoint(breakpoint)
+									: this.session.miDebugger.addBreakPoint(breakpoint);
 							});
 							return Promise.all(all);
 						},

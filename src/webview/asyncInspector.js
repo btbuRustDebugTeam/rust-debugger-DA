@@ -7,8 +7,8 @@
     let groupedWhitelist = null;
     let enabledCrates = new Set();
 
-    // Trace root state (仅展示当前已 trace 的函数)
-    let traceRoots = [];
+    // Observer is a view over History and therefore has one selected root.
+    let observerRoot = null;
 
     // Flat candidates fallback
     let candidates = [];
@@ -16,17 +16,22 @@
     // Initialize UI
     function init() {
         renderTree(treeData);
+        renderTreeViewState();
+        renderObserverRoot();
         setupEventListeners();
         requestCandidates();
     }
 
     function setupEventListeners() {
         document.getElementById('resetBtn').addEventListener('click', () => {
-            traceRoots = [];
+            observerRoot = null;
+            treeData = [];
             groupedWhitelist = null;
             enabledCrates = new Set();
             candidates = [];
-            renderTraceRootSection();
+            renderObserverRoot();
+            renderTreeViewState();
+            renderTree(treeData);
             renderGroupedWhitelist(null);
             vscode.postMessage({ command: 'reset' });
         });
@@ -38,6 +43,19 @@
         document.getElementById('snapshotBtn').addEventListener('click', () => {
             vscode.postMessage({ command: 'snapshot' });
         });
+
+        document.getElementById('observerBtn').addEventListener('click', () => {
+            vscode.postMessage({ command: 'refreshObserver' });
+        });
+    }
+
+    function renderTreeViewState() {
+        const observerBtn = document.getElementById('observerBtn');
+        const title = document.getElementById('treeViewTitle');
+        observerBtn?.classList.add('active');
+        if (title) {
+            title.textContent = 'Execution Graph';
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -49,7 +67,7 @@
         container.innerHTML = '';
 
         if (roots.length === 0) {
-            container.innerHTML = '<div class="placeholder-text">No call tree available. Start debugging and set a trace point.</div>';
+            container.innerHTML = '<div class="placeholder-text">No execution graph available. Select a Trace Root from the whitelist.</div>';
             return;
         }
 
@@ -61,7 +79,7 @@
 
     function createTreeNode(node, depth) {
         const div = document.createElement('div');
-        div.className = `tree-node ${node.type} ${selectedNode === node.cid ? 'selected' : ''}`;
+        div.className = `tree-node ${node.type} ${selectedNode === node.func ? 'selected' : ''}`;
         div.style.marginLeft = `${depth * 20}px`;
 
         const content = document.createElement('div');
@@ -79,16 +97,7 @@
         func.className = 'node-func';
         func.textContent = node.func;
 
-        const meta = document.createElement('div');
-        meta.className = 'node-meta';
-        if (node.type === 'async') {
-            meta.textContent = `CID: ${node.cid} | Poll: ${node.poll} | State: ${node.state}`;
-        } else {
-            meta.textContent = `Addr: ${node.addr}`;
-        }
-
         info.appendChild(func);
-        info.appendChild(meta);
         content.appendChild(typeBadge);
         content.appendChild(info);
         div.appendChild(content);
@@ -96,8 +105,12 @@
         // Add click handler
         div.addEventListener('click', (e) => {
             e.stopPropagation();
-            selectNode(node.cid);
-            vscode.postMessage({ command: 'selectNode', cid: node.cid });
+            selectNode(node.func);
+            vscode.postMessage({
+                command: 'selectNode',
+                cid: node.cid,
+                symbol: node.func,
+            });
         });
 
         // Render children
@@ -113,8 +126,8 @@
         return div;
     }
 
-    function selectNode(cid) {
-        selectedNode = cid;
+    function selectNode(nodeKey) {
+        selectedNode = nodeKey;
         renderTree(treeData);
     }
 
@@ -123,35 +136,24 @@
     }
 
     // -----------------------------------------------------------------------
-    // Trace Root section（仅展示当前已 trace 的根函数列表）
+    // Observer Root section
     // -----------------------------------------------------------------------
 
-    function renderTraceRootSection() {
+    function renderObserverRoot() {
         const display = document.getElementById('traceRootDisplay');
         if (!display) return;
 
-        if (traceRoots.length === 0) {
-            display.textContent = 'No trace root set. Use "Trace" button in whitelist to set.';
+        if (!observerRoot) {
+            display.textContent = 'No trace root set. Use "Trace" in the whitelist to select one.';
             return;
         }
 
-        display.innerHTML = '';
-        traceRoots.forEach(sym => {
-            const item = document.createElement('div');
-            item.className = 'trace-root-item';
-            item.textContent = sym;
-            display.appendChild(item);
-        });
+        display.textContent = observerRoot;
     }
 
-    /**
-     * 当用户在白名单中点击 Trace 按钮时调用
-     */
-    function addTraceRoot(symbol) {
-        if (!traceRoots.includes(symbol)) {
-            traceRoots.push(symbol);
-        }
-        renderTraceRootSection();
+    function setObserverRoot(symbol) {
+        observerRoot = symbol || null;
+        renderObserverRoot();
     }
 
     // -----------------------------------------------------------------------
@@ -304,12 +306,12 @@
         const actions = document.createElement('div');
         actions.className = 'symbol-actions';
 
-        const traceBtn = document.createElement('button');
-        traceBtn.className = 'candidate-btn';
-        traceBtn.textContent = 'Trace';
-        traceBtn.addEventListener('click', (e) => {
+        const observerBtn = document.createElement('button');
+        observerBtn.className = 'candidate-btn';
+        observerBtn.textContent = 'Trace';
+        observerBtn.addEventListener('click', (e) => {
             e.stopPropagation();
-            addTraceRoot(sym.name);
+            setObserverRoot(sym.name);
             vscode.postMessage({ command: 'trace', symbol: sym.name });
         });
 
@@ -321,7 +323,7 @@
             vscode.postMessage({ command: 'locate', symbol: sym.name });
         });
 
-        actions.appendChild(traceBtn);
+        actions.appendChild(observerBtn);
         actions.appendChild(locateBtn);
         item.appendChild(kindBadge);
         item.appendChild(label);
@@ -354,11 +356,11 @@
             const actions = document.createElement('div');
             actions.className = 'candidate-actions';
 
-            const traceBtn = document.createElement('button');
-            traceBtn.className = 'candidate-btn';
-            traceBtn.textContent = 'Trace';
-            traceBtn.addEventListener('click', () => {
-                addTraceRoot(symbol);
+            const observerBtn = document.createElement('button');
+            observerBtn.className = 'candidate-btn';
+            observerBtn.textContent = 'Trace';
+            observerBtn.addEventListener('click', () => {
+                setObserverRoot(symbol);
                 vscode.postMessage({ command: 'trace', symbol: symbol });
             });
 
@@ -369,7 +371,7 @@
                 vscode.postMessage({ command: 'locate', symbol: symbol });
             });
 
-            actions.appendChild(traceBtn);
+            actions.appendChild(observerBtn);
             actions.appendChild(locateBtn);
             item.appendChild(symbolSpan);
             item.appendChild(actions);
@@ -384,8 +386,13 @@
     window.addEventListener('message', event => {
         const message = event.data;
         switch (message.command) {
+            case 'updateTreeView':
+                observerRoot = message.observerRoot || null;
+                renderTreeViewState();
+                renderObserverRoot();
+                break;
             case 'updateTree':
-                treeData = message.treeData;
+                treeData = message.treeData || [];
                 renderTree(treeData);
                 break;
             case 'updateCandidates':
