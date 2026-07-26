@@ -11,3 +11,4 @@ __pycache__/
 # ignore temp folder
 /temp
 
+/temp/
