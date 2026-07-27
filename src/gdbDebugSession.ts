@@ -1378,7 +1378,7 @@ export class GDBDebugSession extends DebugSession {
     // Returns true when a stack frame matches a border definition.
     // Supports both function-name matching and file:line matching.
     private matchesBorder(frame: {file: string; line: number; function?: string}, border: import('./breakpointGroups').Border): boolean {
-        if (border.function && frame.function === border.function) return true;
+        if (border.function && frame.function && frame.function.includes(border.function)) return true;
         if (border.filepath && border.line !== undefined &&
             frame.file === border.filepath && frame.line === border.line) return true;
         return false;
@@ -1478,7 +1478,10 @@ export class GDBDebugSession extends DebugSession {
                 if (!currentGroup) return;
                 for (const hook of currentGroup.hooks) {
                     this.currentHook = hook;
-                    if (filepath === hook.breakpoint.file && lineNumber === hook.breakpoint.line) {
+                    const hookFn = hook.breakpoint.function;
+                    const matchedByFile = hook.breakpoint.file && filepath === hook.breakpoint.file && lineNumber === hook.breakpoint.line;
+                    const matchedByFn = hookFn && v[0].function && v[0].function.includes(hookFn);
+                    if (matchedByFile || matchedByFn) {
                         eval(hook.behavior)().then((hookResult: string) => {
                             this.breakpointGroups!.setNextBreakpointGroup(hookResult);
                             this.currentHook = undefined;
@@ -1511,7 +1514,10 @@ export class GDBDebugSession extends DebugSession {
                 if (!currentGroup) { this.sendUserStoppedEvent(); return; }
 
                 for (const hook of currentGroup.hooks) {
-                    if (filepath === hook.breakpoint.file && lineNumber === hook.breakpoint.line) {
+                    const hookFn = hook.breakpoint.function;
+                    const matchedByFile = hook.breakpoint.file && filepath === hook.breakpoint.file && lineNumber === hook.breakpoint.line;
+                    const matchedByFn = hookFn && v[0].function && v[0].function.includes(hookFn);
+                    if (matchedByFile || matchedByFn) {
                         try {
                             const hookResult = await eval(hook.behavior)();
                             this.breakpointGroups!.setNextBreakpointGroup(hookResult);

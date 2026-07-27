@@ -372,7 +372,13 @@ export class BreakpointGroups {
 	}
 
 	public updateHookBreakpoint(hook: HookBreakpointJSONFriendly) {
-		const groupNames: string[] = eval(this.session.filePathToBreakpointGroupNames)(hook.breakpoint.file);
+		let groupNames: string[];
+		if (hook.breakpoint.file) {
+			groupNames = eval(this.session.filePathToBreakpointGroupNames)(hook.breakpoint.file);
+		} else {
+			// function-only hook: add to the current breakpoint group
+			groupNames = [this.getCurrentBreakpointGroupName()];
+		}
 		for (const groupName of groupNames) {
 			let groupExists = false;
 			for (const existingGroup of this.groups) {
@@ -389,7 +395,13 @@ export class BreakpointGroups {
 
 	// the breakpoints are still set, but they will no longer trigger user-defined behavior.
 	public disableHookBreakpoint(hook: HookBreakpointJSONFriendly) {
-		const groupNames: string[] = eval(this.session.filePathToBreakpointGroupNames)(hook.breakpoint.file);
+		let groupNames: string[];
+		if (hook.breakpoint.file) {
+			groupNames = eval(this.session.filePathToBreakpointGroupNames)(hook.breakpoint.file);
+		} else {
+			// function-only hook: add to the current breakpoint group
+			groupNames = [this.getCurrentBreakpointGroupName()];
+		}
 		for (const groupName of groupNames) {
 			for (const existingGroup of this.groups) {
 				if (existingGroup.name === groupName) {
