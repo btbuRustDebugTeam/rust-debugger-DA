@@ -136,6 +136,26 @@ export interface AttachRequestArguments extends DebugProtocol.AttachRequestArgum
     breakpointGroupNameToDebugFilePaths?: { functionArguments: string; functionBody: string; isAsync: boolean };
 }
 
+export interface LaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
+    program: string;
+    args?: string[];
+    cwd?: string;
+    remote?: string;
+    gdbPath?: string;
+}
+
+type DebugTransport = 'local' | 'remote';
+
+interface GDBStartupConfig {
+    transport: DebugTransport;
+    enableOsDebug: boolean;
+    gdbPath?: string;
+    debuggerArgs?: string[];
+    executable?: string;
+    target?: string;
+    autorun?: string[];
+}
+
 // ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
@@ -165,7 +185,7 @@ export class GDBDebugSession extends DebugSession {
     // Inferior state
     private inferiorStarted = false;
     private gdbReady = false;       // GDB process has connected and is ready to accept commands
-    private isAttachMode = false;   // true when using attach (QEMU) mode
+    private transport: DebugTransport = 'local';
     private program = '';
     private programArgs: string[] = [];
     private cwd = '';
@@ -279,13 +299,20 @@ export class GDBDebugSession extends DebugSession {
         response: DebugProtocol.LaunchResponse,
         args: DebugProtocol.LaunchRequestArguments,
     ): void {
-        const config = args as any;
+        const config = args as LaunchRequestArguments;
         this.program = config.program || '';
         this.programArgs = config.args || [];
         this.cwd = config.cwd || process.cwd();
+        const hasRemote = Object.prototype.hasOwnProperty.call(config, 'remote');
+        const remote = typeof config.remote === 'string' ? config.remote.trim() : '';
 
         if (!this.program) {
             this.sendErrorResponse(response, 1, 'No program specified in launch configuration');
+            return;
+        }
+
+        if (hasRemote && !remote) {
+            this.sendErrorResponse(response, 2, '`remote` must be a non-empty GDB server endpoint');
             return;
         }
 
@@ -293,10 +320,25 @@ export class GDBDebugSession extends DebugSession {
             fs.mkdirSync(this.tempDir, { recursive: true });
         }
 
-        this.launchGDB();
         this.inferiorStarted = false;
         this.gdbReady = false;
-        this.isAttachMode = false;
+        this.osDebugReady = false;
+        this.transport = remote ? 'remote' : 'local';
+
+        if (remote) {
+            this.launchGDB({
+                transport: 'remote',
+                enableOsDebug: false,
+                gdbPath: config.gdbPath?.trim() || undefined,
+                executable: this.program,
+                target: remote,
+            });
+        } else {
+            this.launchGDB({
+                transport: 'local',
+                enableOsDebug: false,
+            });
+        }
         this.sendResponse(response);
     }
 
@@ -452,14 +494,22 @@ export class GDBDebugSession extends DebugSession {
                 }
                 // Give QEMU ~1s to open the GDB stub before GDB tries to connect
                 setTimeout(() => {
-                    this.launchGDB(config);
+                    this.launchGDB({
+                        transport: 'remote',
+                        enableOsDebug: true,
+                        gdbPath: config.gdbpath,
+                        debuggerArgs: config.debugger_args,
+                        executable: config.executable || '',
+                        target: config.target,
+                        autorun: config.autorun,
+                    });
                 }, 1000);
             }
         );
 
         this.inferiorStarted = false;
         this.gdbReady = false;
-        this.isAttachMode = true;
+        this.transport = 'remote';
         this.sendResponse(response);
     }
 
@@ -473,10 +523,9 @@ export class GDBDebugSession extends DebugSession {
     ): void {
         this.sendResponse(response);
 
-        // In attach mode, GDB hasn't connected yet — the real stop will come from GDB
-        // after connecting to QEMU (via stopAtConnect). Don't send a fake StoppedEvent.
-        // In launch mode, send an entry stop so the UI shows "paused" while the user configures.
-        if (!this.isAttachMode) {
+        // Remote transports report the real stop from the existing remote inferior.
+        // Local transport uses a synthetic entry stop while the user configures ARD.
+        if (this.transport === 'local') {
             const event = new StoppedEvent('entry', 1);
             (event.body as any).description = 'Program loaded. Configure ARD, then press Continue to run.';
             (event.body as any).allThreadsStopped = true;
@@ -752,8 +801,8 @@ export class GDBDebugSession extends DebugSession {
         try {
             await this.cleanupVariables();
 
-            if (!this.inferiorStarted && !this.isAttachMode) {
-                // Launch mode: first Continue starts the program
+            if (!this.inferiorStarted && this.transport === 'local') {
+                // Local transport: first Continue starts the program.
                 this.inferiorStarted = true;
                 await this.miDebugger!.sendCommand('exec-run');
             } else {
@@ -1350,8 +1399,8 @@ export class GDBDebugSession extends DebugSession {
     // GDB subprocess management (via MI2)
     // -----------------------------------------------------------------------
 
-    private launchGDB(attachConfig?: AttachRequestArguments): void {
-        const gdbPath = attachConfig?.gdbpath || 'gdb';
+    private launchGDB(config: GDBStartupConfig): void {
+        const gdbPath = config.gdbPath || 'gdb';
         const gdbArgs = [
             '--interpreter=mi2',
             '-ex', `python import sys; sys.path.insert(0, '${this.pythonPath}'); import async_rust_debugger`,
@@ -1360,7 +1409,7 @@ export class GDBDebugSession extends DebugSession {
 
         const env = { ...process.env, ASYNC_RUST_DEBUGGER_TEMP_DIR: this.tempDir };
 
-        this.miDebugger = new MI2(gdbPath, gdbArgs, attachConfig?.debugger_args || [], env);
+        this.miDebugger = new MI2(gdbPath, gdbArgs, config.debuggerArgs || [], env);
 
         // Wire up events
         this.miDebugger!.on('msg', (type: string, msg: string) => {
@@ -1394,9 +1443,11 @@ export class GDBDebugSession extends DebugSession {
                 console.error(`[Adapter] failed to restore whitelist: ${err.message}`);
             } finally {
                 this.gdbReady = true;
-                if (attachConfig) {
-                    this.osDebugReady = true;
+                if (config.transport === 'remote') {
                     this.inferiorStarted = true;
+                }
+                if (config.enableOsDebug) {
+                    this.osDebugReady = true;
                 }
                 this.sendEvent(new InitializedEvent());
             }
@@ -1483,13 +1534,13 @@ export class GDBDebugSession extends DebugSession {
             }
         });
 
-        // Start GDB: attach mode connects to remote gdbserver, launch mode loads the program
-        if (attachConfig) {
+        // Start GDB using the transport selected by the DAP request.
+        if (config.transport === 'remote') {
             this.miDebugger!.connect(
                 this.cwd,
-                attachConfig.executable || '',
-                attachConfig.target,
-                attachConfig.autorun || [],
+                config.executable || '',
+                config.target || '',
+                config.autorun || [],
             ).catch(err => {
                 console.error('[Adapter] MI2 connect error:', err);
             });

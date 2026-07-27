@@ -42,6 +42,14 @@
               "env": {
                 "type": "object",
                 "description": "Environment variables"
+              },
+              "remote": {
+                "type": "string",
+                "description": "Connect to an already-running GDB server, e.g. localhost:1234"
+              },
+              "gdbPath": {
+                "type": "string",
+                "description": "Path to the GDB executable used for external remote launch; defaults to gdb"
               }
             }
           },
