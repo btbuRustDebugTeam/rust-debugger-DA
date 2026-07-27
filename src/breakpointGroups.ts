@@ -33,11 +33,13 @@ export interface IBreakpointGroupsSession {
 }
 
 export class Border {
-	filepath: string;
-	line: number;
-	constructor(filepath: string, line: number) {
+	filepath?: string;
+	line?: number;
+	function?: string;
+	constructor(filepath?: string, line?: number, func?: string) {
 		this.filepath = filepath;
 		this.line = line;
+		this.function = func;
 	}
 }
 
@@ -329,7 +331,13 @@ export class BreakpointGroups {
 	}
 
 	public updateBorder(border: Border) {
-		const groupNamesOfBorder: string[] = eval(this.session.filePathToBreakpointGroupNames)(border.filepath);
+		let groupNamesOfBorder: string[];
+		if (border.filepath) {
+			groupNamesOfBorder = eval(this.session.filePathToBreakpointGroupNames)(border.filepath);
+		} else {
+			// function-only border: add to the current breakpoint group
+			groupNamesOfBorder = [this.getCurrentBreakpointGroupName()];
+		}
 		for (const groupNameOfBorder of groupNamesOfBorder) {
 			let groupExists = false;
 			for (const group of this.groups) {
@@ -347,7 +355,13 @@ export class BreakpointGroups {
 
 	// breakpoints are still there but they are no longer borders
 	public disableBorder(border: Border) {
-		const groupNamesOfBorder: string[] = eval(this.session.filePathToBreakpointGroupNames)(border.filepath);
+		let groupNamesOfBorder: string[];
+		if (border.filepath) {
+			groupNamesOfBorder = eval(this.session.filePathToBreakpointGroupNames)(border.filepath);
+		} else {
+			// function-only border: add to the current breakpoint group
+			groupNamesOfBorder = [this.getCurrentBreakpointGroupName()];
+		}
 		for (const groupNameOfBorder of groupNamesOfBorder) {
 			for (const group of this.groups) {
 				if (group.name === groupNameOfBorder) {
