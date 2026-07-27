@@ -77,6 +77,12 @@ def _find_nearby_coro(poll_sym: str, this_ptr: int, max_offset: int = 128) -> in
 def _push_coro(cid: int) -> int:
     tid = _thread_id()
     st = _TLS_STACK.setdefault(tid, [])
+    # gdb.FinishBreakpoint may not fire on all architectures (e.g. RISC-V
+    # with release + -g).  If the same CID is already on the stack from a
+    # previous poll cycle, remove it (and everything after it) before pushing.
+    if cid in st:
+        idx = st.index(cid)
+        del st[idx:]
     st.append(cid)
     return len(st) - 1  # depth
 
@@ -166,6 +172,18 @@ def _read_ptr(addr: int) -> int:
 
 def _reg_u64(name: str) -> int:
     return int(gdb.parse_and_eval(f"${name}"))
+
+def _arg_reg() -> str:
+    """Return the register name for the first C argument on the current architecture."""
+    try:
+        arch = gdb.selected_frame().architecture().name()
+    except Exception:
+        return "rdi"
+    if "riscv" in arch:
+        return "a0"
+    if "aarch64" in arch:
+        return "x0"
+    return "rdi"  # x86_64
 
 def _current_pc() -> int:
     return int(gdb.parse_and_eval("$pc"))
@@ -362,7 +380,7 @@ def _try_read_awaitee_from_current_poll(poll_sym: str):
 
     # x86_64 SysV: rdi = env ptr
     try:
-        env_ptr = _reg_u64("rdi")
+        env_ptr = _reg_u64(_arg_reg())
     except Exception:
         return None
 
@@ -746,7 +764,7 @@ class PollEntryBP(gdb.Breakpoint):
         # ---- coro context enter (best-effort) ----
         tid = _thread_id()
         try:
-            this_ptr = _reg_u64("rdi")   # x86_64 SysV: first arg (env ptr)
+            this_ptr = _reg_u64(_arg_reg())   # x86_64 SysV: first arg (env ptr)
         except Exception:
             this_ptr = 0
 
@@ -758,7 +776,10 @@ class PollEntryBP(gdb.Breakpoint):
         if poll_sym and this_ptr:
             cid, is_new = _get_or_make_coro_id(poll_sym, this_ptr)
             depth = _push_coro(cid)
-            _PopOnReturnBP(tid, cid)
+            try:
+                _PopOnReturnBP(tid, cid)
+            except Exception:
+                pass  # gdb.FinishBreakpoint may not work on all arch/optimizations
 
         indent = "  " * max(depth, 0)
 
@@ -1080,7 +1101,7 @@ class ARDGetSnapshotCommand(gdb.Command):
                         if not this_ptr:
                             try:
                                 frame.select()
-                                this_ptr = _reg_u64("rdi")
+                                this_ptr = _reg_u64(_arg_reg())
                             except Exception:
                                 pass
 
@@ -1321,6 +1342,26 @@ class ARDSaveTraceStateCommand(gdb.Command):
                     (str(bp.location), bp.poll_sym, bp.internal)
                 )
 
+        # Serialize coroutine tracking state so poll sequences, shadow stack,
+        # and coro IDs survive new_objfile → _cleanup_run_scoped() across
+        # breakpoint-group switches (kernel ↔ user).
+        co_by_key_list = [
+            [sym, int(ptr), int(cid)]
+            for (sym, ptr), cid in _CO_BY_KEY.items()
+        ]
+        co_meta_dict = {
+            str(cid): [sym, int(ptr)]
+            for cid, (sym, ptr) in _CO_META.items()
+        }
+        co_poll_seq_dict = {
+            str(cid): int(seq)
+            for cid, seq in _CO_POLL_SEQ.items()
+        }
+        tls_stack_dict = {
+            str(tid): [int(c) for c in stack]
+            for tid, stack in _TLS_STACK.items()
+        }
+
         state = {
             "active_roots": set(_ACTIVE_ROOTS),
             "callsite_installed": set(_CALLSITE_INSTALLED_FOR_FN),
@@ -1336,13 +1377,21 @@ class ARDSaveTraceStateCommand(gdb.Command):
                 set(_ASYNC_SYMBOL_SET) if _ASYNC_SYMBOL_SET is not None else None
             ),
             "poll_entries": poll_entries,
+            # coroutine tracking (per-group)
+            "co_by_key": co_by_key_list,
+            "co_meta": co_meta_dict,
+            "co_poll_seq": co_poll_seq_dict,
+            "tls_stack": tls_stack_dict,
+            "co_next_id": _CO_NEXT_ID,
         }
         _SAVED_STATES[label] = state
         gdb.write(
             f"[ARD] saved trace state '{label}': "
             f"{len(poll_entries)} poll entries, "
             f"{len(_ACTIVE_ROOTS)} active roots, "
-            f"{len(_CALLSITE_INSTALLED_FOR_FN)} scanned fns\n"
+            f"{len(_CALLSITE_INSTALLED_FOR_FN)} scanned fns, "
+            f"{len(co_by_key_list)} coros, "
+            f"{_CO_NEXT_ID - 1} max cid\n"
         )
 
 
@@ -1380,7 +1429,29 @@ class ARDRestoreTraceStateCommand(gdb.Command):
         _CALLSITE_INSTALLED_FOR_FN.clear()
         _CALLSITE_INSTALLED_FOR_FN.update(state["callsite_installed"])
 
-        # 3. Re-install PollEntryBP for every saved entry.
+        # 3. Restore coroutine tracking state (must happen before PollEntryBP
+        #    re-install so that _push_coro / _CO_POLL_SEQ lookup sees the
+        #    saved CID namespace and poll sequences).
+        global _CO_NEXT_ID
+        _CO_BY_KEY.clear()
+        for sym, ptr, cid in state.get("co_by_key", []):
+            _CO_BY_KEY[(sym, int(ptr))] = int(cid)
+
+        _CO_META.clear()
+        for cid_str, pair in state.get("co_meta", {}).items():
+            _CO_META[int(cid_str)] = (pair[0], int(pair[1]))
+
+        _CO_POLL_SEQ.clear()
+        for cid_str, seq in state.get("co_poll_seq", {}).items():
+            _CO_POLL_SEQ[int(cid_str)] = int(seq)
+
+        _TLS_STACK.clear()
+        for tid_str, stack in state.get("tls_stack", {}).items():
+            _TLS_STACK[int(tid_str)] = [int(c) for c in stack]
+
+        _CO_NEXT_ID = int(state.get("co_next_id", 1))
+
+        # 4. Re-install PollEntryBP for every saved entry.
         restored = 0
         for location, poll_sym, internal in state["poll_entries"]:
             try:
@@ -1397,9 +1468,11 @@ class ARDRestoreTraceStateCommand(gdb.Command):
                     f"at '{location}': {e}\n"
                 )
 
+        coro_count = len(_CO_BY_KEY)
         gdb.write(
             f"[ARD] restored trace state '{label}': "
-            f"{restored}/{len(state['poll_entries'])} poll entries\n"
+            f"{restored}/{len(state['poll_entries'])} poll entries, "
+            f"{coro_count} coros\n"
         )
 
 
