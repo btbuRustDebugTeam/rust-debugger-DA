@@ -97,7 +97,7 @@ export interface AttachRequestArguments extends DebugProtocol.AttachRequestArgum
     second_breakpoint_group?: string;
     kernel_memory_ranges?: string[][];
     user_memory_ranges?: string[][];
-    border_breakpoints?: Array<{ filepath: string; line: number }>;
+    border_breakpoints?: Array<{ filepath?: string; line?: number; function?: string }>;
     hook_breakpoints?: any[];
     filePathToBreakpointGroupNames?: { functionArguments: string; functionBody: string; isAsync: boolean };
     breakpointGroupNameToDebugFilePaths?: { functionArguments: string; functionBody: string; isAsync: boolean };
@@ -317,7 +317,11 @@ export class GDBDebugSession extends DebugSession {
         // Register initial borders from launch.json
         if (config.border_breakpoints) {
             for (const b of config.border_breakpoints) {
-                this.breakpointGroups.updateBorder(new Border(b.filepath, b.line));
+                if (b.function) {
+                    this.breakpointGroups.updateBorder(new Border(b.filepath, b.line, b.function));
+                } else {
+                    this.breakpointGroups.updateBorder(new Border(b.filepath, b.line));
+                }
             }
         }
 
@@ -1371,6 +1375,15 @@ export class GDBDebugSession extends DebugSession {
         }
     }
 
+    // Returns true when a stack frame matches a border definition.
+    // Supports both function-name matching and file:line matching.
+    private matchesBorder(frame: {file: string; line: number; function?: string}, border: import('./breakpointGroups').Border): boolean {
+        if (border.function && frame.function === border.function) return true;
+        if (border.filepath && border.line !== undefined &&
+            frame.file === border.filepath && frame.line === border.line) return true;
+        return false;
+    }
+
     private doAction(action: Action): void {
         if (!this.miDebugger) return;
 
@@ -1418,7 +1431,7 @@ export class GDBDebugSession extends DebugSession {
                 const lineNumber = v[0].line;
                 if (borders) {
                     for (const border of borders) {
-                        if (filepath === border.filepath && lineNumber === border.line) {
+                        if (this.matchesBorder({file: filepath, line: lineNumber, function: v[0].function}, border)) {
                             this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL_TO_USER_BORDER));
                             break;
                         }
@@ -1438,7 +1451,7 @@ export class GDBDebugSession extends DebugSession {
                 const lineNumber = v[0].line;
                 if (borders) {
                     for (const border of borders) {
-                        if (filepath === border.filepath && lineNumber === border.line) {
+                        if (this.matchesBorder({file: filepath, line: lineNumber, function: v[0].function}, border)) {
                             this.pendingBreakpointNode = undefined;
                             this.osStateTransition(new OSEvent(OSEvents.AT_USER_TO_KERNEL_BORDER));
                             return;
@@ -1515,7 +1528,7 @@ export class GDBDebugSession extends DebugSession {
 
                 if (currentGroup.borders) {
                     for (const border of currentGroup.borders) {
-                        if (filepath === border.filepath && lineNumber === border.line) {
+                        if (this.matchesBorder({file: filepath, line: lineNumber, function: v[0].function}, border)) {
                             this.pendingBreakpointNode = undefined;
                             this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL_TO_USER_BORDER));
                             return;
