@@ -36,10 +36,13 @@ export class Border {
 	filepath?: string;
 	line?: number;
 	function?: string;
-	constructor(filepath?: string, line?: number, func?: string) {
+	gdbNumber?: number;  // GDB breakpoint number, set after inserting into GDB
+	direction: 'kernel_to_user' | 'user_to_kernel';
+	constructor(filepath?: string, line?: number, func?: string, direction: 'kernel_to_user' | 'user_to_kernel' = 'kernel_to_user') {
 		this.filepath = filepath;
 		this.line = line;
 		this.function = func;
+		this.direction = direction;
 	}
 }
 
@@ -130,6 +133,9 @@ export class BreakpointGroups {
 	// Tracks symbol files already loaded into GDB via add-symbol-file.
 	// We never unload them so that breakpoints from all groups stay active simultaneously.
 	private loadedSymbolFiles: Set<string> = new Set();
+	// Stores user_to_kernel function-based borders so they can be injected into user groups
+	// that are created after the borders are registered (e.g. on first setBreakpoints call).
+	private pendingUserToKernelFuncBorders: Border[] = [];
 
 	constructor(currentBreakpointGroupName: string, session: IBreakpointGroupsSession, nextBreakpointGroup: string) {
 		this.session = session;
@@ -168,7 +174,8 @@ export class BreakpointGroups {
 			}
 		}
 		if (newIndex === -1) {
-			this.groups.push(new BreakpointGroup(updateTo, [], new HookBreakpoints([]), []));
+			const initialBorders = this.pendingUserToKernelFuncBorders.map(b => new Border(b.filepath, b.line, b.function, b.direction));
+			this.groups.push(new BreakpointGroup(updateTo, [], new HookBreakpoints([]), initialBorders));
 			newIndex = this.groups.length - 1;
 		}
 		let oldIndex = -1;
@@ -199,10 +206,26 @@ export class BreakpointGroups {
 
 		this.session.showInformationMessage(`[DIAG] save done, now switching symbols (clear→unload→load→reinsert)...`);
 
+		const newBpCount = this.groups[newIndex].setBreakpointsArguments.reduce((s, a) => s + (a.breakpoints?.length ?? 0), 0);
+		const newFuncBorders = (this.groups[newIndex].borders ?? []).filter(b => b.function !== undefined).map(b => b.function);
+		console.log('[ardb] ', `[DBG] switching to group "${newGroupName}": ${newBpCount} user BPs, func borders=[${newFuncBorders.join(', ')}]`);
+
 		// 1. Clear old group's breakpoints from GDB (parallel, order doesn't matter)
 		const clearOldPromises = this.groups[oldIndex].setBreakpointsArguments.map(
 			(e) => this.session.miDebugger.clearBreakPoints(e.source.path)
 		);
+
+		// Also delete old group's function-name border breakpoints from GDB.
+		// Use the stored GDB number if available; fall back to deleting by name
+		// to handle the race where gdbNumber hasn't been set yet.
+		const oldFuncBorders = (this.groups[oldIndex].borders ?? []).filter(b => b.function !== undefined);
+		const clearOldFuncBorderPromises = oldFuncBorders.map(b => {
+			const cmd = b.gdbNumber !== undefined
+				? `break-delete ${b.gdbNumber}`
+				: `break-delete ${b.function}`;
+			return this.session.miDebugger.sendCliCommand(cmd).catch(() => { });
+		});
+		oldFuncBorders.forEach(b => { b.gdbNumber = undefined; });
 
 		// 2. Unload old symbol files, load new symbol files — must complete before
 		//    re-inserting breakpoints so GDB can resolve source locations correctly.
@@ -212,7 +235,7 @@ export class BreakpointGroups {
 		const toPath = (e: SymbolFileEntry) => typeof e === 'string' ? e : e.path;
 		const toTextAddr = (e: SymbolFileEntry) => typeof e === 'string' ? undefined : e.textAddr;
 
-		return Promise.all(clearOldPromises)
+		return Promise.all([...clearOldPromises, ...clearOldFuncBorderPromises])
 			.then(() => Promise.all(oldSymbolFiles.map(f => this.session.miDebugger.removeSymbolFile(toPath(f)).catch(err => { console.error('[ardb] removeSymbolFile failed:', err); }))))
 			.then(() => Promise.all(newSymbolFiles.map(f => this.session.miDebugger.addSymbolFile(toPath(f), toTextAddr(f)).catch(err => { console.error('[ardb] addSymbolFile failed:', err); }))))
 			.then(() => {
@@ -235,7 +258,17 @@ export class BreakpointGroups {
 						(_msg) => [] as Array<[boolean, Breakpoint]>
 					);
 				});
-				return Promise.all(breakpointPromises);
+
+				// Also re-insert new group's function-name border breakpoints into GDB
+				const newFuncBorderPromises = (this.groups[newIndex].borders ?? [])
+					.filter(b => b.function !== undefined)
+					.map(b => this.session.miDebugger.addBreakPoint({ raw: b.function!, condition: '' })
+						.then(([ok, brk]) => { if (ok && brk?.id) b.gdbNumber = brk.id; })
+						.catch(() => { })
+					);
+
+				return Promise.all([Promise.all(breakpointPromises), Promise.all(newFuncBorderPromises)])
+					.then(([bpResults]) => bpResults);
 			})
 			.then((nestedResults) => {
 				// 4. Notify session to send BreakpointEvent('changed') for each restored BP
@@ -321,7 +354,9 @@ export class BreakpointGroups {
 			}
 		}
 		if (found === -1) {
-			this.groups.push(new BreakpointGroup(groupName, [], new HookBreakpoints([]), []));
+			// Inject any pending user_to_kernel function-based borders into the new group.
+			const initialBorders = this.pendingUserToKernelFuncBorders.map(b => new Border(b.filepath, b.line, b.function, b.direction));
+			this.groups.push(new BreakpointGroup(groupName, [], new HookBreakpoints([]), initialBorders));
 			found = this.groups.length - 1;
 		}
 		let alreadyThere = -1;
@@ -337,6 +372,32 @@ export class BreakpointGroups {
 	}
 
 	public updateBorder(border: Border) {
+		// Function-based borders (e.g., { function: "enter_user" }) have no filepath.
+		// Assign by direction so each border is only active in the group where it can fire:
+		//   kernel_to_user → kernel group (default first group)
+		//   user_to_kernel → all non-kernel groups (user groups)
+		// This prevents e.g. enter_user (kernel_to_user) from being re-inserted into GDB
+		// when switching to a user breakpoint group, which would cause a spurious stop.
+		if (!border.filepath) {
+			if (border.direction === 'kernel_to_user') {
+				// Only the kernel group needs this border
+				const kernelGroup = this.groups[0];
+				if (kernelGroup) {
+					kernelGroup.borders = kernelGroup.borders ?? [];
+					kernelGroup.borders.push(border);
+				}
+			} else {
+				// user_to_kernel: add to all non-first groups (user groups).
+				// Also stash it so groups created later (on first setBreakpoints call) get it too.
+				this.pendingUserToKernelFuncBorders.push(border);
+				for (const group of this.groups.slice(1)) {
+					group.borders = group.borders ?? [];
+					group.borders.push(border);
+				}
+			}
+			return;
+		}
+
 		let groupNamesOfBorder: string[];
 		if (border.filepath) {
 			groupNamesOfBorder = eval(this.session.filePathToBreakpointGroupNames)(border.filepath);
@@ -361,11 +422,18 @@ export class BreakpointGroups {
 
 	// breakpoints are still there but they are no longer borders
 	public disableBorder(border: Border) {
+		// Function-based borders have no filepath — remove from all groups
+		if (!border.filepath) {
+			for (const group of this.groups) {
+				group.borders = [];
+			}
+			return;
+		}
+
 		let groupNamesOfBorder: string[];
 		if (border.filepath) {
 			groupNamesOfBorder = eval(this.session.filePathToBreakpointGroupNames)(border.filepath);
 		} else {
-			// function-only border: add to the current breakpoint group
 			groupNamesOfBorder = [this.getCurrentBreakpointGroupName()];
 		}
 		for (const groupNameOfBorder of groupNamesOfBorder) {

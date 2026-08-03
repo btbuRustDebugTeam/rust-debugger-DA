@@ -104,6 +104,14 @@ export const OSStateMachine: OSStateMachine = {
 					actions: [
 						{ type: DebuggerActions.start_consecutive_single_steps }
 					]
+				},
+				// When PC is already in kernel space (e.g. border at handle_syscall in StarryOS),
+				// bypass single-step and switch groups directly.
+				[OSEvents.AT_KERNEL]: {
+					target: OSStates.kernel,
+					actions: [
+						{ type: DebuggerActions.high_level_switch_breakpoint_group_to_low_level }
+					]
 				}
 			}
 		},
