@@ -190,9 +190,14 @@ export class BreakpointGroups {
 		const oldGroupName = this.groups[oldIndex].name;
 		const newGroupName = this.groups[newIndex].name;
 
+		this.session.showInformationMessage(`[DIAG] updateCurrentBreakpointGroup: ${oldGroupName} → ${newGroupName}`);
+		this.session.showInformationMessage(`[DIAG] saving trace state for '${oldGroupName}'...`);
+
 		this.session.miDebugger.sendCliCommand(
 			`ardb-save-trace-state ${oldGroupName}`
 		).catch(() => { /* best-effort */ }).then(() => {
+
+		this.session.showInformationMessage(`[DIAG] save done, now switching symbols (clear→unload→load→reinsert)...`);
 
 		// 1. Clear old group's breakpoints from GDB (parallel, order doesn't matter)
 		const clearOldPromises = this.groups[oldIndex].setBreakpointsArguments.map(
@@ -238,6 +243,7 @@ export class BreakpointGroups {
 				this.session.onBreakpointsRestored(flat);
 
 				// 5. Restore async trace state for the new group.
+				this.session.showInformationMessage(`[DIAG] restoring trace state for '${newGroupName}'...`);
 				return this.session.miDebugger.sendCliCommand(
 					`ardb-restore-trace-state ${newGroupName}`
 				).catch(() => { /* best-effort */ });
