@@ -98,7 +98,10 @@ export interface AttachRequestArguments extends DebugProtocol.AttachRequestArgum
     kernel_memory_ranges?: string[][];
     user_memory_ranges?: string[][];
     border_breakpoints?: Array<{ filepath?: string; line?: number; function?: string; direction?: 'kernel_to_user' | 'user_to_kernel' }>;
-    hook_breakpoints?: any[];
+    hook_breakpoints?: Array<{
+        breakpoint: { file?: string; line?: number; function?: string };
+        behavior: { functionArguments?: string; functionBody?: string; body?: string; args?: string[]; isAsync?: boolean };
+    }>;
     filePathToBreakpointGroupNames?: { functionArguments: string; functionBody: string; isAsync: boolean };
     breakpointGroupNameToDebugFilePaths?: { functionArguments: string; functionBody: string; isAsync: boolean };
 }
@@ -171,6 +174,7 @@ export class GDBDebugSession extends DebugSession {
     private currentHook: HookBreakpoint | undefined;
     private pendingBreakpointNode: MINode | undefined;
     private functionBorderNames: string[] = [];  // function-name border BPs to auto-insert on debug-ready
+    private functionHookNames: string[] = [];    // function-name hook BPs to auto-insert on debug-ready
 
     constructor(opts: GDBDebugSessionOptions) {
         super();
@@ -333,17 +337,30 @@ export class GDBDebugSession extends DebugSession {
         // uses ObjectAsFunction { body, args[] } — convert here.
         if (config.hook_breakpoints) {
             for (const h of config.hook_breakpoints) {
-                const normalized: HookBreakpointJSONFriendly = {
-                    breakpoint: h.breakpoint,
-                    behavior: {
-                        body: h.behavior?.functionBody ?? h.behavior?.body ?? '',
-                        args: h.behavior?.functionArguments !== undefined
-                            ? [h.behavior.functionArguments]
-                            : (h.behavior?.args ?? []),
-                        isAsync: h.behavior?.isAsync ?? false,
-                    },
+                const behavior = {
+                    body: h.behavior?.functionBody ?? h.behavior?.body ?? '',
+                    args: h.behavior?.functionArguments !== undefined
+                        ? [h.behavior.functionArguments]
+                        : (h.behavior?.args ?? []),
+                    isAsync: h.behavior?.isAsync ?? false,
                 };
-                this.breakpointGroups.updateHookBreakpoint(normalized);
+
+                // Function-based hooks (e.g. { function: "syscall_exec" }) need to be
+                // auto-inserted into GDB as raw function-name breakpoints, just like borders.
+                if (h.breakpoint.function) {
+                    this.functionHookNames.push(h.breakpoint.function);
+                    const normalized: HookBreakpointJSONFriendly = {
+                        breakpoint: { function: h.breakpoint.function, condition: '' } as any,
+                        behavior,
+                    };
+                    this.breakpointGroups.updateHookBreakpoint(normalized);
+                } else if (h.breakpoint.file) {
+                    const normalized: HookBreakpointJSONFriendly = {
+                        breakpoint: { file: h.breakpoint.file, line: h.breakpoint.line ?? 0, condition: '' } as any,
+                        behavior,
+                    };
+                    this.breakpointGroups.updateHookBreakpoint(normalized);
+                }
             }
         }
 
@@ -1247,6 +1264,19 @@ export class GDBDebugSession extends DebugSession {
                         console.error(`[ardb] failed to auto-insert border BP "${funcName}":`, e);
                     }
                 }
+
+                // Auto-insert function-name hook breakpoints into GDB.
+                // These drive dynamic breakpoint group selection (e.g. syscall_exec
+                // determines which user process to switch to). Like borders, they are
+                // transparent to the user — the behavior runs and execution continues.
+                for (const funcName of this.functionHookNames) {
+                    try {
+                        await this.miDebugger!.addBreakPoint({ raw: funcName, condition: '' });
+                        console.log(`[ardb] auto-inserted hook BP: "${funcName}"`);
+                    } catch (e) {
+                        console.error(`[ardb] failed to auto-insert hook BP "${funcName}":`, e);
+                    }
+                }
             }
             this.sendEvent(new InitializedEvent());
         });
@@ -1370,29 +1400,27 @@ export class GDBDebugSession extends DebugSession {
      * Read a C-string variable from GDB. Used by hook breakpoint behaviors
      * (which capture `this` via arrow functions) to fetch e.g. the `path`
      * argument of `sys_exec` and decide which user breakpoint group to switch to.
+     *
+     * Uses GDB's "p" (print) command and parses the console output with regex,
+     * which works across Rust versions without depending on Vec<String> internals.
      */
     public async getStringVariable(name: string): Promise<string> {
         if (!this.miDebugger) return '';
         try {
-            const lenRes = await this.miDebugger.sendCommand(
-                `data-evaluate-expression ${name}.vec.len`
-            );
-            const len = parseInt((lenRes.result('value') || '').trim(), 10);
-            if (!Number.isFinite(len) || len <= 0 || len > 4096) {
-                this.showInfo(`getStringVariable('${name}'): bad len`);
-                return '';
-            }
+            const printed = await this.miDebugger.captureConsoleOutput(`p ${name}`);
 
-            const ptrRes = await this.miDebugger.sendCommand(
-                `data-evaluate-expression ${name}.vec.buf.ptr.pointer.pointer`
-            );
-            const ptrStr = ptrRes.result('value') || '';
-            const m = /0x[0-9a-fA-F]+/.exec(ptrStr);
-            if (!m) {
-                this.showInfo(`getStringVariable('${name}'): no addr`);
+            const ptrMatch = /pointer:\s*(0x[0-9a-fA-F]+)/.exec(printed);
+            const lenMatch = /len:\s*(\d+)/.exec(printed);
+            if (!ptrMatch || !lenMatch) {
+                this.showInfo(`getStringVariable('${name}'): could not parse pointer/len from: ${printed.slice(0, 200)}`);
                 return '';
             }
-            const addr = m[0];
+            const addr = ptrMatch[1];
+            const len = parseInt(lenMatch[1], 10);
+            if (!Number.isFinite(len) || len <= 0 || len > 4096) {
+                this.showInfo(`getStringVariable('${name}'): bad len ${len}`);
+                return '';
+            }
 
             const memRes = await this.miDebugger.sendCommand(
                 `data-read-memory-bytes ${addr} ${len}`
@@ -1595,8 +1623,11 @@ export class GDBDebugSession extends DebugSession {
 
                 for (const hook of currentGroup.hooks) {
                     const hookFn = hook.breakpoint.function;
-                    const matchedByFile = hook.breakpoint.file && filepath === hook.breakpoint.file && lineNumber === hook.breakpoint.line;
-                    const matchedByFn = hookFn && v[0].function && v[0].function.includes(hookFn);
+                    const hookFile = hook.breakpoint.file;
+                    const hookLine = hook.breakpoint.line;
+                    const stackFunc = v[0].function;
+                    const matchedByFile = hookFile && filepath === hookFile && lineNumber === hookLine;
+                    const matchedByFn = hookFn && stackFunc && stackFunc === hookFn;
                     if (matchedByFile || matchedByFn) {
                         try {
                             const hookResult = await eval(hook.behavior)();

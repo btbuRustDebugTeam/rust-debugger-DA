@@ -739,6 +739,22 @@ export class MI2 extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Execute a GDB CLI command and capture its console output as a string.
+	 * Used by hook breakpoint behaviors to parse GDB output (e.g. "p variable")
+	 * without depending on hardcoded type layouts.
+	 */
+	captureConsoleOutput(command: string): Promise<string> {
+		const lines: string[] = [];
+		const msgHandler = (type: string, msg: string) => {
+			if (type === "console") lines.push(msg);
+		};
+		this.on("msg", msgHandler);
+		return this.sendCommand(`interpreter-exec console "${command.replace(/[\\"']/g, "\\$&")}"`)
+			.then(() => { this.removeListener("msg", msgHandler); return lines.join(""); })
+			.catch((e) => { this.removeListener("msg", msgHandler); throw e; });
+	}
+
 	sendCliCommand(command: string, threadId: number = 0, frameLevel: number = 0): Promise<MINode> {
 		let miCommand = "interpreter-exec ";
 		if (threadId != 0) miCommand += `--thread ${threadId} --frame ${frameLevel} `;

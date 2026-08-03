@@ -208,7 +208,8 @@ export class BreakpointGroups {
 
 		const newBpCount = this.groups[newIndex].setBreakpointsArguments.reduce((s, a) => s + (a.breakpoints?.length ?? 0), 0);
 		const newFuncBorders = (this.groups[newIndex].borders ?? []).filter(b => b.function !== undefined).map(b => b.function);
-		console.log('[ardb] ', `[DBG] switching to group "${newGroupName}": ${newBpCount} user BPs, func borders=[${newFuncBorders.join(', ')}]`);
+		const newFuncHooks = [...this.groups[newIndex].hooks].filter(h => h.breakpoint.function !== undefined).map(h => h.breakpoint.function);
+		console.log('[ardb] ', `[DBG] switching to group "${newGroupName}": ${newBpCount} user BPs, func borders=[${newFuncBorders.join(', ')}], func hooks=[${newFuncHooks.join(', ')}]`);
 
 		// 1. Clear old group's breakpoints from GDB (parallel, order doesn't matter)
 		const clearOldPromises = this.groups[oldIndex].setBreakpointsArguments.map(
@@ -227,6 +228,12 @@ export class BreakpointGroups {
 		});
 		oldFuncBorders.forEach(b => { b.gdbNumber = undefined; });
 
+		// Also delete old group's function-name hook breakpoints from GDB.
+		const oldFuncHooks = [...this.groups[oldIndex].hooks].filter(h => h.breakpoint.function !== undefined);
+		const clearOldFuncHookPromises = oldFuncHooks.map(h => {
+			return this.session.miDebugger.sendCliCommand(`break-delete ${h.breakpoint.function}`).catch(() => { });
+		});
+
 		// 2. Unload old symbol files, load new symbol files — must complete before
 		//    re-inserting breakpoints so GDB can resolve source locations correctly.
 		const oldSymbolFiles: SymbolFileEntry[] = eval(this.session.breakpointGroupNameToDebugFilePaths)(oldGroupName);
@@ -235,7 +242,7 @@ export class BreakpointGroups {
 		const toPath = (e: SymbolFileEntry) => typeof e === 'string' ? e : e.path;
 		const toTextAddr = (e: SymbolFileEntry) => typeof e === 'string' ? undefined : e.textAddr;
 
-		return Promise.all([...clearOldPromises, ...clearOldFuncBorderPromises])
+		return Promise.all([...clearOldPromises, ...clearOldFuncBorderPromises, ...clearOldFuncHookPromises])
 			.then(() => Promise.all(oldSymbolFiles.map(f => this.session.miDebugger.removeSymbolFile(toPath(f)).catch(err => { console.error('[ardb] removeSymbolFile failed:', err); }))))
 			.then(() => Promise.all(newSymbolFiles.map(f => this.session.miDebugger.addSymbolFile(toPath(f), toTextAddr(f)).catch(err => { console.error('[ardb] addSymbolFile failed:', err); }))))
 			.then(() => {
@@ -267,7 +274,14 @@ export class BreakpointGroups {
 						.catch(() => { })
 					);
 
-				return Promise.all([Promise.all(breakpointPromises), Promise.all(newFuncBorderPromises)])
+				// Also re-insert new group's function-name hook breakpoints into GDB
+				const newFuncHookPromises = [...this.groups[newIndex].hooks]
+					.filter(h => h.breakpoint.function !== undefined)
+					.map(h => this.session.miDebugger.addBreakPoint({ raw: h.breakpoint.function!, condition: '' })
+						.catch(() => { })
+					);
+
+				return Promise.all([Promise.all(breakpointPromises), Promise.all(newFuncBorderPromises), Promise.all(newFuncHookPromises)])
 					.then(([bpResults]) => bpResults);
 			})
 			.then((nestedResults) => {
