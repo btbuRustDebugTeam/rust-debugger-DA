@@ -31,20 +31,38 @@
       "internalConsoleOptions": "openOnSessionStart"
     },
     {
-      "name": "Debug Adapter (standalone)",
+      "name": "Debug Adapter Server (调试调试器)",
       "type": "node",
       "request": "launch",
-      "program": "${workspaceFolder}/out/gdbAdapter.js",
-      "args": [],
-      "cwd": "${workspaceFolder}/testcases/minimal",
+      "program": "${workspaceFolder}/out/debugAdapterStandalone.js",
+      "args": [
+        "--server=4711"
+      ],
+      "cwd": "${workspaceFolder}",
       "env": {
-        "ARDB_PROGRAM": "${workspaceFolder}/testcases/minimal/target/debug/minimal",
-        "ARDB_ARGS": "[]",
-        "ARDB_CWD": "${workspaceFolder}/testcases/minimal",
         "PYTHONPATH": "${workspaceFolder}/async_rust_debugger",
-        "ASYNC_RUST_DEBUGGER_TEMP_DIR": "${workspaceFolder}/testcases/minimal/.ardb"
+        "ARDB_TEMP_DIR": "${workspaceFolder}/temp"
       },
-      "console": "internalConsole",
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "openOnSessionStart",
+      "sourceMaps": true,
+      "skipFiles": [
+        "<node_internals>/**"
+      ],
+      "preLaunchTask": "npm: compile"
+    },
+    {
+      "name": "Debug Adapter (standalone, full)",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/out/debugAdapterStandalone.js",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/async_rust_debugger",
+        "ARDB_TEMP_DIR": "${workspaceFolder}/temp"
+      },
+      "console": "integratedTerminal",
       "internalConsoleOptions": "openOnSessionStart",
       "sourceMaps": true,
       "skipFiles": [
@@ -55,18 +73,10 @@
   ],
   "compounds": [
     {
-      "name": "Debug Extension + Debug Target",
-      "configurations": [
-        "Extension Development Host (with testcase)"
-      ],
-      "stopAll": true,
-      "preLaunchTask": "npm: compile"
-    },
-    {
-      "name": "Debug Extension + Debug Adapter",
+      "name": "Extension + Adapter Server (调试调试器)",
       "configurations": [
         "Extension Development Host",
-        "Debug Adapter (standalone)"
+        "Debug Adapter Server (调试调试器)"
       ],
       "stopAll": true,
       "preLaunchTask": "npm: compile"

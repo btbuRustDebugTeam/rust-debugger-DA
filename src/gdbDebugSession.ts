@@ -1425,17 +1425,24 @@ export class GDBDebugSession extends DebugSession {
             this.miDebugger.getStack(0, 1, this.recentStopThreadId).then(v => {
                 if (!v || v.length === 0 || !v[0]) {
                     console.warn('[ardb] check_if_kernel_to_user_border_yet: empty stack');
+                    this.showInfo('[DIAG] check_if_kernel_to_user_border_yet: empty stack - NO FALLBACK');
                     return;
                 }
                 const filepath = v[0].file;
                 const lineNumber = v[0].line;
+                let matched = false;
                 if (borders) {
                     for (const border of borders) {
                         if (this.matchesBorder({file: filepath, line: lineNumber, function: v[0].function}, border)) {
+                            matched = true;
                             this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL_TO_USER_BORDER));
                             break;
                         }
                     }
+                }
+                if (!matched) {
+                    this.showInfo(`[DIAG] check_if_kernel_to_user_border_yet: NO MATCH at ${filepath}:${lineNumber} (${v[0].function}) - HANGING!`);
+                    console.warn(`[ardb] check_if_kernel_to_user_border_yet: no border matched at ${filepath}:${lineNumber}`);
                 }
             });
         }

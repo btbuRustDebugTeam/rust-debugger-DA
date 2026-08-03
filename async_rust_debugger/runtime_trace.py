@@ -546,6 +546,27 @@ def _default_log_path() -> str | None:
         return None
     return os.path.join(cwd, temp_dir, "ardb.log")
 
+def _diag_log_path() -> str | None:
+    cwd = os.getcwd()
+    temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
+    if not temp_dir:
+        return None
+    return os.path.join(cwd, temp_dir, "ardb_diag.log")
+
+def _DIAG_LOG(message: str):
+    """Diagnostic log for debugging save/restore flow. Always writes to file and GDB console."""
+    path = _diag_log_path()
+    if path:
+        try:
+            log_dir = os.path.dirname(path)
+            if not os.path.exists(log_dir):
+                os.makedirs(log_dir, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fp:
+                fp.write(message + "\n")
+        except Exception:
+            pass
+    gdb.write("[DIAG] " + message + "\n")
+
 def _log_ard(message: str, to_console: bool = False):
     """
     双轨日志记录：
@@ -719,6 +740,12 @@ def _pick_interesting_callee(target_addr: int) -> str | None:
 # -------------------------
 
 def _cleanup_run_scoped():
+    _DIAG_LOG("[DIAG] _cleanup_run_scoped() called: "
+              f"|_RUN_SCOPED_BPS|={len(_RUN_SCOPED_BPS)}, "
+              f"|_CALLSITE_INSTALLED_FOR_FN|={len(_CALLSITE_INSTALLED_FOR_FN)}, "
+              f"|_CO_BY_KEY|={len(_CO_BY_KEY)}, "
+              f"|_ACTIVE_ROOTS|={len(_ACTIVE_ROOTS)}, "
+              f"|_CREATED_BPS|={len(_CREATED_BPS)}")
     for bp in list(_RUN_SCOPED_BPS):
         try:
             bp.delete()
@@ -735,11 +762,21 @@ def _cleanup_run_scoped():
     _CO_POLL_SEQ.clear()
     global _CO_NEXT_ID
     _CO_NEXT_ID = 1
+    _DIAG_LOG("[DIAG] _cleanup_run_scoped() done: all run-scoped state cleared")
 
 def _on_exited(event):
+    _DIAG_LOG("[DIAG] _on_exited() fired")
     _cleanup_run_scoped()
 
 def _on_new_objfile(event):
+    objfile_name = getattr(event, 'new_objfile', None)
+    if objfile_name is not None:
+        try:
+            _DIAG_LOG(f"[DIAG] _on_new_objfile() fired: {objfile_name.filename}")
+        except Exception:
+            _DIAG_LOG("[DIAG] _on_new_objfile() fired: (unable to get filename)")
+    else:
+        _DIAG_LOG("[DIAG] _on_new_objfile() fired")
     _cleanup_run_scoped()
 
 # -------------------------
@@ -827,8 +864,11 @@ class PollEntryBP(gdb.Breakpoint):
                 CallSiteBP(a)
 
             _CALLSITE_INSTALLED_FOR_FN.add(fn)
+            _DIAG_LOG(f"[DIAG] PollEntryBP.stop(): installed {len(call_sites)} CallSiteBPs for '{fn}'")
             if (not self.internal) or PRINT_INTERNAL_POLL_HITS:
                 _log_ard(f"[ARD]{indent} call-sites: {len(call_sites)}")
+        else:
+            _DIAG_LOG(f"[DIAG] PollEntryBP.stop(): SKIPPED call-site scan for '{fn}' - already in _CALLSITE_INSTALLED_FOR_FN")
 
         return False
 
@@ -1334,6 +1374,11 @@ class ARDSaveTraceStateCommand(gdb.Command):
             gdb.write("[ARD] Usage: ardb-save-trace-state <label>\n")
             return
 
+        _DIAG_LOG(f"[DIAG] ardb-save-trace-state '{label}': BEGIN")
+        _DIAG_LOG(f"[DIAG]   _CALLSITE_INSTALLED_FOR_FN = {sorted(_CALLSITE_INSTALLED_FOR_FN)}")
+        _DIAG_LOG(f"[DIAG]   _ACTIVE_ROOTS = {sorted(_ACTIVE_ROOTS)}")
+        _DIAG_LOG(f"[DIAG]   |_CREATED_BPS| = {len(_CREATED_BPS)}, PollEntryBP count = {sum(1 for bp in _CREATED_BPS if isinstance(bp, PollEntryBP))}, CallSiteBP count = {sum(1 for bp in _CREATED_BPS if isinstance(bp, CallSiteBP))}")
+
         # Snapshot PollEntryBP metadata before group switch deletes them.
         poll_entries: list[tuple[str, str, bool]] = []
         for bp in list(_CREATED_BPS):
@@ -1341,6 +1386,8 @@ class ARDSaveTraceStateCommand(gdb.Command):
                 poll_entries.append(
                     (str(bp.location), bp.poll_sym, bp.internal)
                 )
+
+        _DIAG_LOG(f"[DIAG]   saving {len(poll_entries)} PollEntryBP entries")
 
         # Serialize coroutine tracking state so poll sequences, shadow stack,
         # and coro IDs survive new_objfile → _cleanup_run_scoped() across
@@ -1385,6 +1432,8 @@ class ARDSaveTraceStateCommand(gdb.Command):
             "co_next_id": _CO_NEXT_ID,
         }
         _SAVED_STATES[label] = state
+        _DIAG_LOG(f"[DIAG] ardb-save-trace-state '{label}': DONE. "
+                  f"callsite_installed saved = {sorted(state['callsite_installed'])}")
         gdb.write(
             f"[ARD] saved trace state '{label}': "
             f"{len(poll_entries)} poll entries, "
@@ -1409,10 +1458,18 @@ class ARDRestoreTraceStateCommand(gdb.Command):
             gdb.write("[ARD] Usage: ardb-restore-trace-state <label>\n")
             return
 
+        _DIAG_LOG(f"[DIAG] ardb-restore-trace-state '{label}': BEGIN")
         state = _SAVED_STATES.pop(label, None)
         if state is None:
+            _DIAG_LOG(f"[DIAG] ardb-restore-trace-state '{label}': NO SAVED STATE (pop returned None)")
             gdb.write(f"[ARD] no saved trace state for '{label}'\n")
             return
+
+        saved_callsite = sorted(state.get("callsite_installed", set()))
+        _DIAG_LOG(f"[DIAG]   state['callsite_installed'] = {saved_callsite}")
+        _DIAG_LOG(f"[DIAG]   state['active_roots'] = {sorted(state.get('active_roots', set()))}")
+        _DIAG_LOG(f"[DIAG]   state['poll_entries'] count = {len(state.get('poll_entries', []))}")
+        _DIAG_LOG(f"[DIAG]   current _CALLSITE_INSTALLED_FOR_FN (before restore) = {sorted(_CALLSITE_INSTALLED_FOR_FN)}")
 
         # 1. Restore whitelist (address map must be rebuilt for new symbols).
         global _WHITELIST_EXACT, _WHITELIST_PREFIX, _WHITELIST_ADDR_MAP
@@ -1428,6 +1485,7 @@ class ARDRestoreTraceStateCommand(gdb.Command):
         _ACTIVE_ROOTS.update(state["active_roots"])
         _CALLSITE_INSTALLED_FOR_FN.clear()
         _CALLSITE_INSTALLED_FOR_FN.update(state["callsite_installed"])
+        _DIAG_LOG(f"[DIAG]   _CALLSITE_INSTALLED_FOR_FN (after restore) = {sorted(_CALLSITE_INSTALLED_FOR_FN)}")
 
         # 3. Restore coroutine tracking state (must happen before PollEntryBP
         #    re-install so that _push_coro / _CO_POLL_SEQ lookup sees the
@@ -1495,6 +1553,32 @@ class ARDResetTraceStateCommand(gdb.Command):
             gdb.write(f"[ARD] no saved trace state for '{label}'\n")
 
 
+class ARDDiagCommand(gdb.Command):
+    """Dump diagnostic state for debugging save/restore flow.
+    Usage: ardb-diag"""
+
+    def __init__(self):
+        super().__init__("ardb-diag", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        gdb.write("=== ARDB Diagnostic State ===\n")
+        gdb.write(f"_ACTIVE_ROOTS ({len(_ACTIVE_ROOTS)}): {sorted(_ACTIVE_ROOTS)}\n")
+        gdb.write(f"_CALLSITE_INSTALLED_FOR_FN ({len(_CALLSITE_INSTALLED_FOR_FN)}): {sorted(_CALLSITE_INSTALLED_FOR_FN)}\n")
+        gdb.write(f"_CREATED_BPS: {len(_CREATED_BPS)} total\n")
+        poll_count = sum(1 for bp in _CREATED_BPS if isinstance(bp, PollEntryBP))
+        call_count = sum(1 for bp in _CREATED_BPS if isinstance(bp, CallSiteBP))
+        gdb.write(f"  PollEntryBP: {poll_count}, CallSiteBP: {call_count}\n")
+        gdb.write(f"_RUN_SCOPED_BPS: {len(_RUN_SCOPED_BPS)}\n")
+        gdb.write(f"_SAVED_STATES labels: {list(_SAVED_STATES.keys())}\n")
+        for lbl, st in _SAVED_STATES.items():
+            gdb.write(f"  '{lbl}': active_roots={len(st.get('active_roots',set()))}, "
+                      f"callsite_installed={len(st.get('callsite_installed',set()))}, "
+                      f"poll_entries={len(st.get('poll_entries',[]))}\n")
+        gdb.write(f"_CO_BY_KEY: {len(_CO_BY_KEY)} entries, _CO_NEXT_ID={_CO_NEXT_ID}\n")
+        gdb.write(f"_TLS_STACK: {dict((k,len(v)) for k,v in _TLS_STACK.items())}\n")
+        gdb.write("=== End Diagnostic State ===\n")
+
+
 # -------------------------
 # Entry
 # -------------------------
@@ -1516,6 +1600,7 @@ def install():
     ARDSaveTraceStateCommand()
     ARDRestoreTraceStateCommand()
     ARDResetTraceStateCommand()
+    ARDDiagCommand()
 
     if not _EVENTS_INSTALLED:
         try:
