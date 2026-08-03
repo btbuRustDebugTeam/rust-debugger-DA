@@ -1113,6 +1113,37 @@ def _current_coro():
     st = _TLS_STACK.get(tid, [])
     return (st[-1], len(st) - 1) if st else (0, -1)
 
+def _remove_coro_from_tls(tid: int, cid: int | None):
+    """Remove one matching active CID from a thread's coroutine stack."""
+    st = _TLS_STACK.get(tid, [])
+    if not st:
+        return
+
+    if st[-1] == cid:
+        st.pop()
+        return
+
+    for i in range(len(st) - 1, -1, -1):
+        if st[i] == cid:
+            del st[i]
+            return
+
+def _finish_breakpoint_needs_c_language(frame) -> bool:
+    """Detect GDB's Rust high-half numeric breakpoint limitation."""
+    try:
+        caller = frame.older()
+        if caller is None:
+            return False
+        return_pc = int(caller.pc())
+        pointer_bits = _ptr_size() * 8
+        return_pc &= (1 << pointer_bits) - 1
+        return (
+            str(frame.language()).lower() == "rust"
+            and bool(return_pc & (1 << (pointer_bits - 1)))
+        )
+    except Exception:
+        return False
+
 class _PopOnReturnBP(gdb.FinishBreakpoint):
     """Close the graph frame, then pop the main coroutine TLS stack."""
     def __init__(
@@ -1123,7 +1154,17 @@ class _PopOnReturnBP(gdb.FinishBreakpoint):
         graph_entered: bool = False,
         cleanup_tls: bool = True,
     ):
-        super().__init__(gdb.selected_frame(), internal=True)
+        frame = gdb.selected_frame()
+        previous_language = None
+        use_c_language = _finish_breakpoint_needs_c_language(frame)
+        try:
+            if use_c_language:
+                previous_language = str(gdb.parameter("language"))
+                gdb.execute("set language c", to_string=True)
+            super().__init__(frame, internal=True)
+        finally:
+            if previous_language is not None:
+                gdb.execute(f"set language {previous_language}", to_string=True)
         self.silent = True
         self.tid = tid
         self.cid = cid
@@ -1141,19 +1182,7 @@ class _PopOnReturnBP(gdb.FinishBreakpoint):
         if not self.cleanup_tls:
             return False
 
-        st = _TLS_STACK.get(self.tid, [])
-        if not st:
-            return False
-
-        if st[-1] == self.cid:
-            st.pop()
-            return False
-
-        # fallback: remove from back if mismatch
-        for i in range(len(st) - 1, -1, -1):
-            if st[i] == self.cid:
-                del st[i]
-                break
+        _remove_coro_from_tls(self.tid, self.cid)
         return False
 
 
@@ -1971,6 +2000,8 @@ class PollEntryBP(gdb.Breakpoint):
                         thread_id=tid,
                         return_breakpoint_failed=True,
                     )
+                if cid:
+                    _remove_coro_from_tls(tid, cid)
                 raise
 
         # new coro line
