@@ -30,6 +30,7 @@ import {
 import {
     OSStateMachine,
     OSState,
+    OSStates,
     OSEvent,
     OSEvents,
     DebuggerActions,
@@ -1004,16 +1005,20 @@ export class GDBDebugSession extends DebugSession {
                         this.breakpointGroups.updateBorder(new Border(args.filepath, args.line, args.function, direction));
                         if (!this.functionBorderNames.includes(args.function)) {
                             this.functionBorderNames.push(args.function);
-                            // If GDB is already ready, insert the border BP immediately.
-                            if (this.miDebugger && this.osDebugReady) {
-                                this.miDebugger.addBreakPoint({ raw: args.function, condition: '' }).then(([ok, brk]) => {
-                                    if (ok && brk?.id) {
-                                        const group = this.breakpointGroups?.getCurrentBreakpointGroup();
-                                        const border = group?.borders?.find(b => b.function === args.function);
-                                        if (border) border.gdbNumber = brk.id;
-                                    }
-                                }).catch(() => {});
-                            }
+                        }
+                        // Insert into GDB immediately if connected.
+                        // Also track for debug-ready in case GDB hasn't connected yet.
+                        if (this.miDebugger && this.gdbReady) {
+                            this.miDebugger.addBreakPoint({ raw: args.function, condition: '' }).then(([ok, brk]) => {
+                                if (ok && brk?.id) {
+                                    const group = this.breakpointGroups?.getCurrentBreakpointGroup();
+                                    const border = group?.borders?.find(b => b.function === args.function);
+                                    if (border) border.gdbNumber = brk.id;
+                                    console.log(`[ardb] border BP inserted: "${args.function}" → GDB #${brk.id}`);
+                                }
+                            }).catch((e) => {
+                                console.error(`[ardb] failed to insert border BP "${args.function}":`, e);
+                            });
                         }
                     } else {
                         this.breakpointGroups.updateBorder(new Border(args.filepath, args.line, undefined, direction));
@@ -1031,20 +1036,42 @@ export class GDBDebugSession extends DebugSession {
 
             case 'setHookBreakpoint':
                 if (this.breakpointGroups && args) {
-                    const normalized: HookBreakpointJSONFriendly = {
-                        breakpoint: args.breakpoint,
-                        behavior: {
-                            body: args.behavior?.functionBody ?? args.behavior?.body ?? '',
-                            args: args.behavior?.functionArguments !== undefined
-                                ? [args.behavior.functionArguments]
-                                : (args.behavior?.args ?? []),
-                            isAsync: args.behavior?.isAsync ?? false,
-                        },
+                    const behavior = {
+                        body: args.behavior?.functionBody ?? args.behavior?.body ?? '',
+                        args: args.behavior?.functionArguments !== undefined
+                            ? [args.behavior.functionArguments]
+                            : (args.behavior?.args ?? []),
+                        isAsync: args.behavior?.isAsync ?? false,
                     };
-                    this.breakpointGroups.updateHookBreakpoint(normalized);
-                    const f = args.breakpoint?.file ? path.basename(args.breakpoint.file) : '?';
-                    const l = args.breakpoint?.line ?? '?';
-                    this.showInfo(`hook breakpoint set: ${f}:${l}`);
+                    if (args.breakpoint?.function) {
+                        // Function-based hook: insert into GDB immediately.
+                        const normalized: HookBreakpointJSONFriendly = {
+                            breakpoint: { function: args.breakpoint.function, condition: '' } as any,
+                            behavior,
+                        };
+                        this.breakpointGroups.updateHookBreakpoint(normalized);
+                        if (!this.functionHookNames.includes(args.breakpoint.function)) {
+                            this.functionHookNames.push(args.breakpoint.function);
+                        }
+                        if (this.miDebugger && this.gdbReady) {
+                            this.miDebugger.addBreakPoint({ raw: args.breakpoint.function, condition: '' }).then(([ok, brk]) => {
+                                console.log(`[ardb] hook BP inserted: "${args.breakpoint.function}" → GDB #${brk?.id ?? '?'}`);
+                            }).catch((e) => {
+                                console.error(`[ardb] failed to insert hook BP "${args.breakpoint.function}":`, e);
+                            });
+                        }
+                        this.showInfo(`hook breakpoint set: ${args.breakpoint.function}`);
+                    } else {
+                        // File-based hook: stored as metadata on an existing source breakpoint.
+                        const normalized: HookBreakpointJSONFriendly = {
+                            breakpoint: args.breakpoint,
+                            behavior,
+                        };
+                        this.breakpointGroups.updateHookBreakpoint(normalized);
+                        const f = args.breakpoint?.file ? path.basename(args.breakpoint.file) : '?';
+                        const l = args.breakpoint?.line ?? '?';
+                        this.showInfo(`hook breakpoint set: ${f}:${l}`);
+                    }
                 }
                 this.sendResponse(response);
                 break;
@@ -1285,6 +1312,8 @@ export class GDBDebugSession extends DebugSession {
             const threadId = this.getThreadId(node);
             this.recentStopThreadId = threadId;
             if (this.osDebugReady) {
+                const bkptno = node.record('bkptno') || '?';
+                console.log(`[ardb] breakpoint hit: bkptno=${bkptno}, state=${OSStates[this.osState.status]}`);
                 this.pendingBreakpointNode = node;
                 this.osStateTransition(new OSEvent(OSEvents.STOPPED));
             } else {
@@ -1444,12 +1473,13 @@ export class GDBDebugSession extends DebugSession {
     }
 
     // Returns true when a stack frame matches a border definition.
-    // Supports both function-name matching and file:line matching.
-    // For function-based borders, uses exact equality (not substring) to avoid false matches.
+    // Supports both function-name matching (substring) and file:line matching.
+    // For function-based borders, uses substring match so short names like
+    // "user_return" can match mangled symbols like "<TrapFrame>::user_return".
     private matchesBorder(frame: {file: string; line: number; function?: string}, border: import('./breakpointGroups').Border, expectedDirection?: 'kernel_to_user' | 'user_to_kernel'): boolean {
         // Direction filter: only match if the border is for the expected direction
         if (expectedDirection && border.direction !== expectedDirection) return false;
-        if (border.function && frame.function && frame.function === border.function) return true;
+        if (border.function && frame.function && frame.function.includes(border.function)) return true;
         if (border.filepath && border.line !== undefined &&
             frame.file === border.filepath && frame.line === border.line) return true;
         return false;
@@ -1476,18 +1506,23 @@ export class GDBDebugSession extends DebugSession {
         }
         else if (action.type === DebuggerActions.check_if_user_yet) {
             this.showInfo('doing action: check_if_user_yet');
-            this.miDebugger.getSomeRegisterValues([this.programCounterId]).then(regs => {
-                if (!regs || regs.length === 0 || !regs[0]) {
-                    console.warn('[ardb] check_if_user_yet: no register data');
-                    return;
-                }
-                const pc = parseAddr(regs[0].value ?? '');
-                if (pc !== undefined && isUserAddr(pc, this.userMemoryRanges)) {
-                    this.showInfo('arrived at user. current addr: ' + pc.toString(16));
+            // Read the sepc CSR instead of PC. On RISC-V GDB, stepi may not follow sret
+            // into user space (it steps to the next instruction in memory). By reading sepc
+            // we can determine the sret target address BEFORE sret actually executes.
+            this.miDebugger.sendCommand('data-evaluate-expression "$sepc"').then(res => {
+                const sepcStr = res.result('value') || '';
+                const sepc = parseAddr(sepcStr);
+                const isUser = sepc !== undefined && isUserAddr(sepc, this.userMemoryRanges);
+                console.log(`[ardb] check_if_user_yet: sepc=${sepcStr}, isUser=${isUser}`);
+                if (isUser) {
+                    this.showInfo('sepc points to user space, switching group');
                     this.osStateTransition(new OSEvent(OSEvents.AT_USER));
                 } else {
+                    // sepc not in user space yet — keep single-stepping
                     this.miDebugger!.stepInstruction();
                 }
+            }).catch(() => {
+                this.miDebugger!.stepInstruction();
             });
         }
         else if (action.type === DebuggerActions.check_if_kernel_to_user_border_yet) {
@@ -1627,7 +1662,7 @@ export class GDBDebugSession extends DebugSession {
                     const hookLine = hook.breakpoint.line;
                     const stackFunc = v[0].function;
                     const matchedByFile = hookFile && filepath === hookFile && lineNumber === hookLine;
-                    const matchedByFn = hookFn && stackFunc && stackFunc === hookFn;
+                    const matchedByFn = hookFn && stackFunc && stackFunc.includes(hookFn);
                     if (matchedByFile || matchedByFn) {
                         try {
                             const hookResult = await eval(hook.behavior)();

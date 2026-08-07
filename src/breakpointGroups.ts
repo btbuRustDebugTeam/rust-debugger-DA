@@ -16,6 +16,7 @@ export interface IDebuggerBackend {
 	removeSymbolFile(filepath: string): Promise<any>;
 	continue(reverse?: boolean): Promise<boolean>;
 	sendCliCommand(command: string): Promise<any>;
+	sendCommand(command: string): Promise<any>;
 }
 
 // Entry returned by breakpointGroupNameToDebugFilePaths.
@@ -224,14 +225,14 @@ export class BreakpointGroups {
 			const cmd = b.gdbNumber !== undefined
 				? `break-delete ${b.gdbNumber}`
 				: `break-delete ${b.function}`;
-			return this.session.miDebugger.sendCliCommand(cmd).catch(() => { });
+			return this.session.miDebugger.sendCommand(cmd).catch(() => { });
 		});
 		oldFuncBorders.forEach(b => { b.gdbNumber = undefined; });
 
 		// Also delete old group's function-name hook breakpoints from GDB.
 		const oldFuncHooks = [...this.groups[oldIndex].hooks].filter(h => h.breakpoint.function !== undefined);
 		const clearOldFuncHookPromises = oldFuncHooks.map(h => {
-			return this.session.miDebugger.sendCliCommand(`break-delete ${h.breakpoint.function}`).catch(() => { });
+			return this.session.miDebugger.sendCommand(`break-delete ${h.breakpoint.function}`).catch(() => { });
 		});
 
 		// 2. Unload old symbol files, load new symbol files — must complete before
