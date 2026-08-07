@@ -31,6 +31,10 @@ class MockBackend implements IDebuggerBackend {
         this.cliCalls.push(command);
         return Promise.resolve();
     }
+    sendCommand(command: string): Promise<any> {
+        this.cliCalls.push(command);
+        return Promise.resolve();
+    }
 }
 
 // ---------------------------------------------------------------------------
