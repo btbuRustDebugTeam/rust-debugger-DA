@@ -171,7 +171,7 @@ Rust 编译器会把每个 `async` 函数转换为实现 `Future` 的状态机�
 - trace root、await edge、call edge 与影子栈等追踪记录；
 - 白名单函数及其在当前符号表中的地址映射。
 
-切换符号文件后，调试器按“重载 Python 脚本 - 恢复白名单 - 恢复协程与追踪状态 - 重建动态跟踪断点 - 恢复用户断点”的顺序完成恢复，保证跨地址空间的异步追踪连续性。
+切换符号文件后，调试器依次恢复白名单、追踪记录和协程状态，清理残余旧断点，最后重建动态跟踪断点，保证跨地址空间的异步追踪连续性。
 
 #### 4.2.2 切换前保存的四类数据
 
@@ -183,7 +183,7 @@ Rust 编译器会把每个 `async` 函数转换为实现 `Future` 的状态机�
 
 恢复顺序不能任意调整：白名单地址依赖新的符号表，动态跟踪断点又依赖已恢复的协程实例与调用路径。如果先恢复断点、后恢复状态，就可能产生无归属断点或使用旧地址。
 
-因此调试器依次完成：重新加载异步跟踪脚本；根据新符号表解析白名单；恢复 CID、协程及调用图数据；根据活动追踪路径重建内部断点；最后恢复用户源码断点。该顺序保证界面中的逻辑调用树在一次特权级切换前后连续，而不是被重置成新的调试会话。
+因此调试器依次完成：根据新符号表恢复白名单；恢复追踪记录；恢复 CID 与协程状态；清理残余旧断点；根据活动追踪路径重建内部断点。普通源码断点和 OS 特殊断点由断点组切换流程另行恢复。该顺序保证界面中的逻辑调用树在一次特权级切换前后连续，而不是被重置成新的调试会话。
 
 ### 4.3 Async Inspector 图形化调试界面
 
@@ -267,7 +267,7 @@ JTAG 与串口承担不同职责：J-Link 连接 TMS、TRST、TCK、TDI、TDO、
 
 项目同时实现线上硬件交互实验平台：Moodle 提供教学入口，Flask 提供注册、预约与查询接口，MariaDB 保存用户、预约、设备和调度状态，Docker 提供隔离实验环境，SSH、TFTP 和 RISC-V 工具链承担设备访问、文件传输与编译任务。平台已完成真实 VisionFive 2 的预约、分配、释放、提前提醒、状态更新、终端日志和实验会话归档。
 
-用户注册 SSH 公钥后，可以预约具体实验时段并查询设备分配结果。预约开始时，调度器把真实 VisionFive 2 分配给当前用户并更新设备状态；预约结束时，平台停止当前会话、归档终端日志、释放设备并把状态恢复为 idle。真实设备连接信息包括 `user@192.168.137.2:22`、`riscv64` 架构和 Debian 系统信息。
+用户注册 SSH 公钥后，可以预约具体实验时段并查询设备分配结果。预约开始时，调度器把真实 VisionFive 2 分配给当前用户并更新设备状态；预约结束时，平台停止当前会话、归档终端日志、释放设备并把状态恢复为 idle。查询页面会显示当前会话的 SSH 连接信息、`riscv64` 架构和 Debian 系统信息。
 
 ![真实 VisionFive 2 预约与连接信息查询](docs/assets/线上平台真实设备查询.png)
 
@@ -364,7 +364,7 @@ embassy 使用自定义 executor，不依赖 Tokio 等外部异步运行时。�
       },
       "behavior": {
         "functionArguments": "",
-        "functionBody": "const p = await this.getStringVariable('path'); const name = p.replace('./','').split('/').pop(); return '/home/user_apps/' + name + '.c';",
+        "functionBody": "const p = await this.getStringVariable('path'); const name = p.replace('./','').split('/').pop(); return '${workspaceFolder}/user_apps/' + name + '.c';",
         "isAsync": true
       }
     }],
@@ -436,7 +436,8 @@ node out/test/testOSDebugFlow.js
 .
 ├── src/                    # VS Code Extension、Debug Adapter 与 MI2 协议层
 ├── async_rust_debugger/    # GDB Python 异步跟踪脚本
-├── testcases/              # 状态机与集成测试
+├── src/test/               # 状态机与 MockMI2 集成测试
+├── testcases/              # Rust 异步跟踪示例程序
 ├── docs/                   # 演示视频、进度文档与图片资源
 ├── .vscode/                # 扩展调试配置
 ├── package.json
