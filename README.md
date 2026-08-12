@@ -14,8 +14,8 @@
 | **学校**     | 北京工商大学                                                 |
 | **小组成员** | 曾小红、王浩铭、武雪妍                                       |
 | **指导老师** | 吴竞邦                                                       |
-| **决赛文档** | [源代码级异步操作系统调试方法决赛文档](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/%E5%86%B3%E8%B5%9B%E6%96%87%E6%A1%A3-%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E8%B7%A8%E7%89%B9%E6%9D%83%E7%BA%A7%E7%BB%9F%E4%B8%80%E8%B0%83%E8%AF%95%E5%B9%B3%E5%8F%B0.pdf?ref_type=heads)                                                      |
-| **决赛PPT** | [源代码级异步操作系统调试方法决赛PPT](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/%E5%86%B3%E8%B5%9BPPT-%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E8%B7%A8%E7%89%B9%E6%9D%83%E7%BA%A7%E7%BB%9F%E4%B8%80%E8%B0%83%E8%AF%95%E5%B9%B3%E5%8F%B0.pdf?ref_type=heads)                                                       |
+| **决赛文档** | [源代码级异步操作系统调试方法决赛文档](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/%E5%86%B3%E8%B5%9B%E6%96%87%E6%A1%A3-%E6%BA%90%E4%BB%A3%E7%A0%81%E7%BA%A7%E5%BC%82%E6%AD%A5%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E8%B0%83%E8%AF%95%E6%96%B9%E6%B3%95.pdf)                                                      |
+| **决赛PPT** | [源代码级异步操作系统调试方法决赛PPT](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/%E5%86%B3%E8%B5%9BPPT-%E6%BA%90%E4%BB%A3%E7%A0%81%E7%BA%A7%E5%BC%82%E6%AD%A5%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E8%B0%83%E8%AF%95%E6%96%B9%E6%B3%95.pdf)                                                       |
 | **演示视频** | [源代码级异步操作系统调试方法决赛演示视频](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/tree/main/docs?ref_type=heads)                                                      |
 
 ### 1.2 摘要
