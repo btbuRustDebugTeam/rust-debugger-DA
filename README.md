@@ -57,6 +57,8 @@ Rust 编译器会把每个 `async` 函数转换为实现 `Future` 的状态机�
 
 两种边合并后，才能把多个 poll 周期中的离散栈帧还原为完整的异步执行因果树。
 
+![GDB 物理调用栈与异步逻辑调用树对比](docs/assets/物理调用栈vs逻辑调用树.png)
+
 ### 2.3 决赛阶段的核心问题
 
 在前序方法基础上，决赛阶段需要解决以下四个相互关联的问题：
@@ -90,6 +92,8 @@ Rust 编译器会把每个 `async` 函数转换为实现 `Future` 的状态机�
 | VisionFive 2 真机调试 | 完成 | 建立 J-Link、OpenOCD、GDB 与串口链路，完成处理器状态读取、暂停、恢复及跨特权级调试适配 |
 | 线上硬件交互平台 | 完成 | 实现真实开发板预约、分配、释放、SSH 公钥注册、状态更新、日志和会话归档 |
 
+![项目总体方案](docs/assets/项目总览图.png)
+
 ### 3.1 文档索引
 
 - [一、项目基本信息](#一项目基本信息)
@@ -113,7 +117,7 @@ Rust 编译器会把每个 `async` 函数转换为实现 `Future` 的状态机�
 - [七、项目结构](#七项目结构)
 - [八、演示与文档](#八演示与文档)
 - [九、项目分工](#九项目分工)
-- [十、后续工作](#十后续工作)
+- [十、总结与展望](#十总结与展望)
 - [十一、参考项目与资料](#十一参考项目与资料)
 
 ## 四、核心工作
@@ -213,6 +217,8 @@ Async Inspector 不是对 Call Stack 的简单复制。Call Stack 展示“当�
 
 教学 OS 上的调试机制通常隐含三个前提：内核与用户源码处于同一工作区、所有系统调用具有统一的用户态入口、用户程序能够在调试开始前静态配置。组件化 OS StarryOS 不满足这些前提，因此项目完成了三组改进。
 
+![教学 OS 的三个隐含前提](docs/assets/三个隐含前提对比.png)
+
 #### 4.4.1 边界断点定位与方向识别
 
 - 使用函数名断点定位外部 crate 中的特权级切换函数，摆脱本地源码路径和行号依赖；
@@ -224,6 +230,8 @@ Async Inspector 不是对 Call Stack 的简单复制。Call Stack 展示“当�
 组件化 OS 的用户程序通过 libc 中大量独立封装函数执行 `ecall`，用户态不存在唯一入口。但所有系统调用陷入内核后都必须进入同一个分发函数，例如 StarryOS 的 `starry_kernel::syscall::handle_syscall`。将 user-to-kernel 边界移动到该通用收敛点，只需一个函数名断点即可覆盖所有系统调用。
 
 两个方向的边界由此都可能位于内核地址空间，单靠 PC 范围无法判断方向。`direction` 属性把断点位置与状态机允许的转换方向绑定：只有方向和当前状态同时匹配，断点才被视为有效边界。
+
+![rCore 与 StarryOS 的边界断点位置差异](docs/assets/边界断点位置差异.png)
 
 #### 4.4.2 跨 Rust 版本变量读取
 
@@ -249,6 +257,10 @@ Hook 断点命中 `execve` 后读取程序路径，生成断点组名称并加�
 
 JTAG 与串口承担不同职责：J-Link 连接 TMS、TRST、TCK、TDI、TDO、GND 和目标参考电压，用于控制处理器；USB-TTL 只连接 GND、RXD 和 TXD，采用 115200 bit/s、8 数据位、1 停止位、无流控，用于输出日志，不向开发板供电。处理器因调试请求暂停时，板载网络和 SSH 也会暂时停止；恢复处理器后服务继续运行，因此结束调试会话时必须显式执行恢复操作。
 
+| USB-TTL 串口连接 | VisionFive 2 完整调试连接 |
+| :---: | :---: |
+| ![USB-TTL 串口连接](docs/assets/VisionFive2串口连接.jpg) | ![VisionFive 2 完整调试连接](docs/assets/VisionFive2完整调试连接.jpg) |
+
 真实硬件的 `dcsr.stepie` 字段为 0，单步期间中断关闭，同时开发板调试模块不允许使用 OpenOCD `set_reg` 改写相关 CSR。项目利用跳板页在内核态和用户态地址一致的特点，将边界断点放在 `ecall` 之前，在页表变化前保存用户态断点组，进入内核后加载内核组；返回用户态时再执行反向恢复。
 
 #### 4.5.2 线上硬件交互平台
@@ -256,6 +268,8 @@ JTAG 与串口承担不同职责：J-Link 连接 TMS、TRST、TCK、TDI、TDO、
 项目同时实现线上硬件交互实验平台：Moodle 提供教学入口，Flask 提供注册、预约与查询接口，MariaDB 保存用户、预约、设备和调度状态，Docker 提供隔离实验环境，SSH、TFTP 和 RISC-V 工具链承担设备访问、文件传输与编译任务。平台已完成真实 VisionFive 2 的预约、分配、释放、提前提醒、状态更新、终端日志和实验会话归档。
 
 用户注册 SSH 公钥后，可以预约具体实验时段并查询设备分配结果。预约开始时，调度器把真实 VisionFive 2 分配给当前用户并更新设备状态；预约结束时，平台停止当前会话、归档终端日志、释放设备并把状态恢复为 idle。真实设备连接信息包括 `user@192.168.137.2:22`、`riscv64` 架构和 Debian 系统信息。
+
+![真实 VisionFive 2 预约与连接信息查询](docs/assets/线上平台真实设备查询.png)
 
 #### 4.5.3 调试链路与预约系统结合
 
@@ -306,29 +320,71 @@ embassy 使用自定义 executor，不依赖 Tokio 等外部异步运行时。�
 
 ```json
 {
-  "type": "osdb",
-  "request": "attach",
-  "target": ":1234",
-  "gdbpath": "riscv64-unknown-elf-gdb",
-  "first_breakpoint_group": "kernel",
-  "kernel_memory_ranges": [
-    ["0xffffffc000000000", "0xffffffffffffffff"]
-  ],
-  "user_memory_ranges": [
-    ["0x0000000000001000", "0x0000004000000000"]
-  ],
-  "border_breakpoints": [
-    {
-      "function": "enter_user",
-      "direction": "kernel_to_user"
+  "version": "0.2.0",
+  "configurations": [{
+    "type": "ardb",
+    "request": "attach",
+    "name": "StarryOS Debug (riscv64)",
+    "cwd": "${workspaceFolder}",
+    "target": ":1234",
+    "gdbpath": "/opt/riscv/bin/riscv64-unknown-elf-gdb",
+    "executable": "${workspaceFolder}/target/riscv64gc-unknown-none-elf/release/starryos",
+    "qemuPath": "qemu-system-riscv64",
+    "qemuArgs": [
+      "-L", "/usr/share/qemu", "-m", "1G", "-smp", "1",
+      "-machine", "virt", "-bios", "default",
+      "-kernel", "${workspaceFolder}/StarryOS_riscv64-qemu-virt.bin",
+      "-nographic", "-s", "-S"
+    ],
+    "first_breakpoint_group": "kernel",
+    "stopAtConnect": true,
+    "program_counter_id": 32,
+    "kernel_memory_ranges": [
+      ["0xffffffc000000000", "0xffffffffffffffff"]
+    ],
+    "user_memory_ranges": [
+      ["0x0000000000001000", "0x0000004000000000"]
+    ],
+    "border_breakpoints": [
+      {
+        "function": "enter_user",
+        "direction": "kernel_to_user"
+      },
+      {
+        "function": "starry_kernel::syscall::handle_syscall",
+        "direction": "user_to_kernel"
+      }
+    ],
+    "hook_breakpoints": [{
+      "breakpoint": {
+        "file": "${workspaceFolder}/kernel/src/syscall/task/execve.rs",
+        "line": 65
+      },
+      "behavior": {
+        "functionArguments": "",
+        "functionBody": "const p = await this.getStringVariable('path'); const name = p.replace('./','').split('/').pop(); return '/home/user_apps/' + name + '.c';",
+        "isAsync": true
+      }
+    }],
+    "filePathToBreakpointGroupNames": {
+      "isAsync": false,
+      "functionArguments": "filePathStr",
+      "functionBody": "if (filePathStr.includes('kernel/src')) { return ['kernel']; } else { return [filePathStr]; }"
     },
-    {
-      "function": "starry_kernel::syscall::handle_syscall",
-      "direction": "user_to_kernel"
+    "breakpointGroupNameToDebugFilePaths": {
+      "isAsync": false,
+      "functionArguments": "groupName",
+      "functionBody": "if (groupName === 'kernel') { return ['${workspaceFolder}/target/riscv64gc-unknown-none-elf/release/starryos']; } else { return [groupName.replace('.c', '')]; }"
     }
-  ]
+  }]
 }
 ```
+
+该配置同时给出了 QEMU/GDB 连接、内核与用户地址范围、双向边界断点、`execve` Hook，以及“源码路径 - 断点组 - 符号文件”两组可编程映射。实际部署时只需按本机工具链、镜像和用户程序目录调整路径，不应照搬示例中的环境路径。
+
+当前仓库在 `package.json` 中注册的调试类型为 `ardb`；旧版 osgdb 配置中曾使用 `osdb`，复制旧配置时需要同步改为当前类型。
+
+完整调试流程为：QEMU 以 `-s -S` 启动并等待 GDB；调试器加载内核符号并进入 kernel 断点组；命中 `enter_user` 后切换到用户态；StarryOS 进入 shell；用户命令触发 `execve` Hook，调试器读取路径、创建进程组并加载用户 ELF；用户程序执行 `ecall` 后在 syscall handler 收敛点切回 kernel 组；系统调用返回时再切回对应用户组。多轮往返过程中，源码断点、符号文件和异步跟踪状态均由状态机自动维护。
 
 ### 5.4 Async-os 统一调试验证
 
@@ -356,8 +412,12 @@ npm run compile
 ### 6.2 运行自动化测试
 
 ```bash
-npm test
+npm run compile
+node out/test/testOSStateMachine.js
+node out/test/testOSDebugFlow.js
 ```
+
+其中 `testOSStateMachine.js` 覆盖 37 个状态机单元测试，`testOSDebugFlow.js` 通过 MockMI2 执行 4 个完整调试流程场景。仓库当前未定义 `npm test` 脚本，因此应先编译 TypeScript，再直接运行生成的测试文件。
 
 ### 6.3 基本调试流程
 
@@ -400,14 +460,10 @@ npm test
 | 成员 | 主要分工 |
 | --- | --- |
 | 曾小红 | 异步跟踪方案改进；异步跟踪与 OS 调试融合；Async Inspector 设计与实现；StarryOS、embassy 与 Async-os 适配验证；参赛文档和 PPT 制作 |
-| 王浩铭 | OS 调试功能测试与验证；VisionFive 2 硬件调试环境搭建与适配；线上硬件交互实验平台设计与实现；真实开发板接入、预约调度与会话管理；硬件调试章节撰写 |
+| 王浩铭 | OS 调试功能测试与验证（状态机单元测试、集成测试）；VisionFive 2 硬件调试与线上实验平台扩展 |
 | 武雪妍 | 文档图片与示意图制作；参赛 PPT 制作 |
 
-## 十、后续工作
-
-1. 解析内核 ELF 与链接脚本，自动推导地址范围、syscall handler 和内核出口函数等调试配置；
-2. 使用 GDB `finish` 和切换冷却机制优化 kernel-to-user 方向逐指令单步的性能；
-3. 将 OpenOCD 进程启停、GDB 连接信息和串口日志纳入预约调度，形成完整的远程硬件调试会话。
+## 十、总结与展望
 
 ### 10.1 已完成工作总结
 
@@ -423,6 +479,10 @@ npm test
 ### 10.2 进一步改进方向
 
 统一调试平台的核心功能已经建立，但配置易用性、特权级切换性能和硬件调试服务编排仍有提升空间。配置自动推导将减少新操作系统适配时的人工工作；切换性能优化将改善交互式 shell 场景；线上平台与 OpenOCD、GDB、串口服务的进一步融合，则可以把已经验证的单机真机调试过程转换为面向多用户的预约式远程实验服务。
+
+1. 解析内核 ELF 与链接脚本，自动推导地址范围、syscall handler 和内核出口函数等调试配置；
+2. 使用 GDB `finish` 和切换冷却机制优化 kernel-to-user 方向逐指令单步的性能；
+3. 将 OpenOCD 进程启停、GDB 连接信息和串口日志纳入预约调度，形成完整的远程硬件调试会话。
 
 ## 十一、参考项目与资料
 
