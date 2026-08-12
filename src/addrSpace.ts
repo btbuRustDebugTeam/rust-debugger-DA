@@ -25,6 +25,7 @@ export function isUserAddr(addr: bigint, user_memory_ranges: string[][]): boolea
 // Parse a hex register value string (e.g. "0x80200000") to BigInt.
 // Returns undefined if the string is not a valid number.
 export function parseAddr(valueStr: string): bigint | undefined {
+	if (!valueStr || valueStr.trim() === '') return undefined;
 	try {
 		return BigInt(valueStr);
 	} catch {

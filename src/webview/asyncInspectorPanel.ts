@@ -311,6 +311,7 @@ export class AsyncInspectorPanel {
                 addr: rootNode.addr,
                 poll: rootNode.poll,
                 state: rootNode.state,
+                space: (rootNode as any).space,
                 children: []
             };
             this._treeRoots.set(rootNode.cid, root);
@@ -318,6 +319,7 @@ export class AsyncInspectorPanel {
             root.type = rootNode.type;
             root.poll = rootNode.poll;
             root.state = rootNode.state;
+            root.space = (rootNode as any).space;
         }
 
         this.mergePathIntoTree(root, snapshot.path, rootIndex + 1);
@@ -343,6 +345,7 @@ export class AsyncInspectorPanel {
                         addr: node.addr,
                         poll: node.poll,
                         state: node.state,
+                        space: (node as any).space,
                         children: [],
                     };
                     current.children.push(child);
@@ -350,6 +353,7 @@ export class AsyncInspectorPanel {
                     child.type = node.type;
                     child.poll = node.poll;
                     child.state = node.state;
+                    child.space = (node as any).space;
                 }
                 current = child;
             } else {
@@ -364,6 +368,7 @@ export class AsyncInspectorPanel {
                         addr: node.addr,
                         poll: node.poll,
                         state: node.state,
+                        space: (node as any).space,
                         children: [],
                     };
                     current.children.push(child);
@@ -444,5 +449,6 @@ interface TreeNode {
     addr: string;
     poll: number;
     state: number | string;
+    space?: 'kernel' | 'user' | 'unknown';
     children: TreeNode[];
 }

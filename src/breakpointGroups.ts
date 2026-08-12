@@ -237,15 +237,38 @@ export class BreakpointGroups {
 
 		// 2. Unload old symbol files, load new symbol files — must complete before
 		//    re-inserting breakpoints so GDB can resolve source locations correctly.
+		//
+		//    Only manage files that were loaded via addSymbolFile (tracked in
+		//    loadedSymbolFiles). The primary executable loaded by GDB's
+		//    file-exec-and-symbols is NOT tracked and should never be removed.
 		const oldSymbolFiles: SymbolFileEntry[] = eval(this.session.breakpointGroupNameToDebugFilePaths)(oldGroupName);
 		const newSymbolFiles: SymbolFileEntry[] = eval(this.session.breakpointGroupNameToDebugFilePaths)(newGroupName);
 
 		const toPath = (e: SymbolFileEntry) => typeof e === 'string' ? e : e.path;
 		const toTextAddr = (e: SymbolFileEntry) => typeof e === 'string' ? undefined : e.textAddr;
 
+		// Only remove files we previously loaded via addSymbolFile.
+		// The primary executable (kernel ELF, loaded via file-exec-and-symbols)
+		// is never in loadedSymbolFiles and thus never touched.
+		const filesToRemove = oldSymbolFiles.map(toPath).filter(p => this.loadedSymbolFiles.has(p));
+		const filesToAdd = newSymbolFiles.filter(e => !this.loadedSymbolFiles.has(toPath(e)));
+
 		return Promise.all([...clearOldPromises, ...clearOldFuncBorderPromises, ...clearOldFuncHookPromises])
-			.then(() => Promise.all(oldSymbolFiles.map(f => this.session.miDebugger.removeSymbolFile(toPath(f)).catch(err => { console.error('[ardb] removeSymbolFile failed:', err); }))))
-			.then(() => Promise.all(newSymbolFiles.map(f => this.session.miDebugger.addSymbolFile(toPath(f), toTextAddr(f)).catch(err => { console.error('[ardb] addSymbolFile failed:', err); }))))
+			.then(() => Promise.all(filesToRemove.map(p =>
+				this.session.miDebugger.removeSymbolFile(p).then(() => {
+					this.loadedSymbolFiles.delete(p);
+				}).catch(err => {
+					console.error('[ardb] removeSymbolFile failed:', err);
+					this.loadedSymbolFiles.delete(p);  // remove from tracking even on failure
+				})
+			)))
+			.then(() => Promise.all(filesToAdd.map(f =>
+				this.session.miDebugger.addSymbolFile(toPath(f), toTextAddr(f)).then((ok) => {
+					if (ok) this.loadedSymbolFiles.add(toPath(f));
+				}).catch(err => {
+					console.error('[ardb] addSymbolFile failed:', err);
+				})
+			)))
 			.then(() => {
 				// 3. Re-insert new group's breakpoints
 				const breakpointPromises = this.groups[newIndex].setBreakpointsArguments.map((args) => {
