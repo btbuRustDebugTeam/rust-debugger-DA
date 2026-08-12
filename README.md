@@ -2,7 +2,7 @@
   <img src="docs/assets/校徽.png" alt="学校logo">
 </p>
 
-# 操作系统跨特权级统一调试平台
+# 源代码级异步操作系统调试方法
 
 ## 一、基本信息
 
@@ -14,10 +14,9 @@
 | **学校**     | 北京工商大学                                                 |
 | **小组成员** | 曾小红、王浩铭、武雪妍                                       |
 | **指导老师** | 吴竞邦                                                       |
-| **决赛文档** | [操作系统跨特权级统一调试平台决赛文档](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/%E5%86%B3%E8%B5%9B%E6%96%87%E6%A1%A3-%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E8%B7%A8%E7%89%B9%E6%9D%83%E7%BA%A7%E7%BB%9F%E4%B8%80%E8%B0%83%E8%AF%95%E5%B9%B3%E5%8F%B0.pdf?ref_type=heads)                                                      |
-| **决赛PPT** | [操作系统跨特权级统一调试平台决赛PPT](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/%E5%86%B3%E8%B5%9BPPT-%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E8%B7%A8%E7%89%B9%E6%9D%83%E7%BA%A7%E7%BB%9F%E4%B8%80%E8%B0%83%E8%AF%95%E5%B9%B3%E5%8F%B0.pdf?ref_type=heads)                                                       |
-| **演示视频** | [操作系统跨特权级统一调试平台决赛演示视频](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/tree/main/docs?ref_type=heads)                                                      |
-| **开发进度记录** | [开发进度](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/docs/%E5%BC%80%E5%8F%91%E8%BF%9B%E5%BA%A6.md)                                                       |
+| **决赛文档** | [源代码级异步操作系统调试方法决赛文档](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/%E5%86%B3%E8%B5%9B%E6%96%87%E6%A1%A3-%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E8%B7%A8%E7%89%B9%E6%9D%83%E7%BA%A7%E7%BB%9F%E4%B8%80%E8%B0%83%E8%AF%95%E5%B9%B3%E5%8F%B0.pdf?ref_type=heads)                                                      |
+| **决赛PPT** | [源代码级异步操作系统调试方法决赛PPT](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/%E5%86%B3%E8%B5%9BPPT-%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E8%B7%A8%E7%89%B9%E6%9D%83%E7%BA%A7%E7%BB%9F%E4%B8%80%E8%B0%83%E8%AF%95%E5%B9%B3%E5%8F%B0.pdf?ref_type=heads)                                                       |
+| **演示视频** | [源代码级异步操作系统调试方法决赛演示视频](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/tree/main/docs?ref_type=heads)                                                      |
 
 ### 1.2 摘要
 
@@ -62,7 +61,7 @@
 
 ### 1.5 文档索引
 
-- [操作系统跨特权级统一调试平台](#操作系统跨特权级统一调试平台)
+- [源代码级异步操作系统调试方法](#源代码级异步操作系统调试方法)
   - [一、基本信息](#一基本信息)
     - [1.1 项目信息](#11-项目信息)
     - [1.2 摘要](#12-摘要)
@@ -187,6 +186,8 @@ Rust 的 async/await 机制中，编译器将 async 函数编译为一个状态�
 
 ### 4.4 面向不同操作系统的通用化改进
 
+![rCore 与 StarryOS 的架构差异](docs/assets/rCore与StarryOS架构差异.png)
+
 三项改进解决三个通用性缺陷：
 
 **函数名断点。** 边界断点和 Hook 断点增加函数名指定方式，由 GDB 通过符号表自动定位，不依赖本地文件路径。将 user→kernel 边界从分散的 C 库 ecall 入口收敛到内核态唯一 syscall 分发函数（如 `handle_syscall`），一个函数名断点覆盖全部返回路径。引入 direction 字段消除两边界同处内核地址空间时的方向歧义。
@@ -206,7 +207,6 @@ Rust 的 async/await 机制中，编译器将 async 函数编译为一个状态�
 ### 5.2 embassy 异步跟踪运行时无关性验证
 
 embassy 是一个用 Rust 编写的嵌入式异步框架，不依赖 Tokio 等外部运行时，使用自定义 executor。在 embassy 的 `tick` 示例程序上启用异步追踪后，工具成功恢复出三层嵌套等待链：
-![embassy异步函数执行图](docs/assets/embassy异步函数执行图.png)
 
 ```
 ASYNC USER  tick::_embassy_main_task::...::{async_fn#0}
@@ -250,11 +250,11 @@ embassy 的自定义 executor 与 Tokio 内部结构截然不同，工具仍能�
 
 ### 1. 文档 PDF
 
-[操作系统跨特权级统一调试平台决赛文档](决赛文档-操作系统跨特权级统一调试平台.pdf)
+[源代码级异步操作系统调试方法决赛文档]()
 
 ### 2. 决赛 PPT
 
-[操作系统跨特权级统一调试平台决赛PPT](决赛PPT-操作系统跨特权级统一调试平台.pdf)
+[源代码级异步操作系统调试方法决赛PPT]()
 
 ## 九、参考说明
 
@@ -265,7 +265,7 @@ embassy 的自定义 executor 与 Tokio 内部结构截然不同，工具仍能�
 | 2023–2024 | code-debug | 实现 VS Code 调试器扩展，四状态机驱动的断点组管理机制。 [https://github.com/chenzhiy2001/code-debug](https://github.com/chenzhiy2001/code-debug) |
 | 2025 | ARDB | 提出 await edge 与 call edge 双关系恢复方法。 [https://github.com/OSDebugger/code-debug_Asynchronous-trace](https://github.com/OSDebugger/code-debug_Asynchronous-trace) |
 
-### 9.2 验证目标
+### 9.2 被调试目标
 
 - [StarryOS](https://github.com/Starry-OS/StarryOS) — 基于 ArceOS 框架的组件化 Rust 操作系统，本项目 OS 调试通用性改进的验证目标
 - [rCore-Tutorial-v3](https://github.com/rcore-os/rCore-Tutorial-v3) — 教学操作系统，前序工作的主要验证平台
