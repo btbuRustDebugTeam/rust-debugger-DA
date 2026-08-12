@@ -215,7 +215,7 @@ Async Inspector 不是对 Call Stack 的简单复制。Call Stack 展示“当�
 
 ### 4.4 面向不同操作系统的通用化改进
 
-教学 OS 上的调试机制通常隐含三个前提：内核与用户源码处于同一工作区、所有系统调用具有统一的用户态入口、用户程序能够在调试开始前静态配置。组件化 OS StarryOS 不满足这些前提，因此项目完成了三组改进。
+教学 OS 上的调试机制通常隐含三个前提：内核与用户源码处于同一工作区、所有系统调用具有统一的用户态入口、用户程序能够在调试开始前静态配置。基于 ArceOS 框架的组件化 OS StarryOS 不满足这些前提，因此项目完成了三组改进。
 
 ![教学 OS 的三个隐含前提](docs/assets/三个隐含前提对比.png)
 
@@ -251,7 +251,7 @@ Hook 断点命中 `execve` 后读取程序路径，生成断点组名称并加�
 
 项目在已有工作的基础上完成 VisionFive 2 硬件调试适配。GDB 负责加载符号和发送调试命令，OpenOCD 在 3333 端口提供 GDB Server，J-Link 通过 JTAG 控制处理器，USB-TTL 串口用于观察 U-Boot 和目标系统输出。
 
-调试环境采用 J-Link V12 与 OpenOCD 0.12.0，可识别 E24、U74 调试模块以及 5 个 XLEN=64 的 hart，并支持查看线程状态、读取 PC/SP/RA、暂停和恢复处理器。针对真实硬件单步期间 `dcsr.stepie=0` 且无法通过 OpenOCD 改写相关 CSR 的限制，采用边界断点和断点组切换完成内核态、用户态单步及跨特权级双向切换。
+调试环境采用 J-Link V12 与 OpenOCD 0.12.0，JTAG 扫描得到 TAP ID `0x07110cfd`，可识别 E24、U74 调试模块以及 5 个 XLEN=64 的 hart，并支持查看线程状态、读取 PC/SP/RA、暂停和恢复处理器。针对真实硬件单步期间 `dcsr.stepie=0` 且无法通过 OpenOCD 改写相关 CSR 的限制，采用边界断点和断点组切换完成内核态、用户态单步及跨特权级双向切换。
 
 ![VisionFive 2 真机硬件调试通信链路](docs/assets/VisionFive2硬件调试通信示意图.png)
 
@@ -305,6 +305,8 @@ embassy 使用自定义 executor，不依赖 Tokio 等外部异步运行时。�
 验证流程包括：以调试模式编译示例并保留完整 DWARF；在 `launch.json` 中启用异步调试；生成按 crate 分组的白名单；选中用户 crate 后设置 trace root；继续运行直至下一个停止事件，由 Async Inspector 自动刷新逻辑调用树。
 
 结果显示最外层 `main_task`、中间的 `run_task` 和最内层 `timer::poll` 形成三层嵌套等待链。最外层任务完成后标记为 inactive，计时器未到期时内层 Future 多次返回 Pending，poll 次数持续累计，与计时器驱动的真实执行特征一致。
+
+本次输出中，`main_task` 的 `calls=1、exit=1、active=no`，`run_task` 的 `calls=3、exit=1、active=yes`，`timer::poll` 的 `calls=3、exit=2、active=yes`。这些实例级统计与计时器尚未到期、内层 Future 多次返回 Pending 的行为一致。
 
 ![embassy 异步函数执行图](docs/assets/embassy异步函数执行图.png)
 
