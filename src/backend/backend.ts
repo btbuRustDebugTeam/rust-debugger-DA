@@ -10,6 +10,7 @@ export interface Breakpoint {
 	id?: number;
 	file?: string;
 	line?: number;
+	function?: string;
 	raw?: string;
 	condition: string;
 	countCondition?: string;

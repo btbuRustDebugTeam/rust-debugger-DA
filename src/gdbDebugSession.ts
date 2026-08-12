@@ -30,6 +30,7 @@ import {
 import {
     OSStateMachine,
     OSState,
+    OSStates,
     OSEvent,
     OSEvents,
     DebuggerActions,
@@ -54,6 +55,7 @@ export interface SnapshotData {
         file?: string;
         fullname?: string;
         line?: number;
+        space?: 'kernel' | 'user' | 'unknown';
     }>;
 }
 
@@ -97,8 +99,11 @@ export interface AttachRequestArguments extends DebugProtocol.AttachRequestArgum
     second_breakpoint_group?: string;
     kernel_memory_ranges?: string[][];
     user_memory_ranges?: string[][];
-    border_breakpoints?: Array<{ filepath: string; line: number }>;
-    hook_breakpoints?: any[];
+    border_breakpoints?: Array<{ filepath?: string; line?: number; function?: string; direction?: 'kernel_to_user' | 'user_to_kernel' }>;
+    hook_breakpoints?: Array<{
+        breakpoint: { file?: string; line?: number; function?: string };
+        behavior: { functionArguments?: string; functionBody?: string; body?: string; args?: string[]; isAsync?: boolean };
+    }>;
     filePathToBreakpointGroupNames?: { functionArguments: string; functionBody: string; isAsync: boolean };
     breakpointGroupNameToDebugFilePaths?: { functionArguments: string; functionBody: string; isAsync: boolean };
 }
@@ -170,6 +175,8 @@ export class GDBDebugSession extends DebugSession {
     private programCounterId = 32; // RISC-V PC register id
     private currentHook: HookBreakpoint | undefined;
     private pendingBreakpointNode: MINode | undefined;
+    private functionBorderNames: string[] = [];  // function-name border BPs to auto-insert on debug-ready
+    private functionHookNames: string[] = [];    // function-name hook BPs to auto-insert on debug-ready
 
     constructor(opts: GDBDebugSessionOptions) {
         super();
@@ -317,7 +324,13 @@ export class GDBDebugSession extends DebugSession {
         // Register initial borders from launch.json
         if (config.border_breakpoints) {
             for (const b of config.border_breakpoints) {
-                this.breakpointGroups.updateBorder(new Border(b.filepath, b.line));
+                const direction = b.direction ?? 'kernel_to_user';
+                if (b.function) {
+                    this.breakpointGroups.updateBorder(new Border(b.filepath, b.line, b.function, direction));
+                    this.functionBorderNames.push(b.function);
+                } else {
+                    this.breakpointGroups.updateBorder(new Border(b.filepath, b.line, undefined, direction));
+                }
             }
         }
 
@@ -326,17 +339,30 @@ export class GDBDebugSession extends DebugSession {
         // uses ObjectAsFunction { body, args[] } — convert here.
         if (config.hook_breakpoints) {
             for (const h of config.hook_breakpoints) {
-                const normalized: HookBreakpointJSONFriendly = {
-                    breakpoint: h.breakpoint,
-                    behavior: {
-                        body: h.behavior?.functionBody ?? h.behavior?.body ?? '',
-                        args: h.behavior?.functionArguments !== undefined
-                            ? [h.behavior.functionArguments]
-                            : (h.behavior?.args ?? []),
-                        isAsync: h.behavior?.isAsync ?? false,
-                    },
+                const behavior = {
+                    body: h.behavior?.functionBody ?? h.behavior?.body ?? '',
+                    args: h.behavior?.functionArguments !== undefined
+                        ? [h.behavior.functionArguments]
+                        : (h.behavior?.args ?? []),
+                    isAsync: h.behavior?.isAsync ?? false,
                 };
-                this.breakpointGroups.updateHookBreakpoint(normalized);
+
+                // Function-based hooks (e.g. { function: "syscall_exec" }) need to be
+                // auto-inserted into GDB as raw function-name breakpoints, just like borders.
+                if (h.breakpoint.function) {
+                    this.functionHookNames.push(h.breakpoint.function);
+                    const normalized: HookBreakpointJSONFriendly = {
+                        breakpoint: { function: h.breakpoint.function, condition: '' } as any,
+                        behavior,
+                    };
+                    this.breakpointGroups.updateHookBreakpoint(normalized);
+                } else if (h.breakpoint.file) {
+                    const normalized: HookBreakpointJSONFriendly = {
+                        breakpoint: { file: h.breakpoint.file, line: h.breakpoint.line ?? 0, condition: '' } as any,
+                        behavior,
+                    };
+                    this.breakpointGroups.updateHookBreakpoint(normalized);
+                }
             }
         }
 
@@ -975,7 +1001,29 @@ export class GDBDebugSession extends DebugSession {
             // OS debug commands
             case 'setBorder':
                 if (this.breakpointGroups && args) {
-                    this.breakpointGroups.updateBorder(new Border(args.filepath, args.line));
+                    const direction = args.direction ?? 'kernel_to_user';
+                    if (args.function) {
+                        this.breakpointGroups.updateBorder(new Border(args.filepath, args.line, args.function, direction));
+                        if (!this.functionBorderNames.includes(args.function)) {
+                            this.functionBorderNames.push(args.function);
+                        }
+                        // Insert into GDB immediately if connected.
+                        // Also track for debug-ready in case GDB hasn't connected yet.
+                        if (this.miDebugger && this.gdbReady) {
+                            this.miDebugger.addBreakPoint({ raw: args.function, condition: '' }).then(([ok, brk]) => {
+                                if (ok && brk?.id) {
+                                    const group = this.breakpointGroups?.getCurrentBreakpointGroup();
+                                    const border = group?.borders?.find(b => b.function === args.function);
+                                    if (border) border.gdbNumber = brk.id;
+                                    console.log(`[ardb] border BP inserted: "${args.function}" → GDB #${brk.id}`);
+                                }
+                            }).catch((e) => {
+                                console.error(`[ardb] failed to insert border BP "${args.function}":`, e);
+                            });
+                        }
+                    } else {
+                        this.breakpointGroups.updateBorder(new Border(args.filepath, args.line, undefined, direction));
+                    }
                 }
                 this.sendResponse(response);
                 break;
@@ -989,20 +1037,42 @@ export class GDBDebugSession extends DebugSession {
 
             case 'setHookBreakpoint':
                 if (this.breakpointGroups && args) {
-                    const normalized: HookBreakpointJSONFriendly = {
-                        breakpoint: args.breakpoint,
-                        behavior: {
-                            body: args.behavior?.functionBody ?? args.behavior?.body ?? '',
-                            args: args.behavior?.functionArguments !== undefined
-                                ? [args.behavior.functionArguments]
-                                : (args.behavior?.args ?? []),
-                            isAsync: args.behavior?.isAsync ?? false,
-                        },
+                    const behavior = {
+                        body: args.behavior?.functionBody ?? args.behavior?.body ?? '',
+                        args: args.behavior?.functionArguments !== undefined
+                            ? [args.behavior.functionArguments]
+                            : (args.behavior?.args ?? []),
+                        isAsync: args.behavior?.isAsync ?? false,
                     };
-                    this.breakpointGroups.updateHookBreakpoint(normalized);
-                    const f = args.breakpoint?.file ? path.basename(args.breakpoint.file) : '?';
-                    const l = args.breakpoint?.line ?? '?';
-                    this.showInfo(`hook breakpoint set: ${f}:${l}`);
+                    if (args.breakpoint?.function) {
+                        // Function-based hook: insert into GDB immediately.
+                        const normalized: HookBreakpointJSONFriendly = {
+                            breakpoint: { function: args.breakpoint.function, condition: '' } as any,
+                            behavior,
+                        };
+                        this.breakpointGroups.updateHookBreakpoint(normalized);
+                        if (!this.functionHookNames.includes(args.breakpoint.function)) {
+                            this.functionHookNames.push(args.breakpoint.function);
+                        }
+                        if (this.miDebugger && this.gdbReady) {
+                            this.miDebugger.addBreakPoint({ raw: args.breakpoint.function, condition: '' }).then(([ok, brk]) => {
+                                console.log(`[ardb] hook BP inserted: "${args.breakpoint.function}" → GDB #${brk?.id ?? '?'}`);
+                            }).catch((e) => {
+                                console.error(`[ardb] failed to insert hook BP "${args.breakpoint.function}":`, e);
+                            });
+                        }
+                        this.showInfo(`hook breakpoint set: ${args.breakpoint.function}`);
+                    } else {
+                        // File-based hook: stored as metadata on an existing source breakpoint.
+                        const normalized: HookBreakpointJSONFriendly = {
+                            breakpoint: args.breakpoint,
+                            behavior,
+                        };
+                        this.breakpointGroups.updateHookBreakpoint(normalized);
+                        const f = args.breakpoint?.file ? path.basename(args.breakpoint.file) : '?';
+                        const l = args.breakpoint?.line ?? '?';
+                        this.showInfo(`hook breakpoint set: ${f}:${l}`);
+                    }
                 }
                 this.sendResponse(response);
                 break;
@@ -1198,11 +1268,43 @@ export class GDBDebugSession extends DebugSession {
             this.sendEvent(new TerminatedEvent());
         });
 
-        this.miDebugger!.on('debug-ready', () => {
+        this.miDebugger!.on('debug-ready', async () => {
             this.gdbReady = true;
             if (attachConfig) {
                 this.osDebugReady = true;
                 this.inferiorStarted = true;
+
+                // Auto-insert function-name border breakpoints into GDB.
+                // These are the borders that drive the OS state machine (e.g. into_user, handle_syscall).
+                // They are inserted as raw function-name breakpoints and are transparent to the user.
+                for (const funcName of this.functionBorderNames) {
+                    try {
+                        const [ok, brk] = await this.miDebugger!.addBreakPoint({ raw: funcName, condition: '' });
+                        if (ok && brk?.id) {
+                            // Store the GDB breakpoint number back on the Border object
+                            // so updateCurrentBreakpointGroup can delete by number on group switch.
+                            const group = this.breakpointGroups?.getCurrentBreakpointGroup();
+                            const border = group?.borders?.find(b => b.function === funcName);
+                            if (border) border.gdbNumber = brk.id;
+                            console.log(`[ardb] auto-inserted border BP: "${funcName}" → GDB #${brk.id}`);
+                        }
+                    } catch (e) {
+                        console.error(`[ardb] failed to auto-insert border BP "${funcName}":`, e);
+                    }
+                }
+
+                // Auto-insert function-name hook breakpoints into GDB.
+                // These drive dynamic breakpoint group selection (e.g. syscall_exec
+                // determines which user process to switch to). Like borders, they are
+                // transparent to the user — the behavior runs and execution continues.
+                for (const funcName of this.functionHookNames) {
+                    try {
+                        await this.miDebugger!.addBreakPoint({ raw: funcName, condition: '' });
+                        console.log(`[ardb] auto-inserted hook BP: "${funcName}"`);
+                    } catch (e) {
+                        console.error(`[ardb] failed to auto-insert hook BP "${funcName}":`, e);
+                    }
+                }
             }
             this.sendEvent(new InitializedEvent());
         });
@@ -1211,6 +1313,8 @@ export class GDBDebugSession extends DebugSession {
             const threadId = this.getThreadId(node);
             this.recentStopThreadId = threadId;
             if (this.osDebugReady) {
+                const bkptno = node.record('bkptno') || '?';
+                console.log(`[ardb] breakpoint hit: bkptno=${bkptno}, state=${OSStates[this.osState.status]}`);
                 this.pendingBreakpointNode = node;
                 this.osStateTransition(new OSEvent(OSEvents.STOPPED));
             } else {
@@ -1326,29 +1430,27 @@ export class GDBDebugSession extends DebugSession {
      * Read a C-string variable from GDB. Used by hook breakpoint behaviors
      * (which capture `this` via arrow functions) to fetch e.g. the `path`
      * argument of `sys_exec` and decide which user breakpoint group to switch to.
+     *
+     * Uses GDB's "p" (print) command and parses the console output with regex,
+     * which works across Rust versions without depending on Vec<String> internals.
      */
     public async getStringVariable(name: string): Promise<string> {
         if (!this.miDebugger) return '';
         try {
-            const lenRes = await this.miDebugger.sendCommand(
-                `data-evaluate-expression ${name}.vec.len`
-            );
-            const len = parseInt((lenRes.result('value') || '').trim(), 10);
-            if (!Number.isFinite(len) || len <= 0 || len > 4096) {
-                this.showInfo(`getStringVariable('${name}'): bad len`);
-                return '';
-            }
+            const printed = await this.miDebugger.captureConsoleOutput(`p ${name}`);
 
-            const ptrRes = await this.miDebugger.sendCommand(
-                `data-evaluate-expression ${name}.vec.buf.ptr.pointer.pointer`
-            );
-            const ptrStr = ptrRes.result('value') || '';
-            const m = /0x[0-9a-fA-F]+/.exec(ptrStr);
-            if (!m) {
-                this.showInfo(`getStringVariable('${name}'): no addr`);
+            const ptrMatch = /pointer:\s*(0x[0-9a-fA-F]+)/.exec(printed);
+            const lenMatch = /len:\s*(\d+)/.exec(printed);
+            if (!ptrMatch || !lenMatch) {
+                this.showInfo(`getStringVariable('${name}'): could not parse pointer/len from: ${printed.slice(0, 200)}`);
                 return '';
             }
-            const addr = m[0];
+            const addr = ptrMatch[1];
+            const len = parseInt(lenMatch[1], 10);
+            if (!Number.isFinite(len) || len <= 0 || len > 4096) {
+                this.showInfo(`getStringVariable('${name}'): bad len ${len}`);
+                return '';
+            }
 
             const memRes = await this.miDebugger.sendCommand(
                 `data-read-memory-bytes ${addr} ${len}`
@@ -1371,6 +1473,19 @@ export class GDBDebugSession extends DebugSession {
         }
     }
 
+    // Returns true when a stack frame matches a border definition.
+    // Supports both function-name matching (substring) and file:line matching.
+    // For function-based borders, uses substring match so short names like
+    // "user_return" can match mangled symbols like "<TrapFrame>::user_return".
+    private matchesBorder(frame: {file: string; line: number; function?: string}, border: import('./breakpointGroups').Border, expectedDirection?: 'kernel_to_user' | 'user_to_kernel'): boolean {
+        // Direction filter: only match if the border is for the expected direction
+        if (expectedDirection && border.direction !== expectedDirection) return false;
+        if (border.function && frame.function && frame.function.includes(border.function)) return true;
+        if (border.filepath && border.line !== undefined &&
+            frame.file === border.filepath && frame.line === border.line) return true;
+        return false;
+    }
+
     private doAction(action: Action): void {
         if (!this.miDebugger) return;
 
@@ -1378,7 +1493,8 @@ export class GDBDebugSession extends DebugSession {
             this.showInfo('doing action: check_if_kernel_yet');
             this.miDebugger.getSomeRegisterValues([this.programCounterId]).then(regs => {
                 if (!regs || regs.length === 0 || !regs[0]) {
-                    console.warn('[ardb] check_if_kernel_yet: no register data');
+                    console.warn('[ardb] check_if_kernel_yet: no register data, retrying step');
+                    this.miDebugger!.stepInstruction();
                     return;
                 }
                 const pc = parseAddr(regs[0].value ?? '');
@@ -1392,18 +1508,23 @@ export class GDBDebugSession extends DebugSession {
         }
         else if (action.type === DebuggerActions.check_if_user_yet) {
             this.showInfo('doing action: check_if_user_yet');
-            this.miDebugger.getSomeRegisterValues([this.programCounterId]).then(regs => {
-                if (!regs || regs.length === 0 || !regs[0]) {
-                    console.warn('[ardb] check_if_user_yet: no register data');
-                    return;
-                }
-                const pc = parseAddr(regs[0].value ?? '');
-                if (pc !== undefined && isUserAddr(pc, this.userMemoryRanges)) {
-                    this.showInfo('arrived at user. current addr: ' + pc.toString(16));
+            // Read the sepc CSR instead of PC. On RISC-V GDB, stepi may not follow sret
+            // into user space (it steps to the next instruction in memory). By reading sepc
+            // we can determine the sret target address BEFORE sret actually executes.
+            this.miDebugger.sendCommand('data-evaluate-expression "$sepc"').then(res => {
+                const sepcStr = res.result('value') || '';
+                const sepc = parseAddr(sepcStr);
+                const isUser = sepc !== undefined && isUserAddr(sepc, this.userMemoryRanges);
+                console.log(`[ardb] check_if_user_yet: sepc=${sepcStr}, isUser=${isUser}`);
+                if (isUser) {
+                    this.showInfo('sepc points to user space, switching group');
                     this.osStateTransition(new OSEvent(OSEvents.AT_USER));
                 } else {
+                    // sepc not in user space yet — keep single-stepping
                     this.miDebugger!.stepInstruction();
                 }
+            }).catch(() => {
+                this.miDebugger!.stepInstruction();
             });
         }
         else if (action.type === DebuggerActions.check_if_kernel_to_user_border_yet) {
@@ -1412,40 +1533,77 @@ export class GDBDebugSession extends DebugSession {
             this.miDebugger.getStack(0, 1, this.recentStopThreadId).then(v => {
                 if (!v || v.length === 0 || !v[0]) {
                     console.warn('[ardb] check_if_kernel_to_user_border_yet: empty stack');
+                    this.showInfo('[DIAG] check_if_kernel_to_user_border_yet: empty stack - NO FALLBACK');
                     return;
                 }
                 const filepath = v[0].file;
                 const lineNumber = v[0].line;
+                let matched = false;
                 if (borders) {
                     for (const border of borders) {
-                        if (filepath === border.filepath && lineNumber === border.line) {
+                        if (this.matchesBorder({file: filepath, line: lineNumber, function: v[0].function}, border, 'kernel_to_user')) {
+                            matched = true;
                             this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL_TO_USER_BORDER));
                             break;
                         }
                     }
                 }
+                if (!matched) {
+                    this.showInfo(`[DIAG] check_if_kernel_to_user_border_yet: NO MATCH at ${filepath}:${lineNumber} (${v[0].function}) - HANGING!`);
+                    console.warn(`[ardb] check_if_kernel_to_user_border_yet: no border matched at ${filepath}:${lineNumber}`);
+                }
             });
         }
         else if (action.type === DebuggerActions.check_if_user_to_kernel_border_yet) {
             this.showInfo('doing action: check_if_user_to_kernel_border_yet');
-            const borders = this.breakpointGroups?.getCurrentBreakpointGroup()?.borders;
-            this.miDebugger.getStack(0, 1, this.recentStopThreadId).then(v => {
-                if (!v || v.length === 0 || !v[0]) {
-                    this.sendUserStoppedEvent();
-                    return;
-                }
-                const filepath = v[0].file;
-                const lineNumber = v[0].line;
-                if (borders) {
-                    for (const border of borders) {
-                        if (filepath === border.filepath && lineNumber === border.line) {
-                            this.pendingBreakpointNode = undefined;
-                            this.osStateTransition(new OSEvent(OSEvents.AT_USER_TO_KERNEL_BORDER));
+            // Check if PC is already in kernel space (common in StarryOS where the border
+            // is placed at a kernel function like handle_syscall). If so, check border
+            // and emit AT_KERNEL directly instead of going through single-step.
+            this.miDebugger.getSomeRegisterValues([this.programCounterId]).then(regs => {
+                const pc = parseAddr(regs?.[0]?.value ?? '');
+                if (pc !== undefined && isKernelAddr(pc, this.kernelMemoryRanges)) {
+                    // PC is already in kernel: check for user_to_kernel border in stack frame
+                    this.miDebugger!.getStack(0, 1, this.recentStopThreadId).then(v => {
+                        if (!v || v.length === 0 || !v[0]) {
+                            this.sendUserStoppedEvent();
                             return;
                         }
-                    }
+                        const filepath = v[0].file;
+                        const lineNumber = v[0].line;
+                        const borders = this.breakpointGroups?.getCurrentBreakpointGroup()?.borders;
+                        if (borders) {
+                            for (const border of borders) {
+                                if (this.matchesBorder({file: filepath, line: lineNumber, function: v[0].function}, border, 'user_to_kernel')) {
+                                    this.pendingBreakpointNode = undefined;
+                                    this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL));
+                                    return;
+                                }
+                            }
+                        }
+                        this.sendUserStoppedEvent();
+                    });
+                    return;
                 }
-                this.sendUserStoppedEvent();
+                // PC is still in user space: check border and go through single-step
+                const borders = this.breakpointGroups?.getCurrentBreakpointGroup()?.borders;
+                this.miDebugger!.getStack(0, 1, this.recentStopThreadId).then(v => {
+                    if (!v || v.length === 0 || !v[0]) {
+                        this.sendUserStoppedEvent();
+                        return;
+                    }
+                    const filepath = v[0].file;
+                    const lineNumber = v[0].line;
+                    if (borders) {
+                        for (const border of borders) {
+                            if (this.matchesBorder({file: filepath, line: lineNumber, function: v[0].function}, border, 'user_to_kernel')) {
+                                this.pendingBreakpointNode = undefined;
+                                this.osStateTransition(new OSEvent(OSEvents.AT_USER_TO_KERNEL_BORDER));
+                                return;
+                            }
+                        }
+                    }
+                    this.sendUserStoppedEvent();
+                });
             });
         }
         else if (action.type === DebuggerActions.start_consecutive_single_steps) {
@@ -1465,7 +1623,10 @@ export class GDBDebugSession extends DebugSession {
                 if (!currentGroup) return;
                 for (const hook of currentGroup.hooks) {
                     this.currentHook = hook;
-                    if (filepath === hook.breakpoint.file && lineNumber === hook.breakpoint.line) {
+                    const hookFn = hook.breakpoint.function;
+                    const matchedByFile = hook.breakpoint.file && filepath === hook.breakpoint.file && lineNumber === hook.breakpoint.line;
+                    const matchedByFn = hookFn && v[0].function && v[0].function.includes(hookFn);
+                    if (matchedByFile || matchedByFn) {
                         eval(hook.behavior)().then((hookResult: string) => {
                             this.breakpointGroups!.setNextBreakpointGroup(hookResult);
                             this.currentHook = undefined;
@@ -1498,7 +1659,13 @@ export class GDBDebugSession extends DebugSession {
                 if (!currentGroup) { this.sendUserStoppedEvent(); return; }
 
                 for (const hook of currentGroup.hooks) {
-                    if (filepath === hook.breakpoint.file && lineNumber === hook.breakpoint.line) {
+                    const hookFn = hook.breakpoint.function;
+                    const hookFile = hook.breakpoint.file;
+                    const hookLine = hook.breakpoint.line;
+                    const stackFunc = v[0].function;
+                    const matchedByFile = hookFile && filepath === hookFile && lineNumber === hookLine;
+                    const matchedByFn = hookFn && stackFunc && stackFunc.includes(hookFn);
+                    if (matchedByFile || matchedByFn) {
                         try {
                             const hookResult = await eval(hook.behavior)();
                             this.breakpointGroups!.setNextBreakpointGroup(hookResult);
@@ -1515,7 +1682,7 @@ export class GDBDebugSession extends DebugSession {
 
                 if (currentGroup.borders) {
                     for (const border of currentGroup.borders) {
-                        if (filepath === border.filepath && lineNumber === border.line) {
+                        if (this.matchesBorder({file: filepath, line: lineNumber, function: v[0].function}, border, 'kernel_to_user')) {
                             this.pendingBreakpointNode = undefined;
                             this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL_TO_USER_BORDER));
                             return;
@@ -1598,6 +1765,21 @@ export class GDBDebugSession extends DebugSession {
                 const content = fs.readFileSync(snapshotPath, 'utf-8');
                 const data = JSON.parse(content);
                 if (data && Array.isArray(data.path)) {
+                    // Classify each node's address space for kernel/user visual distinction
+                    for (const node of data.path) {
+                        const addr = parseAddr(node.addr);
+                        if (addr !== undefined) {
+                            if (isKernelAddr(addr, this.kernelMemoryRanges)) {
+                                node.space = 'kernel';
+                            } else if (isUserAddr(addr, this.userMemoryRanges)) {
+                                node.space = 'user';
+                            } else {
+                                node.space = 'unknown';
+                            }
+                        } else {
+                            node.space = 'unknown';
+                        }
+                    }
                     return data as SnapshotData;
                 }
             }

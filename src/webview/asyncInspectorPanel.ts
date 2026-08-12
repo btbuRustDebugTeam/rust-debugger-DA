@@ -172,39 +172,22 @@ export class AsyncInspectorPanel {
             return;
         }
 
-        // Find the frame index for this CID in the snapshot path.
-        let targetFrameIndex = -1;
+        // Find the node in the snapshot path that matches this CID.
+        let targetNode: any = null;
         for (let i = 0; i < snapshot.path.length; i++) {
             const node = snapshot.path[i];
             if (node.type === 'async' && node.cid === cid) {
-                targetFrameIndex = snapshot.path.length - 1 - i;
+                targetNode = node;
                 break;
             }
         }
 
-        if (targetFrameIndex >= 0) {
-            try {
-                const stackTrace = await this._debugSession.customRequest('stackTrace', {
-                    threadId: snapshot.thread_id,
-                    startFrame: 0,
-                    levels: 200,
-                });
-
-                const frames = stackTrace?.stackFrames || [];
-                if (frames.length > targetFrameIndex) {
-                    const frame = frames[targetFrameIndex];
-
-                    await this._debugSession.customRequest('evaluate', {
-                        expression: `frame ${targetFrameIndex}`,
-                        context: 'repl',
-                    });
-
-                    if (frame.source?.path) {
-                        await this.handleSelectFrame(frame.source.path, frame.line || 0);
-                    }
-                }
-            } catch (error) {
-                console.error('Failed to switch frame:', error);
+        if (targetNode) {
+            // Prefer fullname (absolute path), fall back to file (relative path).
+            const filePath = targetNode.fullname || targetNode.file;
+            const line = targetNode.line || 0;
+            if (filePath && line > 0) {
+                await this.handleSelectFrame(filePath, line);
             }
         }
     }
@@ -328,6 +311,7 @@ export class AsyncInspectorPanel {
                 addr: rootNode.addr,
                 poll: rootNode.poll,
                 state: rootNode.state,
+                space: (rootNode as any).space,
                 children: []
             };
             this._treeRoots.set(rootNode.cid, root);
@@ -335,6 +319,7 @@ export class AsyncInspectorPanel {
             root.type = rootNode.type;
             root.poll = rootNode.poll;
             root.state = rootNode.state;
+            root.space = (rootNode as any).space;
         }
 
         this.mergePathIntoTree(root, snapshot.path, rootIndex + 1);
@@ -360,6 +345,7 @@ export class AsyncInspectorPanel {
                         addr: node.addr,
                         poll: node.poll,
                         state: node.state,
+                        space: (node as any).space,
                         children: [],
                     };
                     current.children.push(child);
@@ -367,6 +353,7 @@ export class AsyncInspectorPanel {
                     child.type = node.type;
                     child.poll = node.poll;
                     child.state = node.state;
+                    child.space = (node as any).space;
                 }
                 current = child;
             } else {
@@ -381,6 +368,7 @@ export class AsyncInspectorPanel {
                         addr: node.addr,
                         poll: node.poll,
                         state: node.state,
+                        space: (node as any).space,
                         children: [],
                     };
                     current.children.push(child);
@@ -461,5 +449,6 @@ interface TreeNode {
     addr: string;
     poll: number;
     state: number | string;
+    space?: 'kernel' | 'user' | 'unknown';
     children: TreeNode[];
 }

@@ -77,6 +77,39 @@ def _find_nearby_coro(poll_sym: str, this_ptr: int, max_offset: int = 128) -> in
 def _push_coro(cid: int) -> int:
     tid = _thread_id()
     st = _TLS_STACK.setdefault(tid, [])
+    # gdb.FinishBreakpoint may not fire on all architectures (e.g. RISC-V
+    # with release + -g).  If the same CID is already on the stack from a
+    # previous poll cycle, remove it (and everything after it) before pushing.
+    if cid in st:
+        idx = st.index(cid)
+        del st[idx:]
+    # On RISC-V (and potentially other architectures), FinishBreakpoint is
+    # broken.  This means _PopOnReturnBP won't remove a coroutine from the
+    # stack when its poll function returns.  When a different coroutine
+    # starts, the stale top-of-stack entry must be detected and removed.
+    # We check whether the old coroutine's poll function is still present on
+    # the GDB physical call stack.  If not, it has already returned and
+    # should be popped so the new coroutine appears at the correct (sibling)
+    # depth rather than as a spurious child.
+    elif st and st[-1] != cid:
+        prev_cid = st[-1]
+        prev_sym, _ = _CO_META.get(prev_cid, ("", 0))
+        if prev_sym:
+            try:
+                active = False
+                f = gdb.selected_frame()
+                for _ in range(60):
+                    if not f:
+                        break
+                    name = f.name()
+                    if name and name == prev_sym:
+                        active = True
+                        break
+                    f = f.older()
+            except Exception:
+                active = True   # conservative: assume still active
+            if not active:
+                st.pop()
     st.append(cid)
     return len(st) - 1  # depth
 
@@ -135,6 +168,10 @@ _ASYNC_SYMBOL_SET = None   # set[str] | None
 
 _EVENTS_INSTALLED = False
 
+# Per-breakpoint-group saved trace state (async OS debugging).
+# Key: group label ("kernel", "user").  Value: dict with serialized state.
+_SAVED_STATES: dict[str, dict] = {}
+
 
 # -------------------------
 # Low-level helpers
@@ -162,6 +199,18 @@ def _read_ptr(addr: int) -> int:
 
 def _reg_u64(name: str) -> int:
     return int(gdb.parse_and_eval(f"${name}"))
+
+def _arg_reg() -> str:
+    """Return the register name for the first C argument on the current architecture."""
+    try:
+        arch = gdb.selected_frame().architecture().name()
+    except Exception:
+        return "rdi"
+    if "riscv" in arch:
+        return "a0"
+    if "aarch64" in arch:
+        return "x0"
+    return "rdi"  # x86_64
 
 def _current_pc() -> int:
     return int(gdb.parse_and_eval("$pc"))
@@ -358,7 +407,7 @@ def _try_read_awaitee_from_current_poll(poll_sym: str):
 
     # x86_64 SysV: rdi = env ptr
     try:
-        env_ptr = _reg_u64("rdi")
+        env_ptr = _reg_u64(_arg_reg())
     except Exception:
         return None
 
@@ -523,6 +572,27 @@ def _default_log_path() -> str | None:
     if not temp_dir:
         return None
     return os.path.join(cwd, temp_dir, "ardb.log")
+
+def _diag_log_path() -> str | None:
+    cwd = os.getcwd()
+    temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
+    if not temp_dir:
+        return None
+    return os.path.join(cwd, temp_dir, "ardb_diag.log")
+
+def _DIAG_LOG(message: str):
+    """Diagnostic log for debugging save/restore flow. Always writes to file and GDB console."""
+    path = _diag_log_path()
+    if path:
+        try:
+            log_dir = os.path.dirname(path)
+            if not os.path.exists(log_dir):
+                os.makedirs(log_dir, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fp:
+                fp.write(message + "\n")
+        except Exception:
+            pass
+    gdb.write("[DIAG] " + message + "\n")
 
 def _log_ard(message: str, to_console: bool = False):
     """
@@ -697,6 +767,12 @@ def _pick_interesting_callee(target_addr: int) -> str | None:
 # -------------------------
 
 def _cleanup_run_scoped():
+    _DIAG_LOG("[DIAG] _cleanup_run_scoped() called: "
+              f"|_RUN_SCOPED_BPS|={len(_RUN_SCOPED_BPS)}, "
+              f"|_CALLSITE_INSTALLED_FOR_FN|={len(_CALLSITE_INSTALLED_FOR_FN)}, "
+              f"|_CO_BY_KEY|={len(_CO_BY_KEY)}, "
+              f"|_ACTIVE_ROOTS|={len(_ACTIVE_ROOTS)}, "
+              f"|_CREATED_BPS|={len(_CREATED_BPS)}")
     for bp in list(_RUN_SCOPED_BPS):
         try:
             bp.delete()
@@ -713,11 +789,21 @@ def _cleanup_run_scoped():
     _CO_POLL_SEQ.clear()
     global _CO_NEXT_ID
     _CO_NEXT_ID = 1
+    _DIAG_LOG("[DIAG] _cleanup_run_scoped() done: all run-scoped state cleared")
 
 def _on_exited(event):
+    _DIAG_LOG("[DIAG] _on_exited() fired")
     _cleanup_run_scoped()
 
 def _on_new_objfile(event):
+    objfile_name = getattr(event, 'new_objfile', None)
+    if objfile_name is not None:
+        try:
+            _DIAG_LOG(f"[DIAG] _on_new_objfile() fired: {objfile_name.filename}")
+        except Exception:
+            _DIAG_LOG("[DIAG] _on_new_objfile() fired: (unable to get filename)")
+    else:
+        _DIAG_LOG("[DIAG] _on_new_objfile() fired")
     _cleanup_run_scoped()
 
 # -------------------------
@@ -742,7 +828,7 @@ class PollEntryBP(gdb.Breakpoint):
         # ---- coro context enter (best-effort) ----
         tid = _thread_id()
         try:
-            this_ptr = _reg_u64("rdi")   # x86_64 SysV: first arg (env ptr)
+            this_ptr = _reg_u64(_arg_reg())   # x86_64 SysV: first arg (env ptr)
         except Exception:
             this_ptr = 0
 
@@ -754,7 +840,18 @@ class PollEntryBP(gdb.Breakpoint):
         if poll_sym and this_ptr:
             cid, is_new = _get_or_make_coro_id(poll_sym, this_ptr)
             depth = _push_coro(cid)
-            _PopOnReturnBP(tid, cid)
+            # gdb.FinishBreakpoint is broken on RISC-V (GDB 15): the C-level
+            # bpfinishpy_pre_stop_hook may crash with an assertion failure even
+            # when the Python constructor succeeds.  Skip entirely on riscv.
+            try:
+                _arch = gdb.selected_frame().architecture().name()
+            except Exception:
+                _arch = ""
+            if "riscv" not in _arch:
+                try:
+                    _PopOnReturnBP(tid, cid)
+                except Exception:
+                    pass  # gdb.FinishBreakpoint may not work on all arch/optimizations
 
         indent = "  " * max(depth, 0)
 
@@ -802,8 +899,11 @@ class PollEntryBP(gdb.Breakpoint):
                 CallSiteBP(a)
 
             _CALLSITE_INSTALLED_FOR_FN.add(fn)
+            _DIAG_LOG(f"[DIAG] PollEntryBP.stop(): installed {len(call_sites)} CallSiteBPs for '{fn}'")
             if (not self.internal) or PRINT_INTERNAL_POLL_HITS:
                 _log_ard(f"[ARD]{indent} call-sites: {len(call_sites)}")
+        else:
+            _DIAG_LOG(f"[DIAG] PollEntryBP.stop(): SKIPPED call-site scan for '{fn}' - already in _CALLSITE_INSTALLED_FOR_FN")
 
         return False
 
@@ -879,10 +979,16 @@ class ARDResetCommand(gdb.Command):
             except Exception:
                 pass
         _CREATED_BPS.clear()
+        for bp in list(_RUN_SCOPED_BPS):
+            try:
+                bp.delete()
+            except Exception:
+                pass
         _RUN_SCOPED_BPS.clear()
 
         _CALLSITE_INSTALLED_FOR_FN.clear()
         _ACTIVE_ROOTS.clear()
+        _SAVED_STATES.clear()
 
         _invalidate_whitelist_addrs()
 
@@ -1075,38 +1181,30 @@ class ARDGetSnapshotCommand(gdb.Command):
                         if not this_ptr:
                             try:
                                 frame.select()
-                                this_ptr = _reg_u64("rdi")
+                                this_ptr = _reg_u64(_arg_reg())
                             except Exception:
                                 pass
 
+                        # Defer CID assignment: store this_ptr temporarily;
+                        # CIDs will be assigned in outermost-first order (after
+                        # reversing phys_tail) so that CID numbers increase
+                        # with nesting depth, matching the logical call order.
                         if this_ptr:
-                            try:
-                                # First try exact match
-                                cid_phys, is_new = _get_or_make_coro_id(fname, this_ptr)
-
-                                # If we just created a new CID, check if there's
-                                # an existing CID with a nearby address for the
-                                # same function.  Pin wrapping can shift the
-                                # pointer by a small offset, so we merge to
-                                # prevent identity fragmentation.
-                                if is_new:
-                                    nearby = _find_nearby_coro(fname, this_ptr)
-                                    if nearby is not None and nearby != cid_phys:
-                                        # Merge: discard the newly created CID,
-                                        # reuse the nearby one
-                                        key_new = (fname, int(this_ptr))
-                                        _CO_BY_KEY.pop(key_new, None)
-                                        _CO_META.pop(cid_phys, None)
-                                        _CO_POLL_SEQ.pop(cid_phys, None)
-                                        cid_phys = nearby
-
-                                if cid_phys not in shadow_cids:
-                                    node_cid = cid_phys
-                                    node_poll = _CO_POLL_SEQ.get(cid_phys, 0)
-                                    node_addr = hex(this_ptr)
-                                    node_state = _read_env_state(fname, this_ptr)
-                            except Exception:
-                                pass
+                            phys_tail.append({
+                                "type": frame_type,
+                                "cid": None,
+                                "func": fname,
+                                "addr": node_addr,
+                                "poll": 0,
+                                "state": node_state,
+                                "file": phys_file,
+                                "fullname": phys_fullname,
+                                "line": phys_line,
+                                "_this_ptr": this_ptr,
+                                "_fname": fname,
+                            })
+                            frame = frame.older()
+                            continue
 
                     phys_tail.append({
                         "type": frame_type,
@@ -1128,6 +1226,33 @@ class ARDGetSnapshotCommand(gdb.Command):
                 pass
         except Exception:
             pass
+
+        # Assign CIDs to deferred async frames in outermost-first order
+        # (reversed phys_tail), so CID numbers increase monotonically with
+        # call depth.  Without this deferred pass, the innermost-first
+        # walk would assign smaller CIDs to deeper frames, reversing the
+        # natural nesting order.
+        for item in reversed(phys_tail):
+            if item.get("_this_ptr"):
+                this_ptr = item.pop("_this_ptr")
+                fname = item.pop("_fname")
+                try:
+                    cid_phys, is_new = _get_or_make_coro_id(fname, this_ptr)
+                    if is_new:
+                        nearby = _find_nearby_coro(fname, this_ptr)
+                        if nearby is not None and nearby != cid_phys:
+                            key_new = (fname, int(this_ptr))
+                            _CO_BY_KEY.pop(key_new, None)
+                            _CO_META.pop(cid_phys, None)
+                            _CO_POLL_SEQ.pop(cid_phys, None)
+                            cid_phys = nearby
+                    if cid_phys not in shadow_cids:
+                        item["cid"] = cid_phys
+                        item["poll"] = _CO_POLL_SEQ.get(cid_phys, 0)
+                        item["addr"] = hex(this_ptr)
+                        item["state"] = _read_env_state(fname, this_ptr)
+                except Exception:
+                    pass
 
         # Physical frames are captured in reverse order (deepest first),
         # so we reverse them before appending to the path.
@@ -1295,6 +1420,251 @@ class ARDInferTraceRootCommand(gdb.Command):
         gdb.write(json.dumps(result) + "\n")
 
 
+class ARDSaveTraceStateCommand(gdb.Command):
+    """Save current trace state so it can be restored after a group switch.
+    Usage: ardb-save-trace-state <label>"""
+
+    def __init__(self):
+        super().__init__("ardb-save-trace-state", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        label = arg.strip()
+        if not label:
+            gdb.write("[ARD] Usage: ardb-save-trace-state <label>\n")
+            return
+
+        _DIAG_LOG(f"[DIAG] ardb-save-trace-state '{label}': BEGIN")
+        _DIAG_LOG(f"[DIAG]   _CALLSITE_INSTALLED_FOR_FN = {sorted(_CALLSITE_INSTALLED_FOR_FN)}")
+        _DIAG_LOG(f"[DIAG]   _ACTIVE_ROOTS = {sorted(_ACTIVE_ROOTS)}")
+        _DIAG_LOG(f"[DIAG]   |_CREATED_BPS| = {len(_CREATED_BPS)}, PollEntryBP count = {sum(1 for bp in _CREATED_BPS if isinstance(bp, PollEntryBP))}, CallSiteBP count = {sum(1 for bp in _CREATED_BPS if isinstance(bp, CallSiteBP))}")
+
+        # Snapshot PollEntryBP metadata before group switch deletes them.
+        poll_entries: list[tuple[str, str, bool]] = []
+        for bp in list(_CREATED_BPS):
+            if isinstance(bp, PollEntryBP):
+                poll_entries.append(
+                    (str(bp.location), bp.poll_sym, bp.internal)
+                )
+
+        _DIAG_LOG(f"[DIAG]   saving {len(poll_entries)} PollEntryBP entries")
+
+        # Serialize coroutine tracking state so poll sequences, shadow stack,
+        # and coro IDs survive new_objfile → _cleanup_run_scoped() across
+        # breakpoint-group switches (kernel ↔ user).
+        co_by_key_list = [
+            [sym, int(ptr), int(cid)]
+            for (sym, ptr), cid in _CO_BY_KEY.items()
+        ]
+        co_meta_dict = {
+            str(cid): [sym, int(ptr)]
+            for cid, (sym, ptr) in _CO_META.items()
+        }
+        co_poll_seq_dict = {
+            str(cid): int(seq)
+            for cid, seq in _CO_POLL_SEQ.items()
+        }
+        tls_stack_dict = {
+            str(tid): [int(c) for c in stack]
+            for tid, stack in _TLS_STACK.items()
+        }
+
+        state = {
+            "active_roots": set(_ACTIVE_ROOTS),
+            "callsite_installed": set(_CALLSITE_INSTALLED_FOR_FN),
+            "whitelist_exact": (
+                set(_WHITELIST_EXACT) if _WHITELIST_EXACT is not None else None
+            ),
+            "whitelist_prefix": (
+                list(_WHITELIST_PREFIX) if _WHITELIST_PREFIX is not None else None
+            ),
+            "whitelist_addr_map": dict(_WHITELIST_ADDR_MAP),
+            "whitelist_addr_ready": _WHITELIST_ADDR_READY,
+            "async_symbol_set": (
+                set(_ASYNC_SYMBOL_SET) if _ASYNC_SYMBOL_SET is not None else None
+            ),
+            "poll_entries": poll_entries,
+            # coroutine tracking (per-group)
+            "co_by_key": co_by_key_list,
+            "co_meta": co_meta_dict,
+            "co_poll_seq": co_poll_seq_dict,
+            "tls_stack": tls_stack_dict,
+            "co_next_id": _CO_NEXT_ID,
+        }
+        _SAVED_STATES[label] = state
+        _DIAG_LOG(f"[DIAG] ardb-save-trace-state '{label}': DONE. "
+                  f"callsite_installed saved = {sorted(state['callsite_installed'])}")
+        gdb.write(
+            f"[ARD] saved trace state '{label}': "
+            f"{len(poll_entries)} poll entries, "
+            f"{len(_ACTIVE_ROOTS)} active roots, "
+            f"{len(_CALLSITE_INSTALLED_FOR_FN)} scanned fns, "
+            f"{len(co_by_key_list)} coros, "
+            f"{_CO_NEXT_ID - 1} max cid\n"
+        )
+
+
+class ARDRestoreTraceStateCommand(gdb.Command):
+    """Restore trace state previously saved by ardb-save-trace-state.
+    Re-installs PollEntryBP instances under the current symbol table.
+    Usage: ardb-restore-trace-state <label>"""
+
+    def __init__(self):
+        super().__init__("ardb-restore-trace-state", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        label = arg.strip()
+        if not label:
+            gdb.write("[ARD] Usage: ardb-restore-trace-state <label>\n")
+            return
+
+        _DIAG_LOG(f"[DIAG] ardb-restore-trace-state '{label}': BEGIN")
+        state = _SAVED_STATES.pop(label, None)
+        if state is None:
+            _DIAG_LOG(f"[DIAG] ardb-restore-trace-state '{label}': NO SAVED STATE (pop returned None)")
+            gdb.write(f"[ARD] no saved trace state for '{label}'\n")
+            return
+
+        saved_callsite = sorted(state.get("callsite_installed", set()))
+        _DIAG_LOG(f"[DIAG]   state['callsite_installed'] = {saved_callsite}")
+        _DIAG_LOG(f"[DIAG]   state['active_roots'] = {sorted(state.get('active_roots', set()))}")
+        _DIAG_LOG(f"[DIAG]   state['poll_entries'] count = {len(state.get('poll_entries', []))}")
+        _DIAG_LOG(f"[DIAG]   current _CALLSITE_INSTALLED_FOR_FN (before restore) = {sorted(_CALLSITE_INSTALLED_FOR_FN)}")
+
+        # 1. Restore whitelist (address map must be rebuilt for new symbols).
+        global _WHITELIST_EXACT, _WHITELIST_PREFIX, _WHITELIST_ADDR_MAP
+        global _WHITELIST_ADDR_READY, _ASYNC_SYMBOL_SET
+        _WHITELIST_EXACT = state["whitelist_exact"]
+        _WHITELIST_PREFIX = state["whitelist_prefix"]
+        _WHITELIST_ADDR_READY = False
+        _WHITELIST_ADDR_MAP = {}
+        _ASYNC_SYMBOL_SET = state["async_symbol_set"]
+
+        # 2. Restore tracking bookkeeping.
+        _ACTIVE_ROOTS.clear()
+        _ACTIVE_ROOTS.update(state["active_roots"])
+        _CALLSITE_INSTALLED_FOR_FN.clear()
+        _CALLSITE_INSTALLED_FOR_FN.update(state["callsite_installed"])
+        _DIAG_LOG(f"[DIAG]   _CALLSITE_INSTALLED_FOR_FN (after restore) = {sorted(_CALLSITE_INSTALLED_FOR_FN)}")
+
+        # 3. Restore coroutine tracking state (must happen before PollEntryBP
+        #    re-install so that _push_coro / _CO_POLL_SEQ lookup sees the
+        #    saved CID namespace and poll sequences).
+        global _CO_NEXT_ID
+        _CO_BY_KEY.clear()
+        for sym, ptr, cid in state.get("co_by_key", []):
+            _CO_BY_KEY[(sym, int(ptr))] = int(cid)
+
+        _CO_META.clear()
+        for cid_str, pair in state.get("co_meta", {}).items():
+            _CO_META[int(cid_str)] = (pair[0], int(pair[1]))
+
+        _CO_POLL_SEQ.clear()
+        for cid_str, seq in state.get("co_poll_seq", {}).items():
+            _CO_POLL_SEQ[int(cid_str)] = int(seq)
+
+        _TLS_STACK.clear()
+        for tid_str, stack in state.get("tls_stack", {}).items():
+            _TLS_STACK[int(tid_str)] = [int(c) for c in stack]
+
+        _CO_NEXT_ID = int(state.get("co_next_id", 1))
+
+        # 4. Delete existing breakpoints before re-installing to avoid
+        #    exponential duplication across repeated kernel↔user group switches.
+        for bp in list(_CREATED_BPS):
+            try:
+                bp.delete()
+            except Exception:
+                pass
+        _CREATED_BPS.clear()
+        for bp in list(_RUN_SCOPED_BPS):
+            try:
+                bp.delete()
+            except Exception:
+                pass
+        _RUN_SCOPED_BPS.clear()
+        # Also clean up any orphan PollEntryBP instances that survived the
+        # delete above.  This can happen on RISC-V (GDB 15) when a symbol
+        # file was removed before the BP's delete() was called — GDB may
+        # fail silently, leaving the BP behind.  Without this sweep, each
+        # kernel↔user group switch accumulates one more orphan BP at the
+        # same location.
+        for bp in list(gdb.breakpoints()):
+            if isinstance(bp, PollEntryBP):
+                try:
+                    bp.delete()
+                except Exception:
+                    pass
+
+        # 5. Re-install PollEntryBP for every saved entry.
+        restored = 0
+        for location, poll_sym, internal in state["poll_entries"]:
+            try:
+                PollEntryBP(
+                    location,
+                    poll_sym=poll_sym,
+                    internal=internal,
+                    temporary=False,
+                )
+                restored += 1
+            except Exception as e:
+                gdb.write(
+                    f"[ARD] restore: failed to re-install PollEntryBP "
+                    f"at '{location}': {e}\n"
+                )
+
+        coro_count = len(_CO_BY_KEY)
+        gdb.write(
+            f"[ARD] restored trace state '{label}': "
+            f"{restored}/{len(state['poll_entries'])} poll entries, "
+            f"{coro_count} coros\n"
+        )
+
+
+class ARDResetTraceStateCommand(gdb.Command):
+    """Discard saved trace state for a label.
+    Usage: ardb-reset-trace-state <label>"""
+
+    def __init__(self):
+        super().__init__("ardb-reset-trace-state", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        label = arg.strip()
+        if not label:
+            gdb.write("[ARD] Usage: ardb-reset-trace-state <label>\n")
+            return
+        if label in _SAVED_STATES:
+            del _SAVED_STATES[label]
+            gdb.write(f"[ARD] cleared saved trace state '{label}'\n")
+        else:
+            gdb.write(f"[ARD] no saved trace state for '{label}'\n")
+
+
+class ARDDiagCommand(gdb.Command):
+    """Dump diagnostic state for debugging save/restore flow.
+    Usage: ardb-diag"""
+
+    def __init__(self):
+        super().__init__("ardb-diag", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        gdb.write("=== ARDB Diagnostic State ===\n")
+        gdb.write(f"_ACTIVE_ROOTS ({len(_ACTIVE_ROOTS)}): {sorted(_ACTIVE_ROOTS)}\n")
+        gdb.write(f"_CALLSITE_INSTALLED_FOR_FN ({len(_CALLSITE_INSTALLED_FOR_FN)}): {sorted(_CALLSITE_INSTALLED_FOR_FN)}\n")
+        gdb.write(f"_CREATED_BPS: {len(_CREATED_BPS)} total\n")
+        poll_count = sum(1 for bp in _CREATED_BPS if isinstance(bp, PollEntryBP))
+        call_count = sum(1 for bp in _CREATED_BPS if isinstance(bp, CallSiteBP))
+        gdb.write(f"  PollEntryBP: {poll_count}, CallSiteBP: {call_count}\n")
+        gdb.write(f"_RUN_SCOPED_BPS: {len(_RUN_SCOPED_BPS)}\n")
+        gdb.write(f"_SAVED_STATES labels: {list(_SAVED_STATES.keys())}\n")
+        for lbl, st in _SAVED_STATES.items():
+            gdb.write(f"  '{lbl}': active_roots={len(st.get('active_roots',set()))}, "
+                      f"callsite_installed={len(st.get('callsite_installed',set()))}, "
+                      f"poll_entries={len(st.get('poll_entries',[]))}\n")
+        gdb.write(f"_CO_BY_KEY: {len(_CO_BY_KEY)} entries, _CO_NEXT_ID={_CO_NEXT_ID}\n")
+        gdb.write(f"_TLS_STACK: {dict((k,len(v)) for k,v in _TLS_STACK.items())}\n")
+        gdb.write("=== End Diagnostic State ===\n")
+
+
 # -------------------------
 # Entry
 # -------------------------
@@ -1313,6 +1683,10 @@ def install():
     ARDGetGroupedWhitelistCommand()
     ARDUpdateWhitelistCommand()
     ARDInferTraceRootCommand()
+    ARDSaveTraceStateCommand()
+    ARDRestoreTraceStateCommand()
+    ARDResetTraceStateCommand()
+    ARDDiagCommand()
 
     if not _EVENTS_INSTALLED:
         try:

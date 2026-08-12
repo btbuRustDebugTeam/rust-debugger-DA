@@ -125,6 +125,7 @@ export class MI2 extends EventEmitter {
 	}
 
 	load(cwd: string, target: string, procArgs: string, autorun: string[] = []): Promise<any> {
+		this.cwd = cwd;
 		if (!path.isAbsolute(target))
 			target = path.join(cwd, target);
 		return new Promise((resolve, reject) => {
@@ -147,6 +148,7 @@ export class MI2 extends EventEmitter {
 
 	// Attach to a running local process (by PID or process name)
 	attach(cwd: string, executable: string, target: string, autorun: string[] = []): Promise<any> {
+		this.cwd = cwd;
 		return new Promise((resolve, reject) => {
 			if (executable && !path.isAbsolute(executable)) executable = path.join(cwd, executable);
 			const args = this.preargs.concat(this.extraargs || []);
@@ -169,6 +171,7 @@ export class MI2 extends EventEmitter {
 
 	// Connect to a GDB remote stub (e.g. QEMU gdbserver via "target remote :port")
 	connect(cwd: string, executable: string, target: string, autorun: string[] = []): Promise<any> {
+		this.cwd = cwd;
 		return new Promise((resolve, reject) => {
 			if (executable && !path.isAbsolute(executable)) executable = path.join(cwd, executable);
 			const args = this.preargs.concat(this.extraargs || []);
@@ -188,6 +191,13 @@ export class MI2 extends EventEmitter {
 				return seq.reduce((p, cmd) => p.then(() => cmd), Promise.resolve() as Promise<any>);
 			}).then(() => {
 				return this.sendCommand("target-select remote " + target);
+			}).then(() => {
+				// Help GDB resolve DWARF relative source paths against the
+				// workspace root. DWARF often stores paths like
+				// "user_apps/hello_world/src/main.rs" without DW_AT_comp_dir,
+				// while breakpoints use absolute paths. Adding the workspace
+				// root to GDB's source search path lets GDB match both forms.
+				return this.sendCliCommand(`directory ${cwd}`);
 			}).then(() => {
 				return Promise.all(autorun.map(value => this.sendUserInput(value)));
 			}).then(() => {
@@ -739,6 +749,22 @@ export class MI2 extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Execute a GDB CLI command and capture its console output as a string.
+	 * Used by hook breakpoint behaviors to parse GDB output (e.g. "p variable")
+	 * without depending on hardcoded type layouts.
+	 */
+	captureConsoleOutput(command: string): Promise<string> {
+		const lines: string[] = [];
+		const msgHandler = (type: string, msg: string) => {
+			if (type === "console") lines.push(msg);
+		};
+		this.on("msg", msgHandler);
+		return this.sendCommand(`interpreter-exec console "${command.replace(/[\\"']/g, "\\$&")}"`)
+			.then(() => { this.removeListener("msg", msgHandler); return lines.join(""); })
+			.catch((e) => { this.removeListener("msg", msgHandler); throw e; });
+	}
+
 	sendCliCommand(command: string, threadId: number = 0, frameLevel: number = 0): Promise<MINode> {
 		let miCommand = "interpreter-exec ";
 		if (threadId != 0) miCommand += `--thread ${threadId} --frame ${frameLevel} `;
@@ -748,13 +774,16 @@ export class MI2 extends EventEmitter {
 
 	addSymbolFile(filepath: string, textAddr?: string): Promise<any> {
 		return new Promise((resolve, reject) => {
+			// Resolve relative paths against GDB's CWD so add/remove use the same
+			// canonical path that GDB stores internally.
+			if (!path.isAbsolute(filepath)) {
+				filepath = path.join(this.cwd, filepath);
+			}
 			// GDB requires a .text load address for add-symbol-file.
 			// Use the caller-supplied address, or auto-detect it from the ELF header.
-			// If neither is available, skip silently — the kernel ELF is already loaded
-			// via file-exec-and-symbols, and a user-space ELF with an unknown address
-			// would only corrupt symbol resolution.
 			const addr = textAddr ?? readElfTextAddr(filepath);
 			if (!addr) {
+				console.warn(`[ardb] addSymbolFile: cannot determine .text address for "${filepath}" (no textAddr provided and ELF read failed). Skipping.`);
 				resolve(false);
 				return;
 			}
@@ -767,6 +796,11 @@ export class MI2 extends EventEmitter {
 
 	removeSymbolFile(filepath: string): Promise<any> {
 		return new Promise((resolve, reject) => {
+			// Resolve to absolute so the path matches what GDB stored when
+			// add-symbol-file canonicalized it internally.
+			if (!path.isAbsolute(filepath)) {
+				filepath = path.join(this.cwd, filepath);
+			}
 			this.sendCliCommand("remove-symbol-file " + filepath).then((result) => {
 				if (result.resultRecords?.resultClass == "done") resolve(true);
 				else resolve(false);
@@ -820,4 +854,5 @@ export class MI2 extends EventEmitter {
 	protected process!: ChildProcess.ChildProcess;
 	protected originallyNoTokenMINodes: MINode[] = [];
 	protected tokenCount: number = 0;
+	private cwd: string = '';
 }

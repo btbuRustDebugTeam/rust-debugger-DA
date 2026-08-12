@@ -94,6 +94,14 @@ class MockMI2 implements IDebuggerBackend {
         this.calls.push({ type: 'removeSymbolFile', path: filepath });
         return Promise.resolve();
     }
+    sendCliCommand(_command: string): Promise<any> {
+        this.calls.push({ type: 'continue' });  // lightweight: reuse continue as generic "cli call" marker
+        return Promise.resolve();
+    }
+    sendCommand(_command: string): Promise<any> {
+        this.calls.push({ type: 'continue' });
+        return Promise.resolve();
+    }
 }
 
 // ---------------------------------------------------------------------------
