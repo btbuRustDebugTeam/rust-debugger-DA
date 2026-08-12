@@ -17,6 +17,7 @@
 | **决赛文档** | [操作系统跨特权级统一调试平台决赛文档](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/%E5%86%B3%E8%B5%9B%E6%96%87%E6%A1%A3-%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E8%B7%A8%E7%89%B9%E6%9D%83%E7%BA%A7%E7%BB%9F%E4%B8%80%E8%B0%83%E8%AF%95%E5%B9%B3%E5%8F%B0.pdf?ref_type=heads)                                                      |
 | **决赛PPT** | [操作系统跨特权级统一调试平台决赛PPT](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/%E5%86%B3%E8%B5%9BPPT-%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E8%B7%A8%E7%89%B9%E6%9D%83%E7%BA%A7%E7%BB%9F%E4%B8%80%E8%B0%83%E8%AF%95%E5%B9%B3%E5%8F%B0.pdf?ref_type=heads)                                                       |
 | **演示视频** | [操作系统跨特权级统一调试平台决赛演示视频](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/tree/main/docs?ref_type=heads)                                                      |
+| **开发进度记录** | [开发进度](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/docs/%E5%BC%80%E5%8F%91%E8%BF%9B%E5%BA%A6.md)                                                       |
 
 ### 1.2 摘要
 
