@@ -72,6 +72,21 @@
         typeBadge.textContent = node.type === 'async' ? 'ASYNC' : 'SYNC';
         typeBadge.style.color = node.type === 'async' ? '#ff6b6b' : '#51cf66';
 
+        // Kernel / User space badge
+        const spaceBadge = document.createElement('span');
+        spaceBadge.className = 'node-space';
+        const space = node.space || 'unknown';
+        if (space === 'kernel') {
+            spaceBadge.textContent = 'KERN';
+            spaceBadge.style.color = '#f0a040';
+        } else if (space === 'user') {
+            spaceBadge.textContent = 'USER';
+            spaceBadge.style.color = '#40a0f0';
+        } else {
+            spaceBadge.textContent = '?';
+            spaceBadge.style.color = '#888';
+        }
+
         const info = document.createElement('div');
         info.className = 'node-info';
 
@@ -90,6 +105,7 @@
         info.appendChild(func);
         info.appendChild(meta);
         content.appendChild(typeBadge);
+        content.appendChild(spaceBadge);
         content.appendChild(info);
         div.appendChild(content);
 

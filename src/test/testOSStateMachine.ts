@@ -136,10 +136,13 @@ function transition(state: OSStates, event: OSEvents): [OSState, Action[]] {
     ], 'user + AT_USER_TO_KERNEL_BORDER actions');
 }
 {
-    // AT_KERNEL not defined for user → stays, empty actions
+    // AT_KERNEL → kernel (StarryOS bypass: when PC is already in kernel space,
+    // e.g. border placed at handle_syscall in kernel), switches group to kernel.
     const [next, actions] = transition(OSStates.user, OSEvents.AT_KERNEL);
-    assertEq(next.status, OSStates.user, 'user + undefined event → stays user');
-    assertEq(actions.length, 0, 'user + undefined event → empty actions');
+    assertEq(next.status, OSStates.kernel, 'user + AT_KERNEL → kernel (StarryOS fast path)');
+    assertActions(actions, [
+        DebuggerActions.high_level_switch_breakpoint_group_to_low_level,
+    ], 'user + AT_KERNEL actions');
 }
 
 // ---------------------------------------------------------------------------

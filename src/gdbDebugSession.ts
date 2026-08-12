@@ -55,6 +55,7 @@ export interface SnapshotData {
         file?: string;
         fullname?: string;
         line?: number;
+        space?: 'kernel' | 'user' | 'unknown';
     }>;
 }
 
@@ -1492,7 +1493,8 @@ export class GDBDebugSession extends DebugSession {
             this.showInfo('doing action: check_if_kernel_yet');
             this.miDebugger.getSomeRegisterValues([this.programCounterId]).then(regs => {
                 if (!regs || regs.length === 0 || !regs[0]) {
-                    console.warn('[ardb] check_if_kernel_yet: no register data');
+                    console.warn('[ardb] check_if_kernel_yet: no register data, retrying step');
+                    this.miDebugger!.stepInstruction();
                     return;
                 }
                 const pc = parseAddr(regs[0].value ?? '');
@@ -1763,6 +1765,21 @@ export class GDBDebugSession extends DebugSession {
                 const content = fs.readFileSync(snapshotPath, 'utf-8');
                 const data = JSON.parse(content);
                 if (data && Array.isArray(data.path)) {
+                    // Classify each node's address space for kernel/user visual distinction
+                    for (const node of data.path) {
+                        const addr = parseAddr(node.addr);
+                        if (addr !== undefined) {
+                            if (isKernelAddr(addr, this.kernelMemoryRanges)) {
+                                node.space = 'kernel';
+                            } else if (isUserAddr(addr, this.userMemoryRanges)) {
+                                node.space = 'user';
+                            } else {
+                                node.space = 'unknown';
+                            }
+                        } else {
+                            node.space = 'unknown';
+                        }
+                    }
                     return data as SnapshotData;
                 }
             }

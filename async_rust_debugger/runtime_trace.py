@@ -83,6 +83,33 @@ def _push_coro(cid: int) -> int:
     if cid in st:
         idx = st.index(cid)
         del st[idx:]
+    # On RISC-V (and potentially other architectures), FinishBreakpoint is
+    # broken.  This means _PopOnReturnBP won't remove a coroutine from the
+    # stack when its poll function returns.  When a different coroutine
+    # starts, the stale top-of-stack entry must be detected and removed.
+    # We check whether the old coroutine's poll function is still present on
+    # the GDB physical call stack.  If not, it has already returned and
+    # should be popped so the new coroutine appears at the correct (sibling)
+    # depth rather than as a spurious child.
+    elif st and st[-1] != cid:
+        prev_cid = st[-1]
+        prev_sym, _ = _CO_META.get(prev_cid, ("", 0))
+        if prev_sym:
+            try:
+                active = False
+                f = gdb.selected_frame()
+                for _ in range(60):
+                    if not f:
+                        break
+                    name = f.name()
+                    if name and name == prev_sym:
+                        active = True
+                        break
+                    f = f.older()
+            except Exception:
+                active = True   # conservative: assume still active
+            if not active:
+                st.pop()
     st.append(cid)
     return len(st) - 1  # depth
 
@@ -813,10 +840,18 @@ class PollEntryBP(gdb.Breakpoint):
         if poll_sym and this_ptr:
             cid, is_new = _get_or_make_coro_id(poll_sym, this_ptr)
             depth = _push_coro(cid)
+            # gdb.FinishBreakpoint is broken on RISC-V (GDB 15): the C-level
+            # bpfinishpy_pre_stop_hook may crash with an assertion failure even
+            # when the Python constructor succeeds.  Skip entirely on riscv.
             try:
-                _PopOnReturnBP(tid, cid)
+                _arch = gdb.selected_frame().architecture().name()
             except Exception:
-                pass  # gdb.FinishBreakpoint may not work on all arch/optimizations
+                _arch = ""
+            if "riscv" not in _arch:
+                try:
+                    _PopOnReturnBP(tid, cid)
+                except Exception:
+                    pass  # gdb.FinishBreakpoint may not work on all arch/optimizations
 
         indent = "  " * max(depth, 0)
 
@@ -944,6 +979,11 @@ class ARDResetCommand(gdb.Command):
             except Exception:
                 pass
         _CREATED_BPS.clear()
+        for bp in list(_RUN_SCOPED_BPS):
+            try:
+                bp.delete()
+            except Exception:
+                pass
         _RUN_SCOPED_BPS.clear()
 
         _CALLSITE_INSTALLED_FOR_FN.clear()
@@ -1145,34 +1185,26 @@ class ARDGetSnapshotCommand(gdb.Command):
                             except Exception:
                                 pass
 
+                        # Defer CID assignment: store this_ptr temporarily;
+                        # CIDs will be assigned in outermost-first order (after
+                        # reversing phys_tail) so that CID numbers increase
+                        # with nesting depth, matching the logical call order.
                         if this_ptr:
-                            try:
-                                # First try exact match
-                                cid_phys, is_new = _get_or_make_coro_id(fname, this_ptr)
-
-                                # If we just created a new CID, check if there's
-                                # an existing CID with a nearby address for the
-                                # same function.  Pin wrapping can shift the
-                                # pointer by a small offset, so we merge to
-                                # prevent identity fragmentation.
-                                if is_new:
-                                    nearby = _find_nearby_coro(fname, this_ptr)
-                                    if nearby is not None and nearby != cid_phys:
-                                        # Merge: discard the newly created CID,
-                                        # reuse the nearby one
-                                        key_new = (fname, int(this_ptr))
-                                        _CO_BY_KEY.pop(key_new, None)
-                                        _CO_META.pop(cid_phys, None)
-                                        _CO_POLL_SEQ.pop(cid_phys, None)
-                                        cid_phys = nearby
-
-                                if cid_phys not in shadow_cids:
-                                    node_cid = cid_phys
-                                    node_poll = _CO_POLL_SEQ.get(cid_phys, 0)
-                                    node_addr = hex(this_ptr)
-                                    node_state = _read_env_state(fname, this_ptr)
-                            except Exception:
-                                pass
+                            phys_tail.append({
+                                "type": frame_type,
+                                "cid": None,
+                                "func": fname,
+                                "addr": node_addr,
+                                "poll": 0,
+                                "state": node_state,
+                                "file": phys_file,
+                                "fullname": phys_fullname,
+                                "line": phys_line,
+                                "_this_ptr": this_ptr,
+                                "_fname": fname,
+                            })
+                            frame = frame.older()
+                            continue
 
                     phys_tail.append({
                         "type": frame_type,
@@ -1194,6 +1226,33 @@ class ARDGetSnapshotCommand(gdb.Command):
                 pass
         except Exception:
             pass
+
+        # Assign CIDs to deferred async frames in outermost-first order
+        # (reversed phys_tail), so CID numbers increase monotonically with
+        # call depth.  Without this deferred pass, the innermost-first
+        # walk would assign smaller CIDs to deeper frames, reversing the
+        # natural nesting order.
+        for item in reversed(phys_tail):
+            if item.get("_this_ptr"):
+                this_ptr = item.pop("_this_ptr")
+                fname = item.pop("_fname")
+                try:
+                    cid_phys, is_new = _get_or_make_coro_id(fname, this_ptr)
+                    if is_new:
+                        nearby = _find_nearby_coro(fname, this_ptr)
+                        if nearby is not None and nearby != cid_phys:
+                            key_new = (fname, int(this_ptr))
+                            _CO_BY_KEY.pop(key_new, None)
+                            _CO_META.pop(cid_phys, None)
+                            _CO_POLL_SEQ.pop(cid_phys, None)
+                            cid_phys = nearby
+                    if cid_phys not in shadow_cids:
+                        item["cid"] = cid_phys
+                        item["poll"] = _CO_POLL_SEQ.get(cid_phys, 0)
+                        item["addr"] = hex(this_ptr)
+                        item["state"] = _read_env_state(fname, this_ptr)
+                except Exception:
+                    pass
 
         # Physical frames are captured in reverse order (deepest first),
         # so we reverse them before appending to the path.
@@ -1509,7 +1568,34 @@ class ARDRestoreTraceStateCommand(gdb.Command):
 
         _CO_NEXT_ID = int(state.get("co_next_id", 1))
 
-        # 4. Re-install PollEntryBP for every saved entry.
+        # 4. Delete existing breakpoints before re-installing to avoid
+        #    exponential duplication across repeated kernel↔user group switches.
+        for bp in list(_CREATED_BPS):
+            try:
+                bp.delete()
+            except Exception:
+                pass
+        _CREATED_BPS.clear()
+        for bp in list(_RUN_SCOPED_BPS):
+            try:
+                bp.delete()
+            except Exception:
+                pass
+        _RUN_SCOPED_BPS.clear()
+        # Also clean up any orphan PollEntryBP instances that survived the
+        # delete above.  This can happen on RISC-V (GDB 15) when a symbol
+        # file was removed before the BP's delete() was called — GDB may
+        # fail silently, leaving the BP behind.  Without this sweep, each
+        # kernel↔user group switch accumulates one more orphan BP at the
+        # same location.
+        for bp in list(gdb.breakpoints()):
+            if isinstance(bp, PollEntryBP):
+                try:
+                    bp.delete()
+                except Exception:
+                    pass
+
+        # 5. Re-install PollEntryBP for every saved entry.
         restored = 0
         for location, poll_sym, internal in state["poll_entries"]:
             try:
