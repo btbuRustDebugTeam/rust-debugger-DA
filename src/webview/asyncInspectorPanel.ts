@@ -285,6 +285,10 @@ export class AsyncInspectorPanel {
             return;
         }
 
+        // Prefer the first coroutine node (cid != null) as the tree root.
+        // The physical-stack fallback (sync code / before the first poll) may
+        // produce a path where NO node has a cid (env ptr unreadable) — in
+        // that case fall back to the first node so the chain still renders.
         let rootIndex = -1;
         for (let i = 0; i < snapshot.path.length; i++) {
             if (snapshot.path[i].cid !== null) {
@@ -294,15 +298,23 @@ export class AsyncInspectorPanel {
         }
 
         if (rootIndex < 0) {
-            return;
+            rootIndex = 0;
         }
 
         const rootNode = snapshot.path[rootIndex];
-        if (rootNode.cid === null) {
+        if (!rootNode) {
             return;
         }
 
-        let root = this._treeRoots.get(rootNode.cid);
+        // Coroutine roots are keyed by cid; a physical-stack fallback chain
+        // (root cid === null) is transient — replace it on every stop instead
+        // of merging chains from different stop locations.
+        const rootKey = rootNode.cid ?? -1;
+        if (rootNode.cid === null) {
+            this._treeRoots.delete(-1);
+        }
+
+        let root = this._treeRoots.get(rootKey);
         if (!root) {
             root = {
                 type: rootNode.type,
@@ -314,7 +326,7 @@ export class AsyncInspectorPanel {
                 space: (rootNode as any).space,
                 children: []
             };
-            this._treeRoots.set(rootNode.cid, root);
+            this._treeRoots.set(rootKey, root);
         } else {
             root.type = rootNode.type;
             root.poll = rootNode.poll;

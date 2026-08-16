@@ -31,6 +31,9 @@ export interface IBreakpointGroupsSession {
 	// Called after all breakpoints for the new group have been (re-)inserted into GDB.
 	// The caller should send BreakpointEvent('changed') for each restored breakpoint.
 	onBreakpointsRestored(results: Array<[boolean, Breakpoint]>): void;
+	// Crates the user enabled via ardb-update-whitelist. Used to re-apply the
+	// user's selection after a group switch regenerates the whitelist.
+	getWhitelistEnabledCrates?(): string[];
 }
 
 export class Border {
@@ -66,6 +69,7 @@ export function toHookBreakpoint(h: HookBreakpointJSONFriendly): HookBreakpoint 
 export class HookBreakpoint {
 	breakpoint: Breakpoint;
 	behavior: FunctionString;
+	gdbNumber?: number;  // GDB breakpoint number, set after inserting into GDB
 	constructor(breakpoint: Breakpoint, behavior: FunctionString) {
 		this.breakpoint = breakpoint;
 		this.behavior = behavior;
@@ -229,11 +233,12 @@ export class BreakpointGroups {
 		});
 		oldFuncBorders.forEach(b => { b.gdbNumber = undefined; });
 
-		// Also delete old group's function-name hook breakpoints from GDB.
-		const oldFuncHooks = [...this.groups[oldIndex].hooks].filter(h => h.breakpoint.function !== undefined);
-		const clearOldFuncHookPromises = oldFuncHooks.map(h => {
-			return this.session.miDebugger.sendCommand(`break-delete ${h.breakpoint.function}`).catch(() => { });
-		});
+		// NOTE: function-name hook breakpoints are deliberately NOT deleted or
+		// re-inserted on group switches. Hooks live on kernel-space functions and
+		// are global across all groups — they are inserted once on debug-ready.
+		// Deleting/re-inserting them per switch caused duplicates to accumulate
+		// (break-delete by function name is not supported by GDB, and the stored
+		// gdbNumber was reset before the delete could run).
 
 		// 2. Unload old symbol files, load new symbol files — must complete before
 		//    re-inserting breakpoints so GDB can resolve source locations correctly.
@@ -253,7 +258,7 @@ export class BreakpointGroups {
 		const filesToRemove = oldSymbolFiles.map(toPath).filter(p => this.loadedSymbolFiles.has(p));
 		const filesToAdd = newSymbolFiles.filter(e => !this.loadedSymbolFiles.has(toPath(e)));
 
-		return Promise.all([...clearOldPromises, ...clearOldFuncBorderPromises, ...clearOldFuncHookPromises])
+		return Promise.all([...clearOldPromises, ...clearOldFuncBorderPromises])
 			.then(() => Promise.all(filesToRemove.map(p =>
 				this.session.miDebugger.removeSymbolFile(p).then(() => {
 					this.loadedSymbolFiles.delete(p);
@@ -298,14 +303,11 @@ export class BreakpointGroups {
 						.catch(() => { })
 					);
 
-				// Also re-insert new group's function-name hook breakpoints into GDB
-				const newFuncHookPromises = [...this.groups[newIndex].hooks]
-					.filter(h => h.breakpoint.function !== undefined)
-					.map(h => this.session.miDebugger.addBreakPoint({ raw: h.breakpoint.function!, condition: '' })
-						.catch(() => { })
-					);
+				// NOTE: function-name hook breakpoints are not re-inserted here —
+				// they are global (kernel-space) and were inserted once on debug-ready.
+				// See the comment on the old-group cleanup above.
 
-				return Promise.all([Promise.all(breakpointPromises), Promise.all(newFuncBorderPromises), Promise.all(newFuncHookPromises)])
+				return Promise.all([Promise.all(breakpointPromises), Promise.all(newFuncBorderPromises)])
 					.then(([bpResults]) => bpResults);
 			})
 			.then((nestedResults) => {
@@ -317,7 +319,38 @@ export class BreakpointGroups {
 				this.session.showInformationMessage(`[DIAG] restoring trace state for '${newGroupName}'...`);
 				return this.session.miDebugger.sendCliCommand(
 					`ardb-restore-trace-state ${newGroupName}`
-				).catch(() => { /* best-effort */ });
+				).catch(() => { /* best-effort */ })
+				.then(() => {
+					// 5.5 Only when NEW symbol files were loaded (switching TO a user
+					//     group) does the whitelist need regeneration: `info functions`
+					//     now includes the user-space symbols that were missing when the
+					//     whitelist was first generated. Switching back to the kernel
+					//     group loads no new files, so we skip this entirely.
+					if (filesToAdd.length === 0) {
+						return;
+					}
+					this.session.showInformationMessage(`[DIAG] regenerating whitelist (user symbols loaded)...`);
+					return this.session.miDebugger.sendCliCommand('ardb-gen-whitelist').catch(() => { /* best-effort */ })
+						.then(() => {
+							const crates = [...(this.session.getWhitelistEnabledCrates?.() ?? [])];
+							if (newGroupName && !crates.includes(newGroupName)) {
+								crates.push(newGroupName);
+							}
+							const payload = JSON.stringify({ enabled_crates: crates });
+							return this.session.miDebugger.sendCliCommand(
+								`ardb-update-whitelist ${payload}`
+							).catch(() => { /* best-effort */ });
+						})
+						.then(() => this.session.miDebugger.sendCliCommand('ardb-load-whitelist').catch(() => { /* best-effort */ }))
+						.then(() => {
+							// Auto-trace the user crate's async symbols so user-space
+							// coroutines enter the shadow stack; ardb-get-snapshot then
+							// appends the kernel frames via the physical stack tail.
+							return this.session.miDebugger.sendCliCommand(
+								`ardb-trace-user-crate ${newGroupName}`
+							).catch(() => { /* best-effort */ });
+						});
+				});
 			})
 			.then(() => {
 				// 6. Now safe to continue execution

@@ -216,6 +216,15 @@ def gen_grouped_whitelist(out_path: str) -> dict:
     包含所有函数（同步 + 异步），按 crate 分组。
     Returns the grouped data dict.
     """
+    # Hook breakpoint behaviors may leave the GDB language at C ("set language c"
+    # to read string arguments). Under C rendering, `info functions` prints
+    # "static void hello_world::main()" instead of the Rust rendering, which
+    # corrupts crate-name extraction ("static void hello_world" as crate name).
+    # Restore auto language so symbols render in their native form.
+    try:
+        gdb.execute("set language auto", to_string=True)
+    except Exception:
+        pass
     output = gdb.execute("info functions", to_string=True)
     funcs = parse_info_functions(output)
 

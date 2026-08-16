@@ -91,6 +91,28 @@ function readElfTextAddr(filepath: string): string | undefined {
 	}
 }
 
+/**
+ * Read the ELF e_type field (header offset 0x10, 2 bytes little-endian):
+ *   2 = ET_EXEC (statically linked, absolute section addresses)
+ *   3 = ET_DYN  (PIE / shared object, VMA 0, needs a runtime base)
+ * Returns undefined if the file can't be read or isn't ELF.
+ */
+function readElfType(filepath: string): number | undefined {
+	try {
+		const fd = fs.openSync(filepath, 'r');
+		const buf = Buffer.alloc(64);
+		fs.readSync(fd, buf, 0, 64, 0);
+		fs.closeSync(fd);
+		if (buf[0] !== 0x7F || buf[1] !== 0x45 ||
+			buf[2] !== 0x4C || buf[3] !== 0x46) {
+			return undefined;
+		}
+		return buf.readUInt16LE(0x10);
+	} catch {
+		return undefined;
+	}
+}
+
 const nonOutput = /^(?:\d*|undefined)[\*\+\=]|[\~\@\&\^]/;
 const gdbMatch = /(?:\d*|undefined)\(gdb\)/;
 const numRegex = /\d+/;
@@ -507,11 +529,42 @@ export class MI2 extends EventEmitter {
 			this.sendCommand("break-insert -f " + location).then((result) => {
 				if (result.resultRecords?.resultClass == "done") {
 					const bkptNum = parseInt(result.result("bkpt.number"));
+					const pending = result.result("bkpt.pending") !== undefined;
+					if (pending) {
+						// GDB accepted the breakpoint but could not resolve the location
+						// (unknown symbol / no such line / symbol file not loaded yet).
+						// It stays in GDB as a pending breakpoint and will never fire
+						// until the location becomes resolvable. Report it as unverified
+						// instead of pretending it was set successfully.
+						console.warn(`[ardb] addBreakPoint: pending (unresolved) breakpoint at ${location} — no matching line/symbol in loaded symbol files.`);
+						const newBrk: Breakpoint = {
+							id: bkptNum,
+							file: breakpoint.file,
+							raw: breakpoint.raw,
+							line: breakpoint.line,
+							condition: breakpoint.condition,
+						};
+						this.breakpoints.set(newBrk, bkptNum);
+						resolve([false, newBrk]);
+						return;
+					}
+					// Multi-location breakpoints (file:line resolving to several
+					// addresses) return a parent bkpt WITHOUT file/line — those
+					// live in bkpt.locations[]. Fall back to the first location's
+					// line, then to the requested line, so callers never see NaN
+					// (which would break pendingDapIds lookups on group switch).
+					let bkptLine = result.result("bkpt.line");
+					if (bkptLine === undefined) {
+						const locations = result.result("bkpt.locations");
+						if (Array.isArray(locations) && locations.length > 0) {
+							bkptLine = MINode.valueOf(locations[0], "line");
+						}
+					}
 					const newBrk: Breakpoint = {
 						id: bkptNum,
 						file: breakpoint.file ? breakpoint.file : result.result("bkpt.file"),
 						raw: breakpoint.raw,
-						line: parseInt(result.result("bkpt.line")),
+						line: bkptLine !== undefined ? parseInt(bkptLine) : breakpoint.line,
 						condition: breakpoint.condition,
 					};
 					if (breakpoint.condition) {
@@ -779,15 +832,30 @@ export class MI2 extends EventEmitter {
 			if (!path.isAbsolute(filepath)) {
 				filepath = path.join(this.cwd, filepath);
 			}
-			// GDB requires a .text load address for add-symbol-file.
-			// Use the caller-supplied address, or auto-detect it from the ELF header.
+			const elfType = readElfType(filepath);
+			if (elfType === 2 /* ET_EXEC */) {
+				// Statically linked executable: section addresses in the ELF are
+				// absolute runtime addresses (no relocation, no dynamic linker).
+				// GDB reads them directly, so add-symbol-file needs no address.
+				this.sendCliCommand(`add-symbol-file ${filepath}`).then((result) => {
+					if (result.resultRecords?.resultClass == "done") resolve(true);
+					else resolve(false);
+				}, reject);
+				return;
+			}
+			// ET_DYN (PIE / shared object), linked at VMA 0: the caller's
+			// textAddr is the runtime BASE address. Use `-o` (relocation offset)
+			// semantics: GDB shifts every section by the offset, which matches
+			// how the OS loader maps the file (base + p_vaddr). Passing the base
+			// as a positional .text-section address would misplace all symbols
+			// by the .text VMA (a few hundred bytes below the mapping).
 			const addr = textAddr ?? readElfTextAddr(filepath);
 			if (!addr) {
-				console.warn(`[ardb] addSymbolFile: cannot determine .text address for "${filepath}" (no textAddr provided and ELF read failed). Skipping.`);
+				console.warn(`[ardb] addSymbolFile: cannot determine load address for "${filepath}" (no textAddr provided and ELF read failed). Skipping.`);
 				resolve(false);
 				return;
 			}
-			this.sendCliCommand(`add-symbol-file ${filepath} ${addr}`).then((result) => {
+			this.sendCliCommand(`add-symbol-file ${filepath} -o ${addr}`).then((result) => {
 				if (result.resultRecords?.resultClass == "done") resolve(true);
 				else resolve(false);
 			}, reject);
