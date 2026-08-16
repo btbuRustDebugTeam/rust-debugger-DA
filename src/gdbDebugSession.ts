@@ -176,7 +176,11 @@ export class GDBDebugSession extends DebugSession {
     private currentHook: HookBreakpoint | undefined;
     private pendingBreakpointNode: MINode | undefined;
     private functionBorderNames: string[] = [];  // function-name border BPs to auto-insert on debug-ready
+    private functionBorderNamesUtoK: string[] = []; // subset: user_to_kernel direction
     private functionHookNames: string[] = [];    // function-name hook BPs to auto-insert on debug-ready
+    // Crates the user enabled via ardb-update-whitelist — re-applied after
+    // group switches regenerate the whitelist (user symbols enter scope).
+    private whitelistEnabledCrates: string[] = [];
 
     constructor(opts: GDBDebugSessionOptions) {
         super();
@@ -317,6 +321,9 @@ export class GDBDebugSession extends DebugSession {
                     self.sendEvent(new BreakpointEvent('changed', dbp));
                 }
             },
+            getWhitelistEnabledCrates(): string[] {
+                return self.whitelistEnabledCrates;
+            },
         };
 
         this.breakpointGroups = new BreakpointGroups(firstGroup, bpgSession, secondGroup);
@@ -328,6 +335,9 @@ export class GDBDebugSession extends DebugSession {
                 if (b.function) {
                     this.breakpointGroups.updateBorder(new Border(b.filepath, b.line, b.function, direction));
                     this.functionBorderNames.push(b.function);
+                    if (direction === 'user_to_kernel') {
+                        this.functionBorderNamesUtoK.push(b.function);
+                    }
                 } else {
                     this.breakpointGroups.updateBorder(new Border(b.filepath, b.line, undefined, direction));
                 }
@@ -757,45 +767,13 @@ export class GDBDebugSession extends DebugSession {
         try {
             await this.miDebugger!.sendCommand(`thread-select ${threadId}`);
 
-            const snapshot = await this.getSnapshotFromGDB();
-
-            if (snapshot && snapshot.path.length > 0) {
-                const reversedPath = [...snapshot.path].reverse();
-                const stackFrames: DebugProtocol.StackFrame[] = [];
-
-                for (let i = 0; i < reversedPath.length; i++) {
-                    const node = reversedPath[i];
-                    const frameId = threadId * 10000 + i;
-
-                    let name: string;
-                    if (node.type === 'async') {
-                        name = `[async CID:${node.cid}] ${node.func}`;
-                    } else {
-                        name = node.func || '<unknown>';
-                    }
-
-                    const sf = new StackFrame(
-                        frameId,
-                        name,
-                        (node.fullname || node.file) ? new Source(node.file || '', node.fullname || node.file || '') : undefined,
-                        node.line || 0,
-                        0,
-                    );
-
-                    if (node.addr) {
-                        sf.instructionPointerReference = node.addr;
-                    }
-
-                    stackFrames.push(sf);
-                }
-
-                response.body = { stackFrames, totalFrames: stackFrames.length };
-                this.sendResponse(response);
-            } else {
-                await this.fallbackPhysicalStackTrace(response, threadId);
-            }
+            // The VS Code call-stack panel shows the PHYSICAL stack as provided
+            // by GDB. The async logical call chain (coroutine tree) is only
+            // rendered in the Async Inspector panel — it is not injected into
+            // the call-stack view anymore.
+            await this.fallbackPhysicalStackTrace(response, threadId);
         } catch (err: any) {
-            console.log(`[Adapter] snapshot stackTrace failed, falling back: ${err.message}`);
+            console.log(`[Adapter] stackTrace failed: ${err.message}`);
             try {
                 await this.fallbackPhysicalStackTrace(response, threadId);
             } catch (err2: any) {
@@ -1007,6 +985,9 @@ export class GDBDebugSession extends DebugSession {
                         if (!this.functionBorderNames.includes(args.function)) {
                             this.functionBorderNames.push(args.function);
                         }
+                        if (direction === 'user_to_kernel' && !this.functionBorderNamesUtoK.includes(args.function)) {
+                            this.functionBorderNamesUtoK.push(args.function);
+                        }
                         // Insert into GDB immediately if connected.
                         // Also track for debug-ready in case GDB hasn't connected yet.
                         if (this.miDebugger && this.gdbReady) {
@@ -1144,8 +1125,25 @@ export class GDBDebugSession extends DebugSession {
     private async handleArdReset(response: DebugProtocol.Response): Promise<void> {
         if (!this.miDebugger) { response.body = {}; this.sendResponse(response); return; }
         await this.miDebugger.sendCliCommand('ardb-reset');
-        if (fs.existsSync(this.logPath)) {
-            fs.writeFileSync(this.logPath, '');
+        // Clean up debug artifacts produced during the session:
+        // trace logs, snapshot, whitelist files. They are regenerated lazily
+        // by the GDB Python side / whitelist commands on next use.
+        const artifactFiles = [
+            'ardb.log',
+            'ardb_diag.log',
+            'ardb_snapshot.json',
+            'poll_functions.txt',
+            'poll_functions_grouped.json',
+        ];
+        for (const f of artifactFiles) {
+            const p = path.join(this.tempDir, f);
+            try {
+                if (fs.existsSync(p)) {
+                    fs.rmSync(p);
+                }
+            } catch (e) {
+                console.warn(`[ardb] failed to remove artifact ${p}:`, e);
+            }
         }
         response.body = {};
         this.sendResponse(response);
@@ -1191,6 +1189,7 @@ export class GDBDebugSession extends DebugSession {
     private async handleArdUpdateWhitelist(response: DebugProtocol.Response, args: any): Promise<void> {
         if (!this.miDebugger) { response.body = {}; this.sendResponse(response); return; }
         const enabledCrates = args?.enabledCrates || [];
+        this.whitelistEnabledCrates = enabledCrates;
         const payload = JSON.stringify({ enabled_crates: enabledCrates });
         await this.miDebugger.sendCliCommand(`ardb-update-whitelist ${payload}`);
         response.body = {};
@@ -1299,8 +1298,20 @@ export class GDBDebugSession extends DebugSession {
                 // transparent to the user — the behavior runs and execution continues.
                 for (const funcName of this.functionHookNames) {
                     try {
-                        await this.miDebugger!.addBreakPoint({ raw: funcName, condition: '' });
-                        console.log(`[ardb] auto-inserted hook BP: "${funcName}"`);
+                        const [ok, brk] = await this.miDebugger!.addBreakPoint({ raw: funcName, condition: '' });
+                        if (ok && brk?.id) {
+                            // Store GDB breakpoint number on the hook object so
+                            // group switches can delete it by number instead of
+                            // by function name (which GDB's break-delete doesn't support).
+                            const group = this.breakpointGroups?.getCurrentBreakpointGroup();
+                            for (const h of (group?.hooks ?? []) as any) {
+                                if (h.breakpoint?.function === funcName) {
+                                    h.gdbNumber = brk.id;
+                                    break;
+                                }
+                            }
+                        }
+                        console.log(`[ardb] auto-inserted hook BP: "${funcName}" → GDB #${brk?.id ?? '?'}`);
                     } catch (e) {
                         console.error(`[ardb] failed to auto-insert hook BP "${funcName}":`, e);
                     }
@@ -1688,6 +1699,18 @@ export class GDBDebugSession extends DebugSession {
                             return;
                         }
                     }
+                }
+
+                // Also check U→K borders: if a user_to_kernel border is hit
+                // while still in kernel state, it means the kernel internally
+                // called this function (e.g. during init). This is NOT a real
+                // privilege transition — silently continue.
+                const fn = v[0].function;
+                if (fn && this.functionBorderNamesUtoK.some(name => fn.includes(name))) {
+                    console.log(`[ardb] U→K border hit in kernel state (fn="${fn}") — internal call, continuing silently`);
+                    this.pendingBreakpointNode = undefined;
+                    this.miDebugger!.continue();
+                    return;
                 }
 
                 this.sendUserStoppedEvent();

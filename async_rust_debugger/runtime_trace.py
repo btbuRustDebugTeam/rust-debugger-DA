@@ -198,7 +198,14 @@ def _read_ptr(addr: int) -> int:
     return struct.unpack("<I", mem)[0]
 
 def _reg_u64(name: str) -> int:
-    return int(gdb.parse_and_eval(f"${name}"))
+    val = int(gdb.parse_and_eval(f"${name}"))
+    # Mask to unsigned — GDB may return negative Python ints for addresses
+    # with the high bit set (e.g. RISC-V kernel pointers above 0x80000000...).
+    # Without this, hex(this_ptr) produces negative hex strings like
+    # "-0x3f7fcae370" which the TS-side parseAddr can't classify as kernel/user.
+    ps = _ptr_size()
+    mask = (1 << (ps * 8)) - 1
+    return val & mask
 
 def _arg_reg() -> str:
     """Return the register name for the first C argument on the current architecture."""
@@ -837,7 +844,7 @@ class PollEntryBP(gdb.Breakpoint):
         is_new = False
         depth = -1
 
-        if poll_sym and this_ptr:
+        if poll_sym and this_ptr and _is_async_symbol(poll_sym):
             cid, is_new = _get_or_make_coro_id(poll_sym, this_ptr)
             depth = _push_coro(cid)
             # gdb.FinishBreakpoint is broken on RISC-V (GDB 15): the C-level
@@ -966,6 +973,59 @@ class ARDTraceCommand(gdb.Command):
         _ACTIVE_ROOTS.add(sym)
         PollEntryBP(sym, poll_sym=sym, internal=False, temporary=False)
         gdb.write(f"[ARD] trace root: {sym}\n")
+
+
+class ARDTraceUserCrateCommand(gdb.Command):
+    """
+    Trace all async symbols of a user crate. Called automatically after a
+    breakpoint-group switch when the user-space ELF symbols are loaded, so
+    user-space coroutines enter the shadow stack (the physical-stack tail in
+    ardb-get-snapshot then appends the kernel frames for the full chain).
+    Usage: ardb-trace-user-crate <crate_name>
+    """
+    def __init__(self):
+        super().__init__("ardb-trace-user-crate", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        crate = arg.strip()
+        if not crate:
+            gdb.write("Usage: ardb-trace-user-crate <crate_name>\n")
+            return
+
+        temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
+        if not temp_dir:
+            gdb.write('[ARD] ASYNC_RUST_DEBUGGER_TEMP_DIR is not set.\n')
+            return
+
+        grouped_path = os.path.join(os.getcwd(), temp_dir, "poll_functions_grouped.json")
+        if not os.path.exists(grouped_path):
+            gdb.write('[ARD] grouped whitelist not found. Run ardb-gen-whitelist first.\n')
+            return
+
+        try:
+            with open(grouped_path, "r", encoding="utf-8") as fp:
+                grouped_data = json.load(fp)
+        except Exception as e:
+            gdb.write(f'[ARD] failed to read grouped whitelist: {e}\n')
+            return
+
+        crate_info = grouped_data.get("crates", {}).get(crate)
+        if not crate_info:
+            gdb.write(f'[ARD] crate not found in whitelist: {crate}\n')
+            return
+
+        syms = [s["name"] for s in crate_info.get("symbols", []) if s.get("kind") == "async"]
+        traced = 0
+        for sym in syms:
+            if sym in _ACTIVE_ROOTS:
+                continue
+            _ACTIVE_ROOTS.add(sym)
+            PollEntryBP(sym, poll_sym=sym, internal=False, temporary=False)
+            traced += 1
+        gdb.write(
+            f'[ARD] trace-user-crate {crate}: {traced} async symbols traced '
+            f'(total {len(syms)} async, {len(crate_info.get("symbols", []))} symbols)\n'
+        )
 
 
 class ARDResetCommand(gdb.Command):
@@ -1109,26 +1169,19 @@ class ARDGetSnapshotCommand(gdb.Command):
             })
             
         # 2. Extract the physical stack tail (frames above the top traced function).
-        #    Only do this if the shadow stack is non-empty; if nothing has been
-        #    traced yet, we should not fabricate nodes from physical frames.
+        #    When the shadow stack is EMPTY (e.g. stopped in sync code, or before
+        #    the first poll of an async fn), fall back to the full physical stack
+        #    so the tree still shows the complete call chain — top_async_func is
+        #    "" in that case, so every frame is appended (async/sync classified).
         phys_tail = []
         shadow_cids = set(stack)  # CIDs already on the shadow stack
-        if not stack:
-            json_output = json.dumps(snapshot) + "\n"
-            gdb.write(json_output)
-            temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
-            if temp_dir:
-                snapshot_path = os.path.join(os.getcwd(), temp_dir, "ardb_snapshot.json")
-                try:
-                    with open(snapshot_path, "w", encoding="utf-8") as f:
-                        f.write(json_output)
-                except Exception:
-                    pass
-            return
         try:
             saved_frame = gdb.selected_frame()
             frame = saved_frame
-            while frame:
+            frame_count = 0
+            MAX_PHYS_FRAMES = 40
+            while frame and frame_count < MAX_PHYS_FRAMES:
+                frame_count += 1
                 fname = frame.name()
 
                 # Stop if we reach the entry of the top traced function
@@ -1160,7 +1213,6 @@ class ARDGetSnapshotCommand(gdb.Command):
                     if frame_type == "async":
                         # For async frames, try to read the env ptr from the
                         # frame's debug info (first argument / self).
-                        # $rdi is unreliable for non-entry frames.
                         node_state = "N/A"
                         this_ptr = 0
                         try:
@@ -1177,10 +1229,23 @@ class ARDGetSnapshotCommand(gdb.Command):
                                     break
                         except Exception:
                             pass
-                        # Fallback to $rdi if debug info failed
+                        # Fallback: read the frame's OWN saved argument register
+                        # (restored via CFA). Do NOT use the global $a0 — it
+                        # belongs to the innermost frame and is meaningless for
+                        # intermediate async frames on the physical stack.
                         if not this_ptr:
                             try:
                                 frame.select()
+                                reg_val = frame.read_register(_arg_reg())
+                                if reg_val is not None:
+                                    this_ptr = _extract_raw_ptr(reg_val)
+                            except Exception:
+                                pass
+                        # Last resort: global arg register (only meaningful when
+                        # this frame IS the innermost one, e.g. stopped at the
+                        # poll entry itself).
+                        if not this_ptr:
+                            try:
                                 this_ptr = _reg_u64(_arg_reg())
                             except Exception:
                                 pass
@@ -1683,6 +1748,7 @@ def install():
     ARDGetGroupedWhitelistCommand()
     ARDUpdateWhitelistCommand()
     ARDInferTraceRootCommand()
+    ARDTraceUserCrateCommand()
     ARDSaveTraceStateCommand()
     ARDRestoreTraceStateCommand()
     ARDResetTraceStateCommand()
