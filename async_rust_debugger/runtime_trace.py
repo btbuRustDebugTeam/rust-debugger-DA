@@ -219,6 +219,18 @@ def _arg_reg() -> str:
         return "x0"
     return "rdi"  # x86_64
 
+def _arg_reg() -> str:
+    """Return the register name for the first C argument on the current architecture."""
+    try:
+        arch = gdb.selected_frame().architecture().name()
+    except Exception:
+        return "rdi"
+    if "riscv" in arch:
+        return "a0"
+    if "aarch64" in arch:
+        return "x0"
+    return "rdi"  # x86_64
+
 def _current_pc() -> int:
     return int(gdb.parse_and_eval("$pc"))
 
