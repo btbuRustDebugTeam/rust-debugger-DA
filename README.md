@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/校徽.png" alt="学校logo">
+  <img src="docs/assets/校徽.png" alt="学校logo" width="300">
 </p>
 
 # 源代码级异步操作系统调试方法
@@ -14,10 +14,10 @@
 | **学校**     | 北京工商大学                                                 |
 | **小组成员** | 曾小红、王浩铭、武雪妍                                       |
 | **指导老师** | 吴竞邦                                                       |
-| **决赛文档** | [源代码级异步操作系统调试方法决赛文档](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/%E5%86%B3%E8%B5%9B%E6%96%87%E6%A1%A3-%E6%BA%90%E4%BB%A3%E7%A0%81%E7%BA%A7%E5%BC%82%E6%AD%A5%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E8%B0%83%E8%AF%95%E6%96%B9%E6%B3%95.pdf)                                                      |
-| **决赛PPT** | [源代码级异步操作系统调试方法决赛PPT](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/%E5%86%B3%E8%B5%9BPPT-%E6%BA%90%E4%BB%A3%E7%A0%81%E7%BA%A7%E5%BC%82%E6%AD%A5%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E8%B0%83%E8%AF%95%E6%96%B9%E6%B3%95.pdf)                                                       |
-| **演示视频** | [源代码级异步操作系统调试方法决赛演示视频](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/tree/main/docs?ref_type=heads)                                                      |
-| **开发进度** | [开发进度](https://gitlab.eduxiji.net/T2026100119910438/project3136859-387115/-/blob/main/docs/%E5%BC%80%E5%8F%91%E8%BF%9B%E5%BA%A6.md)                                                      |
+| **决赛文档** | [源代码级异步操作系统调试方法决赛文档](决赛文档-源代码级异步操作系统调试方法.pdf)                                                      |
+| **决赛PPT** | [源代码级异步操作系统调试方法决赛PPT](决赛PPT（PDF版）-源代码级异步操作系统调试方法.pdf)                                                       |
+| **演示视频** | [源代码级异步操作系统调试方法决赛演示视频](docs)                                                      |
+| **开发进度** | [开发进度](docs/开发进度.md)                                                      |
 
 ### 1.2 摘要
 
@@ -26,7 +26,7 @@
 本项目围绕四个核心问题展开：
 
 - **异步跟踪开销问题**：去掉调试前的静态 DWARF 预解析，改为运行时通过 `__awaitee` 字段按需发现等待关系，引入 `(poll_sym, env_ptr)` 实例级识别和 trace root 概念。
-- **异步跟踪与跨特权级调试的融合**：设计跨生命周期的 save/restore 机制，维护四类共 19 项数据的连续性，实现异步操作系统调试。
+- **异步跟踪与跨特权级调试的融合**：设计跨生命周期的 save/restore 机制维护四类共 19 项数据的连续性，白名单随断点组分组管理、物理栈回退保证任意停止位置树不为空、以内核锚点让一棵调用树贯穿两个特权级，实现异步操作系统调试。
 - **图形化界面设计**：实现 VS Code 插件化三层架构，Async Inspector 面板以树形图承载等待拓扑、协程元数据和节点身份三类异步语义，与原生 Call Stack 形成双轨协同。
 - **调试器通用性改进**：通过函数名断点、通用收敛点+方向属性、动态进程组自动注入、跨 Rust 版本变量读取等技术，使调试器从教学 OS 扩展到组件化 OS，并适配 Rust 异步操作系统。
 
@@ -39,7 +39,7 @@
 | 核心问题 | 最终目标 | 完成情况 | 说明 |
 | :--- | :--- | :------: | :--- |
 | 全量插桩开销大 | 运行时按需发现 | **全部完成** | 去掉 DWARF 预解析，运行时读取 `__awaitee` 字段动态发现；`(poll_sym, env_ptr)` 区分并发实例；引入 trace root 支持自动推断和手动指定 |
-| 异步跟踪与跨特权级调试冲突 | 异步跟踪与 OS 调试融合 | **全部完成** | 移植四状态机与断点组管理；设计 save/restore 机制维护四类数据跨特权级连续性；37 个单元测试+4 个集成测试通过 |
+| 异步跟踪与跨特权级调试冲突 | 异步跟踪与 OS 调试融合 | **全部完成** | 移植四状态机与断点组管理；save/restore 机制维护四类数据跨特权级连续性；白名单随断点组分组管理；物理栈回退；内核锚点让一棵树贯穿两个特权级；37 个单元测试+4 个集成测试通过 |
 | 异步跟踪结果不直观 | 图形化界面设计 | **全部完成** | VS Code 插件化三层架构；Async Inspector 面板展示逻辑调用树；白名单全流程 UI 集成；与原生 Call Stack 双轨协同 |
 | 跨特权级调试通用性差 | 面向组件化 OS 的通用化改进 | **全部完成** | 函数名断点+通用收敛点+方向属性；动态进程组自动注入；跨 Rust 版本变量读取（GDB Pretty Printer → console 捕获 → 内存直读） |
 
@@ -47,18 +47,18 @@
 
 | 验证目标 | 完成情况 | 说明 |
 | :--- | :------: | :--- |
-| 37 个状态机单元测试 | **全部通过** | 覆盖正常转换路径、PC 快速路径、方向属性校验、异常路径 |
+| 状态机单元测试与集成测试 | **全部通过** | 覆盖正常转换路径、PC 快速路径、方向属性校验、异常路径 |
 | embassy 异步跟踪 | **全部完成** | 三层嵌套等待链（main_task→run_task→timer::poll）正确追踪，验证运行时无关性 |
 | StarryOS 跨特权级调试 | **全部完成** | 内核初始化→shell→动态启动用户程序→断点组自动切换，全程无需手动干预 |
-| Async-os 统一调试 | **部分完成** | 内核态异步协程追踪已完成；跨特权级异步追踪仍在适配中 |
+| Async-os 统一调试 | **全部完成** | 内核态协程追踪完成；pipetest 跨特权级异步追踪打通——同一棵调用树包含内核协程与用户协程，CID 与 poll 次数跨越多次特权级切换连续累积 |
 
 ### 1.4 项目分工
 
 | **成员** | **主要分工**                                                                                 |
 | -------- | -------------------------------------------------------------------------------------------- |
-| 曾小红   | 异步跟踪方案改进；异步跟踪与 OS 调试融合；Async Inspector 图形化面板设计与实现；StarryOS 适配与验证；embassy 异步追踪验证；Async-os 适配探索；撰写参赛文档；参赛PPT制作 |
-| 王浩铭   | OS 调试功能测试与验证（状态机单元测试、集成测试）；硬件调试 |
-| 武雪妍   | 文档图片与示意图制作；参赛 PPT 制作 |
+| 曾小红   | 调研 Rust 异步机制与 OS 调试现状，确定技术路线；设计运行时按需发现机制、协程实例识别方案、save/restore 状态保持机制；实现白名单分组管理、物理栈回退、内核锚点等融合机制；移植 OS 调试功能；设计并实现 Async Inspector 图形化面板；osgdb 适配 StarryOS；async-debug 适配 Async-os；embassy 异步追踪验证；编写项目文档，制作 PPT 与演示视频 |
+| 王浩铭   | 学习 GDB/MI 协议与操作系统调试基础；复现 rCore 调试流程；编写状态机单元测试与集成测试；整理测试报告，反馈测试发现的缺陷；VisionFive 2 真机调试与硬件调试 |
+| 武雪妍   | 学习 Rust 异步机制与调试器使用；复现 async-debug 调试流程；制作项目文档图片与示意图；参与文档排版与图表整理；参与制作 PPT 与演示视频 |
 
 ### 1.5 文档索引
 
@@ -95,8 +95,10 @@
     - [1. 文档 PDF](#1-文档-pdf)
     - [2. 决赛 PPT](#2-决赛-ppt)
   - [九、参考说明](#九参考说明)
-    - [9.1 前序工作](#91-前序工作)
-    - [9.2 被调试目标](#92-被调试目标)
+    - [9.1 调试器通信层](#91-调试器通信层)
+    - [9.2 断点组管理与跨特权级切换](#92-断点组管理与跨特权级切换)
+    - [9.3 异步执行流还原](#93-异步执行流还原)
+    - [9.4 被调试目标与外部工具](#94-被调试目标与外部工具)
 
 ## 二、项目背景
 
@@ -141,7 +143,7 @@ Rust 的 async/await 机制中，编译器将 async 函数编译为一个状态�
 
 ### 3.3 跟踪状态跨特权级保持问题：异步跟踪与 OS 调试融合
 
-异步跟踪和跨特权级调试放到一起时，特权级切换会将异步跟踪积累的协程状态、追踪断点、白名单地址映射全部清空——本质上是两个功能的相关数据生命周期存在冲突。受影响的包括四类共 19 项数据：断点数据（6 类）、协程状态（5 项）、追踪记录（3 项）、白名单数据（5 项）。解决方案是设计 save/restore 机制：切换前将四类数据序列化保存，切换后按白名单→追踪记录→协程状态→清除残余→重建 PollEntryBP 的五步顺序逐一恢复。
+异步跟踪和跨特权级调试放在同一个调试会话时，在两个层面上互相冲突：停止事件的分发路径不同（attach 与 launch 两套逻辑），以及特权级切换会清空异步跟踪积累的状态——受影响的有四类共 19 项数据：断点数据（6 类）、协程状态（5 项）、追踪记录（3 项）、白名单数据（5 项）。解决方案分四步递进：save/restore 机制（切换前序列化保存，切换后按白名单→追踪记录→协程状态→清除残余→重建 PollEntryBP 五步恢复）；白名单按断点组分组管理（切组时自动重建白名单并安装用户态 PollEntryBP）；树的语义边界与物理栈回退（停在协程尚未 poll 的位置时树空是语义正确的，回退到物理栈构建瞬态链）；内核锚点（以 `user_task_top` 为追踪根，其 poll 驱动用户任务直到完成，一棵树贯穿两个特权级）。
 
 ### 3.4 调试器的可视化问题：图形化界面设计
 
@@ -169,11 +171,17 @@ Rust 的 async/await 机制中，编译器将 async 函数编译为一个状态�
 
 ### 4.2 异步跟踪与跨特权级调试的融合
 
-**四类冲突数据。** 特权级切换时，以下数据全部被清空：（1）断点数据——PollEntryBP、CallSiteBP、PopOnReturnBP、边界断点、Hook 断点、用户断点被 GDB 物理删除；（2）协程状态——`_CO_BY_KEY`、`_CO_META`、`_CO_POLL_SEQ`、`_TLS_STACK`、`_CO_NEXT_ID` 在 `new_objfile` 事件时清空；（3）追踪记录——`_ACTIVE_ROOTS`、`_CALLSITE_INSTALLED_FOR_FN` 同时清空；（4）白名单数据——地址映射因目标地址空间变化而全部失效。
+**两层冲突。** （1）事件分发路径：OS 调试（attach 模式）与异步调试（launch 模式）的停止事件分流逻辑不同，融合后必须保证状态机处理完停止事件后快照链路仍被触发、Hook 断点的透明停止不触发快照；（2）数据生命周期：特权级切换会卸载符号表、清空协程状态，受影响的有四类共 19 项数据——断点数据（6 类：PollEntryBP、CallSiteBP、PopOnReturnBP、边界断点、Hook 断点、用户断点）、协程状态（5 项：`_CO_BY_KEY`、`_CO_META`、`_CO_POLL_SEQ`、`_TLS_STACK`、`_CO_NEXT_ID`）、追踪记录（3 项：`_ACTIVE_ROOTS`、`_CALLSITE_INSTALLED_FOR_FN`、`_CREATED_BPS`）、白名单数据（5 项）。
 
 **Save/Restore 机制。** 保存阶段序列化四类数据到 `_SAVED_STATES` 字典，恢复阶段按五步顺序执行：（1）恢复白名单配置，标记地址映射待重建；（2）恢复追踪记录；（3）恢复协程状态（CID 命名空间必须在 PollEntryBP 重装前就绪）；（4）清除残余旧断点防止跨组切换累积重复；（5）逐个重建 PollEntryBP。
 
 **完整切换流程。** 状态机检测到切换条件 → `ardb-save-trace-state` 保存四类数据 → 清除旧断点组、卸载旧符号文件 → 加载新符号文件、恢复新断点组 → `ardb-restore-trace-state` 按序恢复 → 继续执行。
+
+**白名单按断点组分组管理。** 白名单在会话开始时（内核态）生成，只有内核符号；切到用户态后用户协程不在追踪范围内。切组加载新符号文件后自动重新生成白名单、合并用户勾选的 crate、以 `ardb-trace-user-crate` 对用户 crate 的全部异步符号安装 PollEntryBP——用户态协程由此进入影子栈。
+
+**树的语义边界与物理栈回退。** 树的节点是「当前正在 poll 的协程」，停在协程尚未 poll 的位置（如 spawn 语句上）时树空是语义正确的。快照生成时若影子栈为空，回退遍历物理调用栈（≤40 帧）逐帧按 async/sync 分类构建瞬态链；读不到环境指针的真协程帧以 `cid=null` 和物理地址呈现（musl 工具链默认不带栈展开表，属编译选项限制）。
+
+**内核锚点：一棵树贯穿两个特权级。** GDB 的栈展开不跨栈，停在用户态时内核协程帧进不了树。以内核协程 `user_task_top` 为追踪根——它的 poll 驱动用户任务直到完成，用户态协程自然出现在它的 poll 链上。一个追踪根、加上切组时自动安装的用户态 PollEntryBP，即可让树贯穿两个特权级。
 
 ### 4.3 Async Inspector 图形化面板
 
@@ -209,14 +217,7 @@ Rust 的 async/await 机制中，编译器将 async 函数编译为一个状态�
 
 embassy 是一个用 Rust 编写的嵌入式异步框架，不依赖 Tokio 等外部运行时，使用自定义 executor。在 embassy 的 `tick` 示例程序上启用异步追踪后，工具成功恢复出三层嵌套等待链：
 
-```
-ASYNC USER  tick::_embassy_main_task::...::{async_fn#0}
-  CallGraph: calls=1 | exit=1 | active=no  | thread=1
-ASYNC USER  tick::_run_task::...::{async_fn#0}
-  CallGraph: calls=3 | exit=1 | active=yes | thread=1
-ASYNC USER  embassy_time::timer::...::poll
-  CallGraph: calls=3 | exit=2 | active=yes | thread=1
-```
+![embassy异步函数执行图](docs/assets/embassy异步函数执行图.png)
 
 从追踪数据可观察到：`main_task → run_task → timer::poll` 的三层嵌套等待链被完整发现；最外层仅 poll 1 次即完成，内层被 poll 3 次后仍在等待，符合计时器驱动的异步执行模式；每个协程的 calls、exit 和 active 状态独立追踪。
 
@@ -228,15 +229,21 @@ embassy 的自定义 executor 与 Tokio 内部结构截然不同，工具仍能�
 
 ### 5.4 Async-os 统一调试场景验证
 
-验证分两个阶段。第一阶段以 `coroutine_test` 为目标，成功完成内核态异步协程追踪——克服了 Release 编译缺调试信息、RISC-V 寄存器硬编码、FinishBreakpoint 不工作、函数名断点迁移等困难，调试器成功获取了内核态协程的逻辑调用树。第二阶段以 `user_boot` 为目标尝试跨特权级异步追踪，目前已完成了边界断点和 Hook 断点的函数名适配，跨特权级追踪链正在调试中。
+验证分两个阶段。第一阶段以 `coroutine_test` 为目标，成功完成内核态异步协程追踪——克服了 Release 编译缺调试信息、RISC-V 寄存器硬编码、`gdb.FinishBreakpoint` 在 RISC-V 上失效等困难，调试器成功获取了内核态协程的逻辑调用树。
+
+第二阶段以管道读写测试程序 pipetest 为目标（async-await 变体：`pipe_test` spawn reader 与 writer 两个协程，`sys_read`/`sys_write` 为异步系统调用，等待边天然跨越特权级）。Async-os 需满足五项编译要求：内核 release + `-g`（裸汇编短跳转限制，debug 模式链接失败）且附加 `-C strip=none`（release 默认剥除调试信息）；用户程序 `+crt-static` 静态化（动态链接 PIE 被内核加载器把动态链接器当主程序加载，符号基址全错）、`opt-level=0`（O3 吞掉行表，断点全变 pending）；Hook 目标函数 `#[inline(never)]`（LTO 内联消除函数符号）。
+
+调试配置以 `user_task_top` 同时充当 user→kernel 边界断点与异步追踪根，Hook 断点打在 `init_user` 上识别程序名，组名在三个可编程函数间对齐。在 spawn reader、spawn writer、reader 入口、writer 入口四个断点捕获 6 次暂停的调用树：树根始终是内核协程 `user_task_top`，其 Poll 计数在多次内核↔用户切换间从 63 连续累积至 87；停在协程构造点时树由物理栈回退链构成、不为空；reader 协程被 poll 后以 `CID:2`（`Poll:1`、`State:0`）出现在树上；writer 创建链（`CID:5/6`）与 reader 链（`CID:3/4`）同树呈现。验证了树贯穿两个特权级、保存与恢复机制生效、物理栈回退生效、实例级追踪生效。
+
+![贯穿内核态与用户态的调用树](docs/assets/pipetest6.png)
 
 ## 六、总结与展望
 
-本项目围绕四个核心问题，构建了一个跨特权级的统一调试平台：改进了异步跟踪方案（运行时按需发现替代静态预计算）、实现了异步跟踪与跨特权级调试的融合（save/restore 跨生命周期状态保持）、构建了图形化调试界面（VS Code 插件+Async Inspector 双轨协同）、提高了调试器的通用性（从教学 OS 扩展到组件化 OS）。
+本项目围绕四个核心问题，构建了一个跨特权级的统一调试平台：改进了异步跟踪方案（运行时按需发现替代静态预计算）、实现了异步跟踪与跨特权级调试的融合（save/restore 跨生命周期状态保持、白名单分组管理、物理栈回退、内核锚点）、构建了图形化调试界面（VS Code 插件+Async Inspector 双轨协同）、提高了调试器的通用性（从教学 OS 扩展到组件化 OS）。
 
-在验证方面，37 个单元测试和 4 个集成测试全部通过；embassy 上验证了运行时无关性；StarryOS 上完成了全流程调试；Async-os 上完成了内核态异步追踪。开发过程中还经历了代码安全审计、RISC-V 平台适配、协议层非标准需求处理、Rust 版本兼容等大量工程挑战。
+在验证方面，37 个单元测试和 7 个集成测试全部通过；embassy 上验证了运行时无关性；StarryOS 上完成了全流程调试；Async-os 上完成了内核态协程追踪，并打通了 pipetest 的跨特权级异步追踪——同一棵调用树中包含内核协程与用户协程，协程标识与 poll 次数跨越多次特权级切换连续累积。开发过程中还经历了代码安全审计、RISC-V 平台适配、协议层非标准需求处理、Rust 版本兼容等大量工程挑战。
 
-未来展望：统一调试平台的核心能力已经建立，下一步计划实现调试配置的自动推导（通过解析 ELF 符号表和链接脚本），以及特权级切换性能优化（使用 GDB `finish` 命令替代逐指令单步、引入切换冷却期机制）。
+未来展望：统一调试平台的核心能力已经建立，下一步计划实现调试配置的自动推导（通过解析 ELF 符号表和链接脚本）、特权级切换性能优化（使用 GDB `finish` 命令替代逐指令单步、引入切换冷却期机制），以及多 CPU 执行流的恢复（追踪方法不依赖单 CPU 假设——影子栈与各 CPU 的物理栈逐一对应，方法上可直接推广到多核场景，多核配置下的实际验证留作后续工作）。
 
 ## 七、功能展示
 
@@ -251,26 +258,34 @@ embassy 的自定义 executor 与 Tokio 内部结构截然不同，工具仍能�
 
 ### 1. 文档 PDF
 
-[源代码级异步操作系统调试方法决赛文档]()
+[源代码级异步操作系统调试方法决赛文档](决赛文档-源代码级异步操作系统调试方法.pdf)
 
 ### 2. 决赛 PPT
 
-[源代码级异步操作系统调试方法决赛PPT]()
+[源代码级异步操作系统调试方法决赛PPT](决赛PPT（PDF版）-源代码级异步操作系统调试方法.pdf)
 
 ## 九、参考说明
 
-### 9.1 前序工作
+本作品的调试器基础框架继承自开源项目 code-debug，异步执行流还原方法继承自团队前序工作 ARDB，跨特权级调试增强参考团队另一子系统 osgdb 的设计。以下按模块说明借鉴内容与开源许可声明。
 
-| 年份 | 工作 | 说明 |
-|------|------|------|
-| 2023–2024 | code-debug | 实现 VS Code 调试器扩展，四状态机驱动的断点组管理机制。 [https://github.com/chenzhiy2001/code-debug](https://github.com/chenzhiy2001/code-debug) |
-| 2025 | ARDB | 提出 await edge 与 call edge 双关系恢复方法。 [https://github.com/OSDebugger/code-debug_Asynchronous-trace](https://github.com/OSDebugger/code-debug_Asynchronous-trace) |
+### 9.1 调试器通信层
 
-### 9.2 被调试目标
+1. GDB/MI2 协议驱动模块移植自开源项目 code-debug（2023–2024 年操作系统设计大赛赛题 proj55 源码，[https://github.com/chenzhiy2001/code-debug](https://github.com/chenzhiy2001/code-debug)），源码头部保留移植声明（`mi2.ts:1`）。继承其 MI 响应解析框架，并做以下改进：删除原项目的 SSH 远程通道；新增 ELF 段地址解析用于符号加载；新增 multi-location 断点解析与 pending 断点检测（原项目对这两类断点均会静默失效）。
+2. 开源许可声明：code-debug 采用 Unlicense（公共领域许可），允许自由使用、修改与再分发。
 
-- [StarryOS](https://github.com/Starry-OS/StarryOS) — 基于 ArceOS 框架的组件化 Rust 操作系统，本项目 OS 调试通用性改进的验证目标
-- [rCore-Tutorial-v3](https://github.com/rcore-os/rCore-Tutorial-v3) — 教学操作系统，前序工作的主要验证平台
-- [embassy](https://github.com/embassy-rs/embassy) — Rust 嵌入式异步框架，本项目异步调试运行时无关性的验证目标
-- [Async-os](https://github.com/AsyncModules/async-os) — Rust 异步微内核操作系统，本项目统一调试平台的终极验证目标
+### 9.2 断点组管理与跨特权级切换
 
-详情见决赛文档。
+1. 四状态机驱动的断点组管理机制继承自 code-debug。状态迁移逻辑重构为纯函数式实现（`stateTransition` 返回「新状态 + 动作列表」，与 GDB 交互完全解耦），并补充两套共 79 条断言的单元测试——原项目没有任何自动化测试。
+2. 边界断点方向属性、通用 syscall handler 方案（将 user→kernel 方向的 N 个切换点收敛为唯一系统调用分发函数，以单个断点覆盖全部系统调用返回路径）、函数名断点、动态进程组注入等设计，参考团队另一子系统 osgdb（[https://github.com/OSDebugger/osgdb](https://github.com/OSDebugger/osgdb)）。
+3. 开源许可声明：osgdb 为本团队项目，采用 GPL-3.0。
+
+### 9.3 异步执行流还原
+
+1. await edge 与 call edge 双关系恢复方法继承自团队前序工作 ARDB（[https://github.com/OSDebugger/code-debug_Asynchronous-trace](https://github.com/OSDebugger/code-debug_Asynchronous-trace)，2025）。
+2. 在继承方法基础上，今年自研了四个新机制：白名单过滤机制（静态符号表分析生成可追踪函数集合，把追踪范围从全量收窄到目标 crate）；协程实例识别（poll 符号与 this 指针配对，区分同一函数的多个协程实例）；每个 CPU 独立的协程影子栈（多核下各 CPU 的执行流互不串扰）；物理栈回退快照（协程尚未进入 poll 时，按物理栈逐帧分类重建异步链）。
+3. 开源许可声明：ARDB 为本团队项目。
+
+### 9.4 被调试目标与外部工具
+
+1. 验证目标 OS 仅作为被调试对象，未复用其代码：[StarryOS](https://github.com/Starry-OS/StarryOS)（基于 ArceOS 框架的组件化 Rust OS）、[rCore-Tutorial-v3](https://github.com/rcore-os/rCore-Tutorial-v3)（教学 OS）、[embassy](https://github.com/embassy-rs/embassy)（Rust 嵌入式异步框架）、[Async-os](https://github.com/AsyncModules/async-os)（Rust 异步微内核，终极验证目标）。
+2. 使用的外部工具与协议：GDB 调试器及 GDB/MI 机器接口协议、VS Code 调试适配协议（DAP）。
