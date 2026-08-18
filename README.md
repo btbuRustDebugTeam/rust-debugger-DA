@@ -195,8 +195,6 @@ Rust 的 async/await 机制中，编译器将 async 函数编译为一个状态�
 
 ### 4.4 面向不同操作系统的通用化改进
 
-![rCore 与 StarryOS 的架构差异](docs/assets/rCore与StarryOS架构差异.png)
-
 三项改进解决三个通用性缺陷：
 
 **函数名断点。** 边界断点和 Hook 断点增加函数名指定方式，由 GDB 通过符号表自动定位，不依赖本地文件路径。将 user→kernel 边界从分散的 C 库 ecall 入口收敛到内核态唯一 syscall 分发函数（如 `handle_syscall`），一个函数名断点覆盖全部返回路径。引入 direction 字段消除两边界同处内核地址空间时的方向歧义。
