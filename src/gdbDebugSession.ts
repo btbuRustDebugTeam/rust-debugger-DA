@@ -156,6 +156,22 @@ interface GDBStartupConfig {
     autorun?: string[];
 }
 
+export type MIStopKind = 'breakpoint' | 'step' | 'signal' | 'other';
+
+/** Map an MI stop to its user-facing DAP reason. */
+export function mapMIStopToDAPReason(
+    kind: MIStopKind,
+    signalName?: string,
+    pendingUserPause = false,
+): 'breakpoint' | 'step' | 'pause' | 'exception' {
+    if (kind === 'breakpoint') return 'breakpoint';
+    if (kind === 'step') return 'step';
+    if (kind === 'signal') {
+        return pendingUserPause && signalName === 'SIGINT' ? 'pause' : 'exception';
+    }
+    return 'pause';
+}
+
 // ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
@@ -185,6 +201,7 @@ export class GDBDebugSession extends DebugSession {
     // Inferior state
     private inferiorStarted = false;
     private gdbReady = false;       // GDB process has connected and is ready to accept commands
+    private pendingUserPause = false;
     private transport: DebugTransport = 'local';
     private program = '';
     private programArgs: string[] = [];
@@ -322,6 +339,7 @@ export class GDBDebugSession extends DebugSession {
 
         this.inferiorStarted = false;
         this.gdbReady = false;
+        this.pendingUserPause = false;
         this.osDebugReady = false;
         this.transport = remote ? 'remote' : 'local';
 
@@ -368,6 +386,7 @@ export class GDBDebugSession extends DebugSession {
         this.userMemoryRanges = config.user_memory_ranges ?? [];
         this.osState = new OSState(OSStateMachine.initial);
         this.osDebugReady = false;
+        this.pendingUserPause = false;
 
         // Build IBreakpointGroupsSession adapter
         const firstGroup = config.first_breakpoint_group ?? 'kernel';
@@ -883,10 +902,15 @@ export class GDBDebugSession extends DebugSession {
             return;
         }
         if (!this.miDebugger) { this.sendErrorResponse(response, 8, 'No debug session'); return; }
+        this.pendingUserPause = true;
         try {
-            await this.miDebugger!.interrupt();
+            const interrupted = await this.miDebugger!.interrupt();
+            if (!interrupted) {
+                throw new Error('GDB did not accept the interrupt request');
+            }
             this.sendResponse(response);
         } catch (err: any) {
+            this.pendingUserPause = false;
             this.sendErrorResponse(response, 8, err.message);
         }
     }
@@ -1079,6 +1103,7 @@ export class GDBDebugSession extends DebugSession {
         }
 
         this.inferiorStarted = false;
+        this.pendingUserPause = false;
         this.fileBreakpoints.clear();
         this.gdbBkptToDap.clear();
         this.functionBreakpointNumbers = [];
@@ -1400,6 +1425,7 @@ export class GDBDebugSession extends DebugSession {
     // -----------------------------------------------------------------------
 
     private launchGDB(config: GDBStartupConfig): void {
+        this.pendingUserPause = false;
         const gdbPath = config.gdbPath || 'gdb';
         const gdbArgs = [
             '--interpreter=mi2',
@@ -1421,10 +1447,12 @@ export class GDBDebugSession extends DebugSession {
         });
 
         this.miDebugger!.on('quit', () => {
+            this.pendingUserPause = false;
             this.sendEvent(new TerminatedEvent());
         });
 
         this.miDebugger!.on('launcherror', (err: Error) => {
+            this.pendingUserPause = false;
             console.error('[Adapter] GDB launch error:', err);
             this.sendEvent(new TerminatedEvent());
         });
@@ -1454,6 +1482,7 @@ export class GDBDebugSession extends DebugSession {
         });
 
         this.miDebugger!.on('breakpoint', (node: MINode) => {
+            this.consumePendingUserPause();
             const threadId = this.getThreadId(node);
             this.recentStopThreadId = threadId;
             if (this.osDebugReady) {
@@ -1465,50 +1494,66 @@ export class GDBDebugSession extends DebugSession {
         });
 
         this.miDebugger!.on('step-end', (node: MINode) => {
+            const pendingUserPause = this.consumePendingUserPause();
             const threadId = this.getThreadId(node);
             this.recentStopThreadId = threadId;
             if (this.osDebugReady) {
                 this.osStateTransition(new OSEvent(OSEvents.STOPPED));
             } else {
-                const event = new StoppedEvent('step', threadId);
+                const event = new StoppedEvent(
+                    mapMIStopToDAPReason('step', undefined, pendingUserPause),
+                    threadId,
+                );
                 (event.body as any).allThreadsStopped = true;
                 this.sendEvent(event);
             }
         });
 
         this.miDebugger!.on('step-other', (node: MINode) => {
+            const pendingUserPause = this.consumePendingUserPause();
             const threadId = this.getThreadId(node);
             this.recentStopThreadId = threadId;
             if (this.osDebugReady) {
                 this.osStateTransition(new OSEvent(OSEvents.STOPPED));
             } else {
-                const event = new StoppedEvent('pause', threadId);
+                const event = new StoppedEvent(
+                    mapMIStopToDAPReason('other', undefined, pendingUserPause),
+                    threadId,
+                );
                 (event.body as any).allThreadsStopped = true;
                 this.sendEvent(event);
             }
         });
 
         this.miDebugger!.on('signal-stop', (node: MINode) => {
+            const pendingUserPause = this.consumePendingUserPause();
             const threadId = this.getThreadId(node);
             this.recentStopThreadId = threadId;
+            const sigName = node.record('signal-name') || 'unknown';
+            const reason = mapMIStopToDAPReason('signal', sigName, pendingUserPause);
             if (this.osDebugReady) {
                 this.osStateTransition(new OSEvent(OSEvents.STOPPED));
             } else {
-                const sigName = node.record('signal-name') || 'unknown';
-                const event = new StoppedEvent('exception', threadId);
-                (event.body as any).description = `Signal: ${sigName}`;
+                const event = new StoppedEvent(reason, threadId);
+                if (reason === 'exception') {
+                    (event.body as any).description = `Signal: ${sigName}`;
+                }
                 (event.body as any).allThreadsStopped = true;
                 this.sendEvent(event);
             }
         });
 
         this.miDebugger!.on('stopped', (node: MINode) => {
+            const pendingUserPause = this.consumePendingUserPause();
             const threadId = this.getThreadId(node);
             this.recentStopThreadId = threadId;
             if (this.osDebugReady) {
                 this.osStateTransition(new OSEvent(OSEvents.STOPPED));
             } else {
-                const event = new StoppedEvent('pause', threadId);
+                const event = new StoppedEvent(
+                    mapMIStopToDAPReason('other', undefined, pendingUserPause),
+                    threadId,
+                );
                 (event.body as any).allThreadsStopped = true;
                 this.sendEvent(event);
             }
@@ -1520,7 +1565,14 @@ export class GDBDebugSession extends DebugSession {
         });
 
         this.miDebugger!.on('exited-normally', (_node: MINode) => {
+            this.consumePendingUserPause();
             this.sendEvent(new TerminatedEvent());
+        });
+
+        // MI2 currently has no DAP watchpoint handler, but a watchpoint stop must
+        // still win a race with Pause and consume the one-shot pause intent.
+        this.miDebugger!.on('watchpoint', () => {
+            this.consumePendingUserPause();
         });
 
         // Wire breakpoint-modified notify
@@ -1783,6 +1835,13 @@ export class GDBDebugSession extends DebugSession {
         return tid ? parseInt(tid) : 1;
     }
 
+    /** Every target stop consumes the one-shot Pause intent. */
+    private consumePendingUserPause(): boolean {
+        const pending = this.pendingUserPause;
+        this.pendingUserPause = false;
+        return pending;
+    }
+
     private handleBreakpointHit(node: MINode): void {
         const bkptno = parseInt(node.record('bkptno') || '0');
         const threadId = this.getThreadId(node);
@@ -1790,7 +1849,7 @@ export class GDBDebugSession extends DebugSession {
         const entry = this.gdbBkptToDap.get(bkptno);
         const dapId = entry?.id;
 
-        const event = new StoppedEvent('breakpoint', threadId);
+        const event = new StoppedEvent(mapMIStopToDAPReason('breakpoint'), threadId);
         (event.body as any).hitBreakpointIds = dapId ? [dapId] : [];
         (event.body as any).allThreadsStopped = true;
         this.sendEvent(event);
