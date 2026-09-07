@@ -1377,7 +1377,7 @@ export class GDBDebugSession extends DebugSession {
     private async handleArdUpdateWhitelist(response: DebugProtocol.Response, args: any): Promise<void> {
         if (!this.miDebugger) { response.body = {}; this.sendResponse(response); return; }
         const enabledCrates = args?.enabledCrates || [];
-        const payload = JSON.stringify({ enabled_crates: enabledCrates });
+        const payload = JSON.stringify({ enabled_crates: enabledCrates, async_only: args?.asyncOnly === true });
         await this.miDebugger.sendCliCommand(`ardb-update-whitelist ${payload}`);
         response.body = {};
         this.sendResponse(response);

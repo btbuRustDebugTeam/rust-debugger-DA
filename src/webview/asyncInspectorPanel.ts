@@ -66,7 +66,7 @@ export class AsyncInspectorPanel {
                         await this.handleRefreshCandidates();
                         break;
                     case 'updateWhitelistCrates':
-                        await this.handleUpdateWhitelistCrates(message.enabledCrates);
+                        await this.handleUpdateWhitelistCrates(message.enabledCrates, message.asyncOnly === true);
                         break;
                 }
             },
@@ -400,9 +400,9 @@ export class AsyncInspectorPanel {
         }
     }
 
-    private async handleUpdateWhitelistCrates(enabledCrates: string[]): Promise<void> {
+    private async handleUpdateWhitelistCrates(enabledCrates: string[], asyncOnly = false): Promise<void> {
         if (this._debugSession) {
-            await this._debugSession.customRequest('ardb-update-whitelist', { enabledCrates });
+            await this._debugSession.customRequest('ardb-update-whitelist', { enabledCrates, asyncOnly });
             vscode.window.showInformationMessage(`Whitelist updated: ${enabledCrates.length} crate(s) enabled`);
         }
     }

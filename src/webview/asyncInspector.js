@@ -6,6 +6,7 @@
     // Grouped whitelist state
     let groupedWhitelist = null;
     let enabledCrates = new Set();
+    let asyncOnly = false;
 
     // Observer is a view over History and therefore has one selected root.
     let observerRoot = null;
@@ -193,6 +194,18 @@
             frameworkCrates.forEach(name => renderCrateGroup(container, name, grouped.crates[name], false));
         }
 
+        // Filtering takes effect only when the user explicitly applies.
+        const asyncOnlyLabel = document.createElement('label');
+        const asyncOnlyCheckbox = document.createElement('input');
+        asyncOnlyCheckbox.type = 'checkbox';
+        asyncOnlyCheckbox.checked = asyncOnly;
+        asyncOnlyCheckbox.addEventListener('change', () => {
+            asyncOnly = asyncOnlyCheckbox.checked;
+        });
+        asyncOnlyLabel.appendChild(asyncOnlyCheckbox);
+        asyncOnlyLabel.appendChild(document.createTextNode(' Async only'));
+        container.appendChild(asyncOnlyLabel);
+
         // Apply button
         const applyBtn = document.createElement('button');
         applyBtn.className = 'btn apply-btn';
@@ -200,7 +213,8 @@
         applyBtn.addEventListener('click', () => {
             vscode.postMessage({
                 command: 'updateWhitelistCrates',
-                enabledCrates: Array.from(enabledCrates)
+                enabledCrates: Array.from(enabledCrates),
+                asyncOnly
             });
         });
         container.appendChild(applyBtn);

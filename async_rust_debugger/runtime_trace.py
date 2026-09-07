@@ -3469,7 +3469,7 @@ class ARDUpdateWhitelistCommand(gdb.Command):
     Update the runtime whitelist based on enabled crates.
     Reads the grouped JSON, filters to enabled crates, writes flat poll_functions.txt,
     and reloads the whitelist.
-    Usage: ardb-update-whitelist {"enabled_crates": ["my_app", "my_lib"]}
+    Usage: ardb-update-whitelist {"enabled_crates": ["my_app", "my_lib"], "async_only": false}
     """
     def __init__(self):
         super().__init__("ardb-update-whitelist", gdb.COMMAND_USER)
@@ -3499,6 +3499,7 @@ class ARDUpdateWhitelistCommand(gdb.Command):
         try:
             payload = json.loads(arg)
             enabled_crates = set(payload.get("enabled_crates", []))
+            async_only = bool(payload.get("async_only", False))
         except Exception as e:
             gdb.write(f'[ARD] failed to parse argument: {e}\n')
             return
@@ -3519,6 +3520,8 @@ class ARDUpdateWhitelistCommand(gdb.Command):
                     if crate_name not in enabled_crates:
                         continue
                     for sym_info in crate_info.get("symbols", []):
+                        if async_only and sym_info.get("kind") != "async":
+                            continue
                         fp.write(f"{idx} {sym_info['name']}\n")
                         idx += 1
         except Exception as e:
@@ -3539,7 +3542,7 @@ class ARDUpdateWhitelistCommand(gdb.Command):
 
         gdb.write(
             f'[ARD] whitelist updated: {len(enabled_crates)} crates enabled, '
-            f'{idx} symbols, observers={installed} -> {flat_path}\n'
+            f'{idx} symbols, observers={installed} -> {flat_path}, async_only={str(async_only).lower()}\n'
         )
 
 
